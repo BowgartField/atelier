@@ -76,6 +76,7 @@ impl SessionUsage {
         total_cache_creation_tokens: u64,
         context_input_tokens: u64,
         context_cache_read_tokens: u64,
+        context_cache_creation_tokens: u64,
     ) -> Self {
         const MAX_CONTEXT_TOKENS: f64 = 200_000.0;
         // Sonnet 3.5 pricing (adjust for other models if needed)
@@ -87,8 +88,10 @@ impl SessionUsage {
 
         let total_cache_tokens = total_cache_read_tokens + total_cache_creation_tokens;
 
-        // Context = last run's input + cache read (conversation history at that point)
-        let context_tokens = context_input_tokens + context_cache_read_tokens;
+        // Context = last run's input + cache tokens (full context window usage)
+        // This matches Claude Code's calculation: input + cache_read + cache_creation
+        let context_tokens =
+            context_input_tokens + context_cache_read_tokens + context_cache_creation_tokens;
         let context_percentage = ((context_tokens as f64 / MAX_CONTEXT_TOKENS) * 100.0).min(100.0);
 
         // Cost = sum of all tokens across all runs
@@ -140,6 +143,8 @@ pub struct ClaudeCredentials {
 #[serde(rename_all = "camelCase")]
 pub struct OAuthCredentials {
     pub access_token: String,
+    #[allow(dead_code)]
     pub refresh_token: Option<String>,
+    #[allow(dead_code)]
     pub expires_at: Option<u64>,
 }

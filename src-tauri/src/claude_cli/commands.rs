@@ -3,6 +3,7 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::io::Write;
+use std::process::Command;
 use tauri::{AppHandle, Emitter};
 
 use super::config::{ensure_cli_dir, get_cli_binary_path};

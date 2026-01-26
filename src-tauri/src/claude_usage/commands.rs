@@ -39,8 +39,8 @@ pub async fn get_session_usage(
     let metadata = load_metadata(&app, &session_id)?;
 
     // For cost: sum all tokens from all runs
-    // For context: use last run's input (includes full conversation history)
-    let (total_input, total_output, total_cache_read, total_cache_creation, last_input, last_cache_read) = match metadata {
+    // For context: use last run's tokens (represents current context window usage)
+    let (total_input, total_output, total_cache_read, total_cache_creation, last_input, last_cache_read, last_cache_creation) = match metadata {
         Some(meta) => {
             let runs_with_usage: Vec<_> = meta.runs.iter().filter_map(|run| run.usage.as_ref()).collect();
 
@@ -57,14 +57,15 @@ pub async fn get_session_usage(
                 },
             );
 
-            // Last run for context size (includes conversation history)
+            // Last run for context size (input + cache_read + cache_creation = full context)
             let last = runs_with_usage.last();
             let last_input = last.map(|u| u.input_tokens).unwrap_or(0);
             let last_cache_read = last.map(|u| u.cache_read_input_tokens).unwrap_or(0);
+            let last_cache_creation = last.map(|u| u.cache_creation_input_tokens).unwrap_or(0);
 
-            (totals.0, totals.1, totals.2, totals.3, last_input, last_cache_read)
+            (totals.0, totals.1, totals.2, totals.3, last_input, last_cache_read, last_cache_creation)
         }
-        None => (0, 0, 0, 0, 0, 0),
+        None => (0, 0, 0, 0, 0, 0, 0),
     };
 
     Ok(SessionUsage::from_tokens_with_context(
@@ -74,6 +75,7 @@ pub async fn get_session_usage(
         total_cache_creation,
         last_input,
         last_cache_read,
+        last_cache_creation,
     ))
 }
 
@@ -83,4 +85,42 @@ pub async fn get_session_usage(
 #[tauri::command]
 pub async fn has_claude_credentials() -> bool {
     has_oauth_credentials().await
+}
+
+/// Get context data from the Jean hook
+///
+/// Returns context data written by the context-writer hook script.
+/// This provides accurate context percentage from Claude Code directly.
+/// Uses Claude Code's session ID from Jean's session metadata.
+#[tauri::command]
+pub fn get_hook_context_data(
+    app: AppHandle,
+    session_id: String,
+) -> Option<super::context_hook::HookContextData> {
+    // Load session metadata to get Claude Code's session ID
+    let metadata = load_metadata(&app, &session_id).ok()??;
+
+    // Get Claude Code's session ID from metadata
+    let claude_session_id = metadata.claude_session_id.as_ref()?;
+
+    // Read hook data using Claude Code's session ID
+    super::context_hook::read_hook_context_data(claude_session_id)
+}
+
+/// Check if the context tracking hook is installed
+#[tauri::command]
+pub fn is_context_hook_installed() -> bool {
+    super::hook_installer::is_hook_installed()
+}
+
+/// Install the context tracking hook in Claude Code settings
+#[tauri::command]
+pub fn install_context_hook() -> Result<(), String> {
+    super::hook_installer::install_hook()
+}
+
+/// Uninstall the context tracking hook from Claude Code settings
+#[tauri::command]
+pub fn uninstall_context_hook() -> Result<(), String> {
+    super::hook_installer::uninstall_hook()
 }

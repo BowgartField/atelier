@@ -66,7 +66,7 @@ fn parse_credentials_json(json_str: &str) -> Result<String, String> {
 
     creds
         .claude_ai_oauth
-        .and_then(|oauth| Some(oauth.access_token))
+        .map(|oauth| oauth.access_token)
         .ok_or_else(|| "No OAuth credentials found in credentials".to_string())
 }
 

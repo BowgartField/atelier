@@ -9,6 +9,7 @@ import { cn } from '@/lib/utils'
 import {
   useClaudeUsageLimits,
   useSessionUsage,
+  useHookContextData,
   formatCost,
   formatResetTime,
   formatPacingDelta,
@@ -39,10 +40,24 @@ export const ClaudeUsageStatusBar = memo(function ClaudeUsageStatusBar({
     worktreePath,
     sessionId
   )
+  // Hook data provides accurate context % when installed
+  const { data: hookData } = useHookContextData(sessionId)
 
   // Don't render if no session data
   if (!sessionUsage) {
     return null
+  }
+
+  // Merge data: prefer hook data for cost and context % (more accurate)
+  const displayUsage = {
+    ...sessionUsage,
+    // Use hook data when available
+    contextPercentage: hookData?.contextPercentage ?? sessionUsage.contextPercentage,
+    estimatedCostUsd: hookData?.costUsd ?? sessionUsage.estimatedCostUsd,
+    // Extra info from hook for tooltip
+    contextTokens: hookData?.contextTokens,
+    contextMaxTokens: hookData?.contextMaxTokens,
+    isFromHook: !!hookData,
   }
 
   const fiveHour = limits?.fiveHour
@@ -55,7 +70,7 @@ export const ClaudeUsageStatusBar = memo(function ClaudeUsageStatusBar({
     <TooltipProvider delayDuration={300}>
       <div className="hidden @md:flex items-center text-xs text-muted-foreground select-none">
         {/* Session info: S: $cost | XX% */}
-        <SessionInfo usage={sessionUsage} />
+        <SessionInfo usage={displayUsage} />
 
         {/* 5-hour limit: L: XX% (Xh Xm) */}
         {fiveHour && (
@@ -92,12 +107,21 @@ interface SessionInfoProps {
     totalCacheTokens: number
     contextPercentage: number
     estimatedCostUsd: number
+    // Extra info from hook (when available)
+    contextTokens?: number
+    contextMaxTokens?: number
+    isFromHook: boolean
   }
 }
 
 /** Session cost and context percentage */
 function SessionInfo({ usage }: SessionInfoProps) {
   const contextColor = getContextColor(usage.contextPercentage)
+
+  // Format context info for tooltip
+  const contextMaxK = usage.contextMaxTokens
+    ? `${Math.round(usage.contextMaxTokens / 1000)}K`
+    : '200K'
 
   return (
     <Tooltip>
@@ -120,17 +144,27 @@ function SessionInfo({ usage }: SessionInfoProps) {
           <div>
             Output: {formatTokens(usage.totalOutputTokens)} tokens
           </div>
-          {usage.totalCacheTokens > 0 && (
+          {usage.totalCacheTokens > 0 && !usage.isFromHook && (
             <div>
               Cache: {formatTokens(usage.totalCacheTokens)} tokens
             </div>
           )}
           <div className="pt-1 border-t border-border/50">
-            Context: {Math.round(usage.contextPercentage)}% of 200K
+            Context: {Math.round(usage.contextPercentage)}% of {contextMaxK}
+            {usage.contextTokens && (
+              <span className="text-muted-foreground/70">
+                {' '}({formatTokens(usage.contextTokens)})
+              </span>
+            )}
           </div>
           <div>
             Est. cost: {formatCost(usage.estimatedCostUsd)}
           </div>
+          {!usage.isFromHook && (
+            <div className="pt-1 text-muted-foreground/70 text-[10px]">
+              Enable context hook in settings for accurate %
+            </div>
+          )}
         </div>
       </TooltipContent>
     </Tooltip>

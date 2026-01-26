@@ -31,6 +31,20 @@ export interface SessionUsage {
   estimatedCostUsd: number
 }
 
+/**
+ * Context data from Jean's Claude Code hook
+ * Provides accurate context window tracking
+ */
+export interface HookContextData {
+  sessionId: string
+  costUsd: number
+  durationMs: number
+  contextTokens: number
+  contextMaxTokens: number
+  contextPercentage: number
+  timestamp: string
+}
+
 // ============================================================================
 // Query Keys
 // ============================================================================
@@ -41,6 +55,9 @@ export const claudeUsageQueryKeys = {
   credentials: () => [...claudeUsageQueryKeys.all, 'credentials'] as const,
   session: (sessionId: string) =>
     [...claudeUsageQueryKeys.all, 'session', sessionId] as const,
+  hookContext: (sessionId: string) =>
+    [...claudeUsageQueryKeys.all, 'hook-context', sessionId] as const,
+  hookInstalled: () => [...claudeUsageQueryKeys.all, 'hook-installed'] as const,
 }
 
 // ============================================================================
@@ -75,6 +92,37 @@ export async function getSessionUsage(
  */
 export async function hasClaudeCredentials(): Promise<boolean> {
   return invoke<boolean>('has_claude_credentials')
+}
+
+/**
+ * Get context data from Jean's hook (if installed)
+ * Returns null if hook is not installed or data not available
+ */
+export async function getHookContextData(
+  sessionId: string
+): Promise<HookContextData | null> {
+  return invoke<HookContextData | null>('get_hook_context_data', { sessionId })
+}
+
+/**
+ * Check if the context tracking hook is installed
+ */
+export async function isContextHookInstalled(): Promise<boolean> {
+  return invoke<boolean>('is_context_hook_installed')
+}
+
+/**
+ * Install the context tracking hook in Claude Code settings
+ */
+export async function installContextHook(): Promise<void> {
+  return invoke<void>('install_context_hook')
+}
+
+/**
+ * Uninstall the context tracking hook from Claude Code settings
+ */
+export async function uninstallContextHook(): Promise<void> {
+  return invoke<void>('uninstall_context_hook')
 }
 
 // ============================================================================
@@ -131,6 +179,40 @@ export function useSessionUsage(
     enabled: !!worktreeId && !!worktreePath && !!sessionId,
     staleTime: 10_000, // 10 seconds
     refetchInterval: 30_000, // Poll every 30 seconds
+  })
+}
+
+/**
+ * Hook to get context data from Jean's Claude Code hook
+ *
+ * This provides accurate context percentage when the hook is installed.
+ * Returns null if hook is not set up or no data available.
+ */
+export function useHookContextData(sessionId: string | null) {
+  return useQuery({
+    queryKey: sessionId
+      ? claudeUsageQueryKeys.hookContext(sessionId)
+      : ['hook-context', 'none'],
+    queryFn: () => {
+      if (!sessionId) {
+        return null
+      }
+      return getHookContextData(sessionId)
+    },
+    enabled: !!sessionId,
+    staleTime: 5_000, // 5 seconds - hook data updates after each response
+    refetchInterval: 10_000, // Poll every 10 seconds
+  })
+}
+
+/**
+ * Hook to check if the context tracking hook is installed
+ */
+export function useIsContextHookInstalled() {
+  return useQuery({
+    queryKey: claudeUsageQueryKeys.hookInstalled(),
+    queryFn: isContextHookInstalled,
+    staleTime: 60_000, // 1 minute
   })
 }
 

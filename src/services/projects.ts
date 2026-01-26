@@ -1292,8 +1292,13 @@ export function useOpenWorktreeInFinder() {
       logger.info('Opened worktree in Finder')
     },
     onError: error => {
+      // Tauri invoke errors are thrown as strings, not Error objects
       const message =
-        error instanceof Error ? error.message : 'Unknown error occurred'
+        typeof error === 'string'
+          ? error
+          : error instanceof Error
+            ? error.message
+            : 'Unknown error occurred'
       logger.error('Failed to open in Finder', { error })
       toast.error('Failed to open in Finder', { description: message })
     },
@@ -1344,8 +1349,13 @@ export function useOpenWorktreeInTerminal() {
       logger.info('Opened worktree in Terminal')
     },
     onError: error => {
+      // Tauri invoke errors are thrown as strings, not Error objects
       const message =
-        error instanceof Error ? error.message : 'Unknown error occurred'
+        typeof error === 'string'
+          ? error
+          : error instanceof Error
+            ? error.message
+            : 'Unknown error occurred'
       logger.error('Failed to open in Terminal', { error })
       toast.error('Failed to open in Terminal', { description: message })
     },
@@ -1373,8 +1383,13 @@ export function useOpenWorktreeInEditor() {
       logger.info('Opened worktree in Editor')
     },
     onError: error => {
+      // Tauri invoke errors are thrown as strings, not Error objects
       const message =
-        error instanceof Error ? error.message : 'Unknown error occurred'
+        typeof error === 'string'
+          ? error
+          : error instanceof Error
+            ? error.message
+            : 'Unknown error occurred'
       logger.error('Failed to open in Editor', { error })
       toast.error('Failed to open in Editor', { description: message })
     },

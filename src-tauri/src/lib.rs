@@ -1299,6 +1299,10 @@ pub fn run() {
             claude_usage::commands::get_claude_usage_limits,
             claude_usage::commands::get_session_usage,
             claude_usage::commands::has_claude_credentials,
+            claude_usage::commands::get_hook_context_data,
+            claude_usage::commands::is_context_hook_installed,
+            claude_usage::commands::install_context_hook,
+            claude_usage::commands::uninstall_context_hook,
         ])
         .build(tauri::generate_context!())
         .expect("error building tauri application")

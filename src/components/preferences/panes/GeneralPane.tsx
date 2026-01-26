@@ -47,6 +47,12 @@ import {
   setGitPollInterval,
   setRemotePollInterval,
 } from '@/services/git-status'
+import {
+  useIsContextHookInstalled,
+  installContextHook,
+  uninstallContextHook,
+  claudeUsageQueryKeys,
+} from '@/services/claude-usage'
 
 interface CleanupResult {
   deleted_worktrees: number
@@ -96,6 +102,10 @@ export const GeneralPane: React.FC = () => {
   // CLI status hooks
   const { data: cliStatus, isLoading: isCliLoading } = useClaudeCliStatus()
   const { data: ghStatus, isLoading: isGhLoading } = useGhCliStatus()
+
+  // Context hook status
+  const { data: isHookInstalled, isLoading: isHookLoading } = useIsContextHookInstalled()
+  const [isInstallingHook, setIsInstallingHook] = useState(false)
 
   // Auth status queries - only enabled when CLI is installed
   const { data: claudeAuth, isLoading: isClaudeAuthLoading } = useClaudeCliAuth({
@@ -269,6 +279,27 @@ export const GeneralPane: React.FC = () => {
     navigator.clipboard.writeText(path)
     toast.success('Path copied to clipboard')
   }, [])
+
+  const handleContextHookToggle = useCallback(async (enabled: boolean) => {
+    setIsInstallingHook(true)
+    const toastId = toast.loading(enabled ? 'Installing context hook...' : 'Removing context hook...')
+
+    try {
+      if (enabled) {
+        await installContextHook()
+        toast.success('Context hook installed. Restart Claude Code to activate.', { id: toastId })
+      } else {
+        await uninstallContextHook()
+        toast.success('Context hook removed', { id: toastId })
+      }
+      // Refresh hook status
+      queryClient.invalidateQueries({ queryKey: claudeUsageQueryKeys.hookInstalled() })
+    } catch (error) {
+      toast.error(`Failed: ${error}`, { id: toastId })
+    } finally {
+      setIsInstallingHook(false)
+    }
+  }, [queryClient])
 
   return (
     <div className="space-y-6">
@@ -478,6 +509,27 @@ export const GeneralPane: React.FC = () => {
                 }
               }}
             />
+          </InlineField>
+
+          <InlineField
+            label="Accurate context tracking"
+            description={
+              <>
+                Install hook in Claude Code for accurate context %
+                {isHookInstalled && (
+                  <span className="text-green-500 ml-1">(active)</span>
+                )}
+              </>
+            }
+          >
+            {isHookLoading || isInstallingHook ? (
+              <Loader2 className="size-4 animate-spin text-muted-foreground" />
+            ) : (
+              <Switch
+                checked={isHookInstalled ?? false}
+                onCheckedChange={handleContextHookToggle}
+              />
+            )}
           </InlineField>
 
           <InlineField label="Editor" description="App to open worktrees in">
