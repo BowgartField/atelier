@@ -65,12 +65,17 @@ pub struct SessionUsage {
 }
 
 impl SessionUsage {
-    /// Calculate session usage from token counts
-    pub fn from_tokens(
-        input_tokens: u64,
-        output_tokens: u64,
-        cache_read_tokens: u64,
-        cache_creation_tokens: u64,
+    /// Create from token counts with separate context tracking
+    ///
+    /// - total_* params: Sum of all runs (for cost calculation)
+    /// - context_* params: Last run's tokens (for context percentage)
+    pub fn from_tokens_with_context(
+        total_input_tokens: u64,
+        total_output_tokens: u64,
+        total_cache_read_tokens: u64,
+        total_cache_creation_tokens: u64,
+        context_input_tokens: u64,
+        context_cache_read_tokens: u64,
     ) -> Self {
         const MAX_CONTEXT_TOKENS: f64 = 200_000.0;
         // Sonnet 3.5 pricing (adjust for other models if needed)
@@ -80,19 +85,22 @@ impl SessionUsage {
         const CACHE_READ_COST_PER_1M: f64 = 0.30;
         const CACHE_CREATION_COST_PER_1M: f64 = 3.75;
 
-        let total_cache_tokens = cache_read_tokens + cache_creation_tokens;
-        let context_tokens = input_tokens + total_cache_tokens;
+        let total_cache_tokens = total_cache_read_tokens + total_cache_creation_tokens;
+
+        // Context = last run's input + cache read (conversation history at that point)
+        let context_tokens = context_input_tokens + context_cache_read_tokens;
         let context_percentage = ((context_tokens as f64 / MAX_CONTEXT_TOKENS) * 100.0).min(100.0);
 
-        let estimated_cost_usd = (input_tokens as f64 * INPUT_COST_PER_1M
-            + output_tokens as f64 * OUTPUT_COST_PER_1M
-            + cache_read_tokens as f64 * CACHE_READ_COST_PER_1M
-            + cache_creation_tokens as f64 * CACHE_CREATION_COST_PER_1M)
+        // Cost = sum of all tokens across all runs
+        let estimated_cost_usd = (total_input_tokens as f64 * INPUT_COST_PER_1M
+            + total_output_tokens as f64 * OUTPUT_COST_PER_1M
+            + total_cache_read_tokens as f64 * CACHE_READ_COST_PER_1M
+            + total_cache_creation_tokens as f64 * CACHE_CREATION_COST_PER_1M)
             / 1_000_000.0;
 
         Self {
-            total_input_tokens: input_tokens,
-            total_output_tokens: output_tokens,
+            total_input_tokens,
+            total_output_tokens,
             total_cache_tokens,
             context_percentage,
             estimated_cost_usd,

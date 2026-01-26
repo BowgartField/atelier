@@ -38,10 +38,14 @@ pub async fn get_session_usage(
     // Load session metadata to get run info
     let metadata = load_metadata(&app, &session_id)?;
 
-    let (input_tokens, output_tokens, cache_read, cache_creation) = match metadata {
+    // For cost: sum all tokens from all runs
+    // For context: use last run's input (includes full conversation history)
+    let (total_input, total_output, total_cache_read, total_cache_creation, last_input, last_cache_read) = match metadata {
         Some(meta) => {
-            // Aggregate usage from all runs
-            meta.runs.iter().filter_map(|run| run.usage.as_ref()).fold(
+            let runs_with_usage: Vec<_> = meta.runs.iter().filter_map(|run| run.usage.as_ref()).collect();
+
+            // Sum all for cost calculation
+            let totals = runs_with_usage.iter().fold(
                 (0u64, 0u64, 0u64, 0u64),
                 |(inp, out, read, create), u| {
                     (
@@ -51,16 +55,25 @@ pub async fn get_session_usage(
                         create + u.cache_creation_input_tokens,
                     )
                 },
-            )
+            );
+
+            // Last run for context size (includes conversation history)
+            let last = runs_with_usage.last();
+            let last_input = last.map(|u| u.input_tokens).unwrap_or(0);
+            let last_cache_read = last.map(|u| u.cache_read_input_tokens).unwrap_or(0);
+
+            (totals.0, totals.1, totals.2, totals.3, last_input, last_cache_read)
         }
-        None => (0, 0, 0, 0),
+        None => (0, 0, 0, 0, 0, 0),
     };
 
-    Ok(SessionUsage::from_tokens(
-        input_tokens,
-        output_tokens,
-        cache_read,
-        cache_creation,
+    Ok(SessionUsage::from_tokens_with_context(
+        total_input,
+        total_output,
+        total_cache_read,
+        total_cache_creation,
+        last_input,
+        last_cache_read,
     ))
 }
 
