@@ -223,6 +223,7 @@ export const ModalTerminalDrawer = memo(function ModalTerminalDrawer({
         showCloseButton={false}
         className="p-0"
         style={{ width: `${width}px`, maxWidth: '95vw' }}
+        data-terminal-host="true"
       >
         {content}
       </SheetContent>

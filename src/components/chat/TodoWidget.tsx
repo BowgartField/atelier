@@ -54,7 +54,7 @@ export function TodoWidget({
         )}
       >
         <div className="flex w-full items-center gap-2 px-3 py-1.5 text-xs text-muted-foreground">
-          <CollapsibleTrigger className="flex flex-1 items-center gap-2 hover:bg-muted/50 cursor-pointer select-none -ml-3 -my-2 pl-3 py-2 rounded-l-md">
+          <CollapsibleTrigger className="flex flex-1 items-center gap-2 hover:bg-muted/50 select-none -ml-3 -my-2 pl-3 py-2 rounded-l-md">
             <ChevronRight
               className={cn(
                 'h-3.5 w-3.5 shrink-0 transition-transform duration-200',

@@ -105,7 +105,7 @@ pub async fn list_github_issues(
             "--json",
             "number,title,body,state,labels,createdAt,author",
             "-L",
-            "100",
+            "1000",
             "--state",
             &state_arg,
         ])
@@ -196,7 +196,7 @@ pub async fn search_github_issues(
             "--json",
             "number,title,body,state,labels,createdAt,author",
             "-L",
-            "30",
+            "100",
             "--state",
             "all",
         ])
@@ -1414,7 +1414,7 @@ pub async fn list_github_prs(
             "--json",
             "number,title,body,state,headRefName,baseRefName,isDraft,createdAt,author,labels",
             "-L",
-            "100",
+            "1000",
             "--state",
             &state_arg,
         ])
@@ -1466,7 +1466,7 @@ pub async fn search_github_prs(
             "--json",
             "number,title,body,state,headRefName,baseRefName,isDraft,createdAt,author,labels",
             "-L",
-            "30",
+            "100",
             "--state",
             "all",
         ])

@@ -192,7 +192,7 @@ function ProjectSettingsDialogContent({
               </div>
             </header>
 
-            <div className="flex flex-1 flex-col gap-4 overflow-y-auto p-4 pt-0 min-h-0 custom-scrollbar">
+            <div className="flex flex-1 flex-col gap-4 overflow-y-auto p-4 pt-0 min-h-0">
               {safeProjectId && projectPath && (
                 <>
                   {activePane === 'general' && (

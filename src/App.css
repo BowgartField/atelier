@@ -580,18 +580,28 @@ kbd {
   background-color: rgba(251, 146, 60, 0.6);
 }
 
-/* Custom scrollbar styling to match Radix ScrollArea */
-.custom-scrollbar::-webkit-scrollbar {
+/* Global custom scrollbar — applies to every scrollable element so Windows
+   WebView2 doesn't render its native gray scrollbar. */
+*::-webkit-scrollbar {
   width: 10px;
+  height: 10px;
 }
-.custom-scrollbar::-webkit-scrollbar-track {
+*::-webkit-scrollbar-track {
   background: transparent;
 }
-.custom-scrollbar::-webkit-scrollbar-thumb {
+*::-webkit-scrollbar-thumb {
   background: var(--border);
   border-radius: 9999px;
   border: 1px solid transparent;
   background-clip: padding-box;
+}
+*::-webkit-scrollbar-thumb:hover {
+  background: var(--muted-foreground);
+  background-clip: padding-box;
+}
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--border) transparent;
 }
 
 .xterm,

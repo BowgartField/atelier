@@ -275,7 +275,7 @@ export function FloatingDock() {
         ...chatQueryKeys.sessions(currentWorktreeId),
         'with-counts',
       ])
-    const session = cached?.sessions.find(s => s.id === activeSessionId)
+    const session = cached?.sessions?.find(s => s.id === activeSessionId)
     return session ? getResumeCommand(session) : null
   }, [queryClient])
 

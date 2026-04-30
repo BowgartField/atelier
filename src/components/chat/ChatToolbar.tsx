@@ -95,6 +95,7 @@ export const ChatToolbar = memo(function ChatToolbar({
   onOpenPr,
   onReview,
   onMerge,
+  onMergePr,
   onResolvePrConflicts,
   onResolveConflicts,
   hasOpenPr,
@@ -218,15 +219,17 @@ export const ChatToolbar = memo(function ChatToolbar({
     (value: string) => {
       const provider = value === 'default' ? null : value
       onProviderChange(provider)
-      if (
-        provider &&
-        provider !== '__anthropic__' &&
-        (selectedModel === 'claude-opus-4-6[1m]' ||
+      if (provider && provider !== '__anthropic__') {
+        if (selectedModel === 'claude-opus-4-7[1m]') {
+          onModelChange('claude-opus-4-7' as ClaudeModel)
+        } else if (
+          selectedModel === 'claude-opus-4-6[1m]' ||
           selectedModel === 'claude-sonnet-4-6[1m]' ||
           selectedModel === 'claude-opus-4-6-fast' ||
-          selectedModel === 'claude-opus-4-6[1m]-fast')
-      ) {
-        onModelChange('claude-opus-4-6' as ClaudeModel)
+          selectedModel === 'claude-opus-4-6[1m]-fast'
+        ) {
+          onModelChange('claude-opus-4-6' as ClaudeModel)
+        }
       }
     },
     [onProviderChange, onModelChange, selectedModel]
@@ -347,6 +350,7 @@ export const ChatToolbar = memo(function ChatToolbar({
           onOpenPr={onOpenPr}
           onReview={onReview}
           onMerge={onMerge}
+          onMergePr={onMergePr}
           onResolveConflicts={onResolveConflicts}
           onOpenBackendModelPicker={() => setMobileBackendModelPickerOpen(true)}
           handlePullClick={handlePullClick}

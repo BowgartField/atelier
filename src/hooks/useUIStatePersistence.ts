@@ -5,7 +5,11 @@ import { useProjectsStore } from '@/store/projects-store'
 import { useChatStore } from '@/store/chat-store'
 import { useUIStore } from '@/store/ui-store'
 import { useTerminalStore } from '@/store/terminal-store'
+import { useBrowserStore } from '@/store/browser-store'
+import { browserBackend } from '@/hooks/useBrowserPane'
+import { isNativeApp } from '@/lib/environment'
 import { logger } from '@/lib/logger'
+import type { BrowserTab } from '@/types/browser'
 import type { UIState } from '@/types/ui-state'
 
 // Simple debounce implementation
@@ -91,6 +95,13 @@ export function useUIStatePersistence() {
       modalTerminalWidth,
       modalTerminalHeight,
     } = useTerminalStore.getState()
+    const browserState = useBrowserStore.getState()
+    const browserTabsForPersist = Object.fromEntries(
+      Object.entries(browserState.tabs).map(([wid, list]) => [
+        wid,
+        list.map(t => ({ id: t.id, url: t.url, title: t.title || undefined })),
+      ])
+    )
 
     return {
       active_worktree_id: activeWorktreeId,
@@ -111,6 +122,17 @@ export function useUIStatePersistence() {
       modal_terminal_dock_mode: modalTerminalDockMode,
       modal_terminal_width: modalTerminalWidth,
       modal_terminal_height: modalTerminalHeight,
+      // Browser pane state (per-worktree tabs + 3-surface visibility)
+      browser_tabs: browserTabsForPersist,
+      browser_active_tab_ids: browserState.activeTabIds,
+      browser_side_pane_open: browserState.sidePaneOpen,
+      browser_side_pane_width: browserState.sidePaneWidth,
+      browser_modal_open: browserState.modalOpen,
+      browser_modal_dock_mode: browserState.modalDockMode,
+      browser_modal_width: browserState.modalWidth,
+      browser_modal_height: browserState.modalHeight,
+      browser_bottom_panel_open: browserState.bottomPanelOpen,
+      browser_bottom_panel_height: browserState.bottomPanelHeight,
       // Project access timestamps for recency sorting
       project_access_timestamps: projectAccessTimestamps,
       // Dashboard worktree collapse overrides
@@ -366,6 +388,116 @@ export function useUIStatePersistence() {
       )
     }
 
+    // Restore browser pane state (per-worktree tabs + 3-surface visibility)
+    const persistedBrowserTabs = uiState.browser_tabs ?? {}
+    const browserActiveTabIds = uiState.browser_active_tab_ids ?? {}
+    if (Object.keys(persistedBrowserTabs).length > 0) {
+      const hydratedTabs: Record<string, BrowserTab[]> = {}
+      for (const [wid, list] of Object.entries(persistedBrowserTabs)) {
+        hydratedTabs[wid] = list.map(t => ({
+          id: t.id,
+          worktreeId: wid,
+          url: t.url,
+          title: t.title ?? '',
+          isLoading: false,
+        }))
+      }
+      logger.debug('Restoring browser tabs', {
+        worktreeCount: Object.keys(hydratedTabs).length,
+      })
+      useBrowserStore.getState().hydrateTabs(hydratedTabs, browserActiveTabIds)
+    }
+    // Browser surfaces are mutually exclusive per worktree (one webview, one
+    // position). If persisted state has multiple flags true (legacy bug or
+    // hand-edited file), keep only one with priority: modal > sidePane > bottom.
+    const persistedSidePaneOpen = uiState.browser_side_pane_open ?? {}
+    const persistedModalOpen = uiState.browser_modal_open ?? {}
+    const persistedBottomOpen = uiState.browser_bottom_panel_open ?? {}
+    const sanitizedSidePane: Record<string, boolean> = {}
+    const sanitizedModal: Record<string, boolean> = {}
+    const sanitizedBottom: Record<string, boolean> = {}
+    const allWorktreeIds = new Set([
+      ...Object.keys(persistedSidePaneOpen),
+      ...Object.keys(persistedModalOpen),
+      ...Object.keys(persistedBottomOpen),
+    ])
+    for (const wid of allWorktreeIds) {
+      if (persistedModalOpen[wid]) {
+        sanitizedModal[wid] = true
+      } else if (persistedSidePaneOpen[wid]) {
+        sanitizedSidePane[wid] = true
+      } else if (persistedBottomOpen[wid]) {
+        sanitizedBottom[wid] = true
+      }
+    }
+    if (Object.keys(sanitizedSidePane).length > 0) {
+      useBrowserStore.setState({ sidePaneOpen: sanitizedSidePane })
+    }
+    if (Object.keys(sanitizedModal).length > 0) {
+      useBrowserStore.setState({ modalOpen: sanitizedModal })
+    }
+    if (Object.keys(sanitizedBottom).length > 0) {
+      useBrowserStore.setState({ bottomPanelOpen: sanitizedBottom })
+    }
+    if (uiState.browser_side_pane_width != null) {
+      useBrowserStore.setState({
+        sidePaneWidth: uiState.browser_side_pane_width,
+      })
+    }
+    if (uiState.browser_modal_dock_mode) {
+      useBrowserStore.setState({
+        modalDockMode: uiState.browser_modal_dock_mode,
+      })
+    }
+    if (uiState.browser_modal_width != null) {
+      useBrowserStore.setState({ modalWidth: uiState.browser_modal_width })
+    }
+    if (uiState.browser_modal_height != null) {
+      useBrowserStore.setState({ modalHeight: uiState.browser_modal_height })
+    }
+    if (uiState.browser_bottom_panel_height != null) {
+      useBrowserStore.setState({
+        bottomPanelHeight: uiState.browser_bottom_panel_height,
+      })
+    }
+    // Cross-pane mutual exclusion: browser surfaces and terminal modal are
+    // mutually exclusive per worktree. If both restored as open for the same
+    // worktree (legacy/hand-edited state), close every browser surface there
+    // and let the terminal win — terminal is the more recently used surface
+    // for most users and avoids reopening into a broken layout.
+    {
+      const terminalState = useTerminalStore.getState()
+      const fixedSidePane = { ...sanitizedSidePane }
+      const fixedModal = { ...sanitizedModal }
+      const fixedBottom = { ...sanitizedBottom }
+      let changed = false
+      for (const wid of Object.keys(terminalState.modalTerminalOpen)) {
+        if (!terminalState.modalTerminalOpen[wid]) continue
+        if (fixedSidePane[wid]) {
+          fixedSidePane[wid] = false
+          changed = true
+        }
+        if (fixedModal[wid]) {
+          fixedModal[wid] = false
+          changed = true
+        }
+        if (fixedBottom[wid]) {
+          fixedBottom[wid] = false
+          changed = true
+        }
+      }
+      if (changed) {
+        logger.debug(
+          'Resolving browser/terminal mutual exclusion on hydrate (closing browser)'
+        )
+        useBrowserStore.setState({
+          sidePaneOpen: fixedSidePane,
+          modalOpen: fixedModal,
+          bottomPanelOpen: fixedBottom,
+        })
+      }
+    }
+
     // Restore last opened worktree+session per project (convert snake_case → camelCase keys)
     const lastOpenedPerProject = uiState.last_opened_per_project ?? {}
     if (Object.keys(lastOpenedPerProject).length > 0) {
@@ -419,6 +551,17 @@ export function useUIStatePersistence() {
     let prevModalTerminalWidth = useTerminalStore.getState().modalTerminalWidth
     let prevModalTerminalHeight =
       useTerminalStore.getState().modalTerminalHeight
+    let prevBrowserTabs = useBrowserStore.getState().tabs
+    let prevBrowserActiveTabIds = useBrowserStore.getState().activeTabIds
+    let prevBrowserSidePaneOpen = useBrowserStore.getState().sidePaneOpen
+    let prevBrowserSidePaneWidth = useBrowserStore.getState().sidePaneWidth
+    let prevBrowserModalOpen = useBrowserStore.getState().modalOpen
+    let prevBrowserModalDockMode = useBrowserStore.getState().modalDockMode
+    let prevBrowserModalWidth = useBrowserStore.getState().modalWidth
+    let prevBrowserModalHeight = useBrowserStore.getState().modalHeight
+    let prevBrowserBottomPanelOpen = useBrowserStore.getState().bottomPanelOpen
+    let prevBrowserBottomPanelHeight =
+      useBrowserStore.getState().bottomPanelHeight
 
     // Subscribe to projects-store changes (expanded projects, folders, and selected project)
     const unsubProjects = useProjectsStore.subscribe(state => {
@@ -524,6 +667,62 @@ export function useUIStatePersistence() {
       }
     })
 
+    // Subscribe to browser-store changes (tabs, active tab, surfaces)
+    const unsubBrowser = useBrowserStore.subscribe(state => {
+      const tabsChanged = state.tabs !== prevBrowserTabs
+      const activeChanged = state.activeTabIds !== prevBrowserActiveTabIds
+      const sideOpenChanged = state.sidePaneOpen !== prevBrowserSidePaneOpen
+      const sideWidthChanged = state.sidePaneWidth !== prevBrowserSidePaneWidth
+      const modalOpenChanged = state.modalOpen !== prevBrowserModalOpen
+      const modalDockChanged = state.modalDockMode !== prevBrowserModalDockMode
+      const modalWidthChanged = state.modalWidth !== prevBrowserModalWidth
+      const modalHeightChanged = state.modalHeight !== prevBrowserModalHeight
+      const bottomOpenChanged =
+        state.bottomPanelOpen !== prevBrowserBottomPanelOpen
+      const bottomHeightChanged =
+        state.bottomPanelHeight !== prevBrowserBottomPanelHeight
+
+      if (
+        tabsChanged ||
+        activeChanged ||
+        sideOpenChanged ||
+        sideWidthChanged ||
+        modalOpenChanged ||
+        modalDockChanged ||
+        modalWidthChanged ||
+        modalHeightChanged ||
+        bottomOpenChanged ||
+        bottomHeightChanged
+      ) {
+        // Detect tab removals — close their backing webviews
+        if (tabsChanged && isNativeApp()) {
+          const prevIds = new Set<string>()
+          for (const list of Object.values(prevBrowserTabs)) {
+            for (const t of list) prevIds.add(t.id)
+          }
+          const nextIds = new Set<string>()
+          for (const list of Object.values(state.tabs)) {
+            for (const t of list) nextIds.add(t.id)
+          }
+          for (const id of prevIds) {
+            if (!nextIds.has(id)) void browserBackend.close(id)
+          }
+        }
+        prevBrowserTabs = state.tabs
+        prevBrowserActiveTabIds = state.activeTabIds
+        prevBrowserSidePaneOpen = state.sidePaneOpen
+        prevBrowserSidePaneWidth = state.sidePaneWidth
+        prevBrowserModalOpen = state.modalOpen
+        prevBrowserModalDockMode = state.modalDockMode
+        prevBrowserModalWidth = state.modalWidth
+        prevBrowserModalHeight = state.modalHeight
+        prevBrowserBottomPanelOpen = state.bottomPanelOpen
+        prevBrowserBottomPanelHeight = state.bottomPanelHeight
+        const currentState = getCurrentUIState()
+        debouncedSaveRef.current?.(currentState)
+      }
+    })
+
     logger.debug('UI state persistence subscriptions active')
 
     return () => {
@@ -531,6 +730,7 @@ export function useUIStatePersistence() {
       unsubUI()
       unsubChat()
       unsubTerminal()
+      unsubBrowser()
       debouncedSaveRef.current?.cancel()
       logger.debug('UI state persistence subscriptions cleaned up')
     }

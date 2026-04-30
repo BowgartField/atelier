@@ -3,6 +3,7 @@ import type { EffortLevel, ThinkingLevel } from '@/types/chat'
 
 export const MODEL_OPTIONS: { value: ClaudeModel; label: string }[] = [
   { value: 'claude-opus-4-7', label: 'Opus 4.7' },
+  { value: 'claude-opus-4-7[1m]', label: 'Opus 4.7 (1M)' },
   { value: 'claude-opus-4-6', label: 'Opus 4.6' },
   { value: 'claude-opus-4-5-20251101', label: 'Opus 4.5' },
   { value: 'claude-opus-4-6[1m]', label: 'Opus 4.6 (1M)' },

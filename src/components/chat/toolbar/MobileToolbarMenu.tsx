@@ -99,6 +99,7 @@ interface MobileToolbarMenuProps {
   onOpenPr: () => void
   onReview: () => void
   onMerge: () => void
+  onMergePr: () => void
   onResolveConflicts: () => void
   onOpenBackendModelPicker: () => void
 
@@ -160,6 +161,7 @@ export function MobileToolbarMenu({
   onOpenPr,
   onReview,
   onMerge,
+  onMergePr,
   onResolveConflicts,
   onOpenBackendModelPicker,
   handlePullClick,
@@ -518,20 +520,32 @@ export function MobileToolbarMenu({
             R
           </span>
         </DropdownMenuItem>
-        {hasOpenPr && (
-          <DropdownMenuItem
-            onClick={() => {
-              setMenuOpen(false)
-              useUIStore.getState().setReviewCommentsModalOpen(true)
-            }}
-          >
-            <MessageSquare className="h-4 w-4" />
-            Review Comments
-            <span className="ml-auto text-xs text-muted-foreground bg-muted px-1.5 py-0.5 rounded">
-              V
-            </span>
-          </DropdownMenuItem>
-        )}
+        <DropdownMenuItem
+          disabled={!hasOpenPr}
+          onClick={() => {
+            setMenuOpen(false)
+            useUIStore.getState().setReviewCommentsModalOpen(true)
+          }}
+        >
+          <MessageSquare className="h-4 w-4" />
+          PR Comments
+          <span className="ml-auto text-xs text-muted-foreground bg-muted px-1.5 py-0.5 rounded">
+            V
+          </span>
+        </DropdownMenuItem>
+        <DropdownMenuItem
+          disabled={!hasOpenPr}
+          onClick={() => {
+            setMenuOpen(false)
+            onMergePr()
+          }}
+        >
+          <GitMerge className="h-4 w-4" />
+          Merge
+          <span className="ml-auto text-xs text-muted-foreground bg-muted px-1.5 py-0.5 rounded">
+            N
+          </span>
+        </DropdownMenuItem>
 
         <DropdownMenuSeparator />
 

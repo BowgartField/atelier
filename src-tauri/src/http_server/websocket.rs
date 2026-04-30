@@ -2,6 +2,7 @@ use axum::extract::ws::{Message, WebSocket};
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::time::{Duration, Instant};
 use tauri::{AppHandle, Manager};
 use tokio::sync::{broadcast, mpsc};
 
@@ -23,6 +24,9 @@ enum WsClientMessage {
     /// Request replay of missed events after reconnection.
     #[serde(rename = "replay")]
     Replay { session_id: String, last_seq: u64 },
+    /// Request replay of missed terminal events after reconnection.
+    #[serde(rename = "terminal_replay")]
+    TerminalReplay { terminal_id: String, last_seq: u64 },
 }
 
 /// Legacy invoke request without `type` field (backwards compat).
@@ -72,11 +76,32 @@ pub async fn handle_ws_connection(
     // responses are infrequent (user-initiated) and must never be dropped.
     let (resp_tx, mut resp_rx) = mpsc::unbounded_channel::<String>();
 
-    // Main loop — three event sources, never blocks on command dispatch.
+    // Heartbeat: server-driven ping every PING_INTERVAL. If no inbound
+    // traffic (pong, text, ping) for PONG_TIMEOUT, treat connection as dead
+    // and break — onclose path on the client triggers reconnect + replay.
+    const PING_INTERVAL: Duration = Duration::from_secs(20);
+    const PONG_TIMEOUT: Duration = Duration::from_secs(45);
+    let mut ping_interval = tokio::time::interval(PING_INTERVAL);
+    ping_interval.tick().await; // skip immediate fire
+    let mut last_inbound = Instant::now();
+
+    // Main loop — four event sources, never blocks on command dispatch.
     loop {
         tokio::select! {
+            // ── Heartbeat tick ───────────────────────────────────────
+            _ = ping_interval.tick() => {
+                if last_inbound.elapsed() > PONG_TIMEOUT {
+                    log::warn!("WS client idle > {PONG_TIMEOUT:?}, dropping connection");
+                    break;
+                }
+                if ws_tx.send(Message::Ping(vec![].into())).await.is_err() {
+                    break;
+                }
+            }
+
             // ── Incoming command from client ──────────────────────────
             msg = ws_rx.next() => {
+                last_inbound = Instant::now();
                 match msg {
                     Some(Ok(Message::Text(text))) => {
                         match serde_json::from_str::<WsClientMessage>(&text) {
@@ -115,6 +140,17 @@ pub async fn handle_ws_connection(
                                 // Replay missed events for this session
                                 if let Some(broadcaster) = app.try_state::<WsBroadcaster>() {
                                     let events = broadcaster.replay_events(&session_id, last_seq);
+                                    for (_seq, json) in events {
+                                        if ws_tx.send(Message::Text(json.to_string().into())).await.is_err() {
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                            Ok(WsClientMessage::TerminalReplay { terminal_id, last_seq }) => {
+                                // Replay missed terminal events after reconnect
+                                if let Some(broadcaster) = app.try_state::<WsBroadcaster>() {
+                                    let events = broadcaster.replay_terminal_events(&terminal_id, last_seq);
                                     for (_seq, json) in events {
                                         if ws_tx.send(Message::Text(json.to_string().into())).await.is_err() {
                                             break;
@@ -178,7 +214,8 @@ pub async fn handle_ws_connection(
                             break;
                         }
                     }
-                    _ => {} // Ignore binary, pong
+                    Some(Ok(Message::Pong(_))) => {} // liveness already bumped above
+                    _ => {} // Ignore binary
                 }
             }
 

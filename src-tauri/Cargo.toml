@@ -1,6 +1,6 @@
 [package]
 name = "jean"
-version = "0.1.46"
+version = "0.1.47"
 description = "Jean - AI Assistant"
 authors = ["Andras Bacsai"]
 edition = "2021"
@@ -18,7 +18,7 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = ["protocol-asset", "macos-private-api"] }
+tauri = { version = "2", features = ["protocol-asset", "macos-private-api", "unstable", "webview-data-url"] }
 tauri-plugin-opener = "2"
 tauri-plugin-window-state = "2"
 serde = { version = "1", features = ["derive"] }

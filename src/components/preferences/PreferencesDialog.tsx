@@ -635,7 +635,7 @@ export function PreferencesDialog() {
 
             <div
               ref={scrollContainerRef}
-              className="flex flex-1 flex-col gap-4 overflow-y-auto p-4 min-h-0 custom-scrollbar"
+              className="flex flex-1 flex-col gap-4 overflow-y-auto p-4 min-h-0"
             >
               <PreferencesSearchBar
                 variant="mobile"

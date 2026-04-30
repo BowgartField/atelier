@@ -13,6 +13,14 @@ export interface ProjectCanvasSettingsState {
 
 export type ModalTerminalDockMode = 'floating' | 'left' | 'right' | 'bottom'
 
+export type ModalBrowserDockMode = 'floating' | 'left' | 'right' | 'bottom'
+
+export interface BrowserTabPersisted {
+  id: string
+  url: string
+  title?: string
+}
+
 export interface UIState {
   active_worktree_id: string | null
   active_worktree_path: string | null
@@ -40,6 +48,26 @@ export interface UIState {
   modal_terminal_width?: number
   /** Modal terminal height in pixels for bottom dock */
   modal_terminal_height?: number
+  /** Browser tabs persisted per worktree */
+  browser_tabs?: Record<string, BrowserTabPersisted[]>
+  /** Active browser tab id per worktree */
+  browser_active_tab_ids?: Record<string, string>
+  /** Browser side-pane open state per worktree */
+  browser_side_pane_open?: Record<string, boolean>
+  /** Browser side-pane width in pixels (global) */
+  browser_side_pane_width?: number
+  /** Browser modal drawer open state per worktree */
+  browser_modal_open?: Record<string, boolean>
+  /** Browser modal drawer dock mode */
+  browser_modal_dock_mode?: ModalBrowserDockMode
+  /** Browser modal drawer width in pixels for left/right dock */
+  browser_modal_width?: number
+  /** Browser modal drawer height in pixels for bottom dock */
+  browser_modal_height?: number
+  /** Browser bottom panel open state per worktree */
+  browser_bottom_panel_open?: Record<string, boolean>
+  /** Browser bottom panel height in pixels (global) */
+  browser_bottom_panel_height?: number
   /** Last-accessed timestamps per project for recency sorting: projectId → unix ms */
   project_access_timestamps?: Record<string, number>
   /** Dashboard worktree collapse overrides: worktreeId → collapsed (true/false) */
@@ -70,5 +98,15 @@ export const defaultUIState: UIState = {
   modal_terminal_width: 400,
   modal_terminal_height: 280,
   modal_terminal_pinned: false,
+  browser_tabs: {},
+  browser_active_tab_ids: {},
+  browser_side_pane_open: {},
+  browser_side_pane_width: 520,
+  browser_modal_open: {},
+  browser_modal_dock_mode: 'floating',
+  browser_modal_width: 520,
+  browser_modal_height: 400,
+  browser_bottom_panel_open: {},
+  browser_bottom_panel_height: 360,
   version: 1,
 }

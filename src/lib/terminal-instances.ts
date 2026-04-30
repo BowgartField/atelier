@@ -12,7 +12,11 @@ import { Terminal } from '@xterm/xterm'
 import { FitAddon } from '@xterm/addon-fit'
 import { WebLinksAddon } from '@xterm/addon-web-links'
 import { openExternal } from '@/lib/platform'
-import { invoke } from '@/lib/transport'
+import {
+  invoke,
+  isTransportConnected,
+  subscribeTransportStatus,
+} from '@/lib/transport'
 import { listen } from '@/lib/transport'
 import { useTerminalStore } from '@/store/terminal-store'
 import type {
@@ -59,6 +63,33 @@ function ensureWakeHandler(): void {
   }
   document.addEventListener('visibilitychange', wake)
   window.addEventListener('focus', wake)
+}
+
+/** Register one transport status subscriber that writes a [Reconnecting...]/
+ *  [Reconnected] banner into every live xterm instance on connection-state
+ *  transitions. Web access mode only — native always reports connected.
+ *  Helps users understand why their input is being dropped during outages. */
+let transportStatusSubscribed = false
+let lastTransportConnected: boolean | null = null
+function ensureTransportStatusBanner(): void {
+  if (transportStatusSubscribed) return
+  transportStatusSubscribed = true
+  lastTransportConnected = isTransportConnected()
+  subscribeTransportStatus(() => {
+    const connected = isTransportConnected()
+    if (connected === lastTransportConnected) return
+    const message = connected
+      ? '\r\n\x1b[32m[Reconnected]\x1b[0m\r\n'
+      : '\r\n\x1b[33m[Reconnecting...]\x1b[0m\r\n'
+    for (const inst of instances.values()) {
+      try {
+        inst.terminal.write(message)
+      } catch {
+        // ignore — terminal may be in mid-dispose
+      }
+    }
+    lastTransportConnected = connected
+  })
 }
 
 const FALLBACK_TERMINAL_BACKGROUND = '#101010'
@@ -171,13 +202,19 @@ export function getOrCreateTerminal(
     })
   )
 
-  // Handle user input - forward to PTY
+  // Handle user input - forward to PTY.
+  // Drop input while transport is disconnected: queueing 30s+ of keystrokes
+  // and dumping them into the shell on reconnect = footgun (e.g. dangerous
+  // partial commands executed). Banner makes the dropped state visible.
   terminal.onData(data => {
+    if (!isTransportConnected()) return
     invoke('terminal_write', { terminalId, data }).catch(console.error)
   })
 
   // Ensure the visibility/focus wake handler is running.
   ensureWakeHandler()
+  // Ensure transport status banner subscription is active (web access mode).
+  ensureTransportStatusBanner()
 
   const listeners: Promise<() => void>[] = []
 

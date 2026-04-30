@@ -379,6 +379,7 @@ export function ChatWindow({
     const store = useChatStore.getState()
     const currentActive = store.activeSessionIds[activeWorktreeId]
     const sessions = sessionsData.sessions
+    if (!sessions) return
     const firstSession = sessions[0]
 
     // If no active session in store, or it doesn't exist in loaded sessions
@@ -392,7 +393,7 @@ export function ChatWindow({
   }, [sessionsData, activeWorktreeId, isSessionsFetching, uiStateInitialized])
 
   // Use backend's active session if store doesn't have one yet
-  if (!activeSessionId && sessionsData?.sessions.length) {
+  if (!activeSessionId && sessionsData?.sessions?.length) {
     activeSessionId =
       sessionsData.active_session_id ?? sessionsData.sessions[0]?.id
   }
@@ -1756,6 +1757,7 @@ export function ChatWindow({
     handleOpenPr,
     handleReview,
     handleMerge,
+    handleMergePr,
     handleResolveConflicts,
     handleResolvePrConflicts,
     executeMerge,
@@ -1926,6 +1928,7 @@ export function ChatWindow({
     handleOpenPr,
     handleReview,
     handleMerge,
+    handleMergePr,
     handleResolveConflicts,
     handleInvestigateWorkflowRun,
     handleInvestigate,
@@ -2246,6 +2249,7 @@ export function ChatWindow({
 
   return (
     <ErrorBoundary
+      resetKeys={[activeWorktreeId]}
       onError={(error, errorInfo) => {
         logger.error('ChatWindow crashed', {
           error: error.message,
@@ -2841,6 +2845,7 @@ export function ChatWindow({
                                 onOpenPr={handleOpenPr}
                                 onReview={() => handleReview()}
                                 onMerge={handleMerge}
+                                onMergePr={handleMergePr}
                                 onResolvePrConflicts={handleResolvePrConflicts}
                                 onBackendModelChange={
                                   handleToolbarBackendModelChange
@@ -2884,42 +2889,43 @@ export function ChatWindow({
                           {!terminalPanelOpen &&
                             (activeTodos.length > 0 ||
                               activeAgents.length > 0) && (
-                            <div className="hidden xl:flex flex-col gap-2 absolute left-full bottom-0 ml-3 w-64 z-20">
-                              {activeTodos.length > 0 &&
-                                (dismissedTodoMessageId === null ||
-                                  (todoSourceMessageId !== null &&
-                                    todoSourceMessageId !==
-                                      dismissedTodoMessageId)) && (
-                                  <TodoWidget
-                                    todos={normalizeTodosForDisplay(
-                                      activeTodos,
-                                      isFromStreaming
-                                    )}
-                                    isStreaming={isSending}
-                                    onClose={() =>
-                                      setDismissedTodoMessageId(
-                                        todoSourceMessageId ?? '__streaming__'
-                                      )
-                                    }
-                                  />
-                                )}
-                              {activeAgents.length > 0 &&
-                                (dismissedAgentMessageId === null ||
-                                  (agentSourceMessageId !== null &&
-                                    agentSourceMessageId !==
-                                      dismissedAgentMessageId)) && (
-                                  <AgentWidget
-                                    agents={activeAgents}
-                                    isStreaming={agentIsFromStreaming}
-                                    onClose={() =>
-                                      setDismissedAgentMessageId(
-                                        agentSourceMessageId ?? '__streaming__'
-                                      )
-                                    }
-                                  />
-                                )}
-                            </div>
-                          )}
+                              <div className="hidden xl:flex flex-col gap-2 absolute left-full bottom-0 ml-3 w-64 z-20">
+                                {activeTodos.length > 0 &&
+                                  (dismissedTodoMessageId === null ||
+                                    (todoSourceMessageId !== null &&
+                                      todoSourceMessageId !==
+                                        dismissedTodoMessageId)) && (
+                                    <TodoWidget
+                                      todos={normalizeTodosForDisplay(
+                                        activeTodos,
+                                        isFromStreaming
+                                      )}
+                                      isStreaming={isSending}
+                                      onClose={() =>
+                                        setDismissedTodoMessageId(
+                                          todoSourceMessageId ?? '__streaming__'
+                                        )
+                                      }
+                                    />
+                                  )}
+                                {activeAgents.length > 0 &&
+                                  (dismissedAgentMessageId === null ||
+                                    (agentSourceMessageId !== null &&
+                                      agentSourceMessageId !==
+                                        dismissedAgentMessageId)) && (
+                                    <AgentWidget
+                                      agents={activeAgents}
+                                      isStreaming={agentIsFromStreaming}
+                                      onClose={() =>
+                                        setDismissedAgentMessageId(
+                                          agentSourceMessageId ??
+                                            '__streaming__'
+                                        )
+                                      }
+                                    />
+                                  )}
+                              </div>
+                            )}
                         </div>
                       </div>
                     </div>

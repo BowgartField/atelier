@@ -129,7 +129,7 @@ export function WorktreeDropdownMenu({
     (alerts?.length ?? 0) +
     (advisories?.filter(a => a.state === 'draft' || a.state === 'triage')
       .length ?? 0)
-  const workflowRunCount = workflowRuns?.runs.length ?? 0
+  const workflowRunCount = workflowRuns?.runs?.length ?? 0
   const failedWorkflowCount = workflowRuns?.failedCount ?? 0
   const isMobile = useIsMobile()
   const hasDiff = uncommittedAdded > 0 || uncommittedRemoved > 0

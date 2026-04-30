@@ -23,6 +23,7 @@ import {
   Sparkles,
   Tag,
   Terminal,
+  Globe,
   Play,
   Plus,
   Trash2,
@@ -45,6 +46,7 @@ import { ScrollArea, ScrollBar } from '@/components/ui/scroll-area'
 import { CloseWorktreeDialog } from './CloseWorktreeDialog'
 import { useChatStore } from '@/store/chat-store'
 import { useTerminalStore } from '@/store/terminal-store'
+import { useBrowserStore } from '@/store/browser-store'
 import { useUIStore } from '@/store/ui-store'
 import {
   useSessions,
@@ -69,6 +71,7 @@ import { copyToClipboard } from '@/lib/clipboard'
 import { toast } from 'sonner'
 import { ChatWindow } from './ChatWindow'
 import { ModalTerminalDrawer } from './ModalTerminalDrawer'
+import { ModalBrowserDrawer } from '@/components/browser/ModalBrowserDrawer'
 import { OpenInButton } from '@/components/open-in/OpenInButton'
 import { DevToolsDropdown } from './DevToolsDropdown'
 import {
@@ -252,6 +255,15 @@ export function SessionChatModal({
   const modalTerminalDockMode = useTerminalStore(
     state => state.modalTerminalDockMode
   )
+  const hasBottomTerminal =
+    isModalTerminalOpen && modalTerminalDockMode === 'bottom'
+  const isBrowserModalOpen = useBrowserStore(
+    state => state.modalOpen[worktreeId] ?? false
+  )
+  const browserModalDockMode = useBrowserStore(state => state.modalDockMode)
+  const hasBottomBrowser =
+    isBrowserModalOpen && browserModalDockMode === 'bottom'
+  const hasBottomDock = hasBottomTerminal || hasBottomBrowser
   const hasRunningTerminal = useTerminalStore(state => {
     const terminals = state.terminals[worktreeId] ?? []
     return terminals.some(t => state.runningTerminals.has(t.id))
@@ -755,12 +767,15 @@ export function SessionChatModal({
         const terminalAncestor = target?.closest?.(
           '[data-terminal-root="true"]'
         )
-        const { planDialogOpen, gitDiffModalOpen } = useUIStore.getState()
+        const { planDialogOpen, gitDiffModalOpen, contextViewerOpen } =
+          useUIStore.getState()
 
         // Don't close if PlanDialog is open — let it handle ESC
         if (planDialogOpen) return
         // Don't close if GitDiffModal is open — let it handle ESC
         if (gitDiffModalOpen) return
+        // Don't close if ContextViewerDialog is open — let it handle ESC
+        if (contextViewerOpen) return
         // Don't close if CloseWorktreeDialog is open — let it handle ESC
         if (closeConfirmOpen) return
         // Don't close if ESC originated inside a child dialog/sheet portal
@@ -785,7 +800,7 @@ export function SessionChatModal({
         className={cn(
           'absolute inset-0 z-10 flex min-w-0 overflow-hidden bg-background pt-[3px]',
           !isMobile && 'pb-2',
-          modalTerminalDockMode === 'bottom' ? 'flex-col' : 'flex-row'
+          hasBottomDock ? 'flex-col' : 'flex-row'
         )}
         style={
           isMobile
@@ -812,6 +827,7 @@ export function SessionChatModal({
             dockMode="left"
           />
         )}
+        <ModalBrowserDrawer worktreeId={worktreeId} dockMode="left" />
         <div className="flex min-w-0 flex-1 flex-col overflow-hidden">
           <div className="shrink-0 border-b sm:text-left">
             <div
@@ -821,7 +837,7 @@ export function SessionChatModal({
               )}
             >
               <div className="flex items-center gap-2 min-w-0">
-                <h2 className="text-sm font-medium min-w-0 truncate">
+                <h2 className="text-sm font-medium min-w-0 flex-1 truncate">
                   {project && !isMobile && (
                     <span className="text-muted-foreground font-normal">
                       <button
@@ -838,9 +854,9 @@ export function SessionChatModal({
                 </h2>
                 {worktree?.base_branch &&
                   worktree.base_branch !== project?.default_branch && (
-                    <span className="inline-flex items-center gap-1 rounded border border-border/50 px-1.5 py-0.5 text-[10px] font-normal text-muted-foreground">
+                    <span className="inline-flex shrink min-w-0 items-center gap-1 rounded border border-border/50 px-1.5 py-0.5 text-[10px] font-normal text-muted-foreground">
                       <GitBranchPlus className="h-2.5 w-2.5" />
-                      <span className="max-w-40 truncate">
+                      <span className="max-w-16 sm:max-w-40 truncate">
                         {worktree.base_branch}
                       </span>
                       {stackedOnPR && (
@@ -929,6 +945,24 @@ export function SessionChatModal({
                       </kbd>
                     </TooltipContent>
                   </Tooltip>
+                  {isNativeApp() && (
+                    <Tooltip>
+                      <TooltipTrigger asChild>
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          className="h-7 px-2 text-xs"
+                          aria-label="Toggle browser"
+                          onClick={() => {
+                            useBrowserStore.getState().toggleModal(worktreeId)
+                          }}
+                        >
+                          <Globe className="h-3 w-3" />
+                        </Button>
+                      </TooltipTrigger>
+                      <TooltipContent>Browser</TooltipContent>
+                    </Tooltip>
+                  )}
                   {runScripts.length === 1 && (
                     <Tooltip>
                       <TooltipTrigger asChild>
@@ -1440,6 +1474,7 @@ export function SessionChatModal({
             dockMode="right"
           />
         )}
+        <ModalBrowserDrawer worktreeId={worktreeId} dockMode="right" />
         {isModalTerminalOpen && modalTerminalDockMode === 'bottom' && (
           <ModalTerminalDrawer
             worktreeId={worktreeId}
@@ -1447,6 +1482,10 @@ export function SessionChatModal({
             dockMode="bottom"
           />
         )}
+        {/* Browser bottom drawer sits at outer-flex bottom row alongside
+            terminal-bottom; outer flex flips to flex-col when either is
+            docked at bottom (see hasBottomDock). */}
+        <ModalBrowserDrawer worktreeId={worktreeId} dockMode="bottom" />
         {modalTerminalDockMode === 'floating' && (
           <ModalTerminalDrawer
             worktreeId={worktreeId}
@@ -1454,6 +1493,7 @@ export function SessionChatModal({
             dockMode="floating"
           />
         )}
+        <ModalBrowserDrawer worktreeId={worktreeId} dockMode="floating" />
       </div>
       <LabelModal
         isOpen={labelModalOpen}

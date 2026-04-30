@@ -13,6 +13,7 @@ import {
   gitPush,
   triggerImmediateGitPoll,
   triggerImmediateRemotePoll,
+  fetchWorktreesStatus,
   performGitPull,
 } from '@/services/git-status'
 import { prStatusQueryKeys } from '@/services/pr-status'
@@ -25,6 +26,7 @@ import type {
   ReviewResponse,
   MergeWorktreeResponse,
   MergeConflictsResponse,
+  MergePrResponse,
   MergeType,
   Worktree,
   Project,
@@ -80,6 +82,8 @@ interface UseGitOperationsReturn {
   handleReview: (existingSessionId?: string) => Promise<void>
   /** Validates and shows merge options dialog */
   handleMerge: () => Promise<void>
+  /** Merges open PR on GitHub then archives/deletes worktree */
+  handleMergePr: () => Promise<void>
   /** Detects existing merge conflicts and opens resolution session */
   handleResolveConflicts: (override?: InvestigateOverride) => Promise<void>
   /** Fetches base branch and merges to create local conflict state for PR conflict resolution */
@@ -732,6 +736,54 @@ export function useGitOperations({
     setShowMergeDialog(true)
   }, [activeWorktreeId, worktree])
 
+  // Handle Merge PR - merges open PR on GitHub then archives/deletes worktree
+  const handleMergePr = useCallback(async () => {
+    if (!activeWorktreeId || !worktree) return
+    if (!worktree.pr_number) {
+      toast.error('No PR open for this worktree')
+      return
+    }
+
+    const mergePrToastId = toast.loading('Merging PR...')
+    try {
+      const result = await invoke<MergePrResponse>('merge_github_pr', {
+        worktreePath: worktree.path,
+      })
+      toast.success(result.message, { id: mergePrToastId })
+
+      // Archive or delete the worktree (same as auto-archive on merge)
+      const shouldDelete = preferences?.removal_behavior === 'delete'
+      const action = shouldDelete ? 'Deleting' : 'Archiving'
+      const cleanupToastId = toast.loading(`${action} worktree...`)
+      try {
+        await invoke(shouldDelete ? 'delete_worktree' : 'archive_worktree', {
+          worktreeId: activeWorktreeId,
+        })
+        queryClient.invalidateQueries({
+          queryKey: projectsQueryKeys.worktrees(worktree.project_id),
+        })
+        triggerImmediateGitPoll()
+        if (worktree.project_id) fetchWorktreesStatus(worktree.project_id)
+        const pastAction = shouldDelete ? 'Deleted' : 'Archived'
+        toast.success(`${pastAction} "${worktree.name}"`, {
+          id: cleanupToastId,
+        })
+      } catch (cleanupError) {
+        toast.error(
+          `Failed to ${action.toLowerCase()} worktree: ${cleanupError}`,
+          { id: cleanupToastId }
+        )
+      }
+    } catch (error) {
+      toast.error(`Failed to merge PR: ${error}`, { id: mergePrToastId })
+    }
+  }, [
+    activeWorktreeId,
+    worktree,
+    preferences?.removal_behavior,
+    queryClient,
+  ])
+
   // Handle Resolve Conflicts - detects existing merge conflicts and opens resolution session
   const handleResolveConflicts = useCallback(
     async (override?: InvestigateOverride) => {
@@ -1106,6 +1158,7 @@ ${resolveInstructions}`
     handleOpenPr,
     handleReview,
     handleMerge,
+    handleMergePr,
     handleResolveConflicts,
     handleResolvePrConflicts,
     executeMerge,

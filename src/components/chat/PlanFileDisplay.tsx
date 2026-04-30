@@ -1,11 +1,24 @@
-import { useState } from 'react'
+import { useCallback, useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
-import { ChevronRight, FileText, AlertCircle } from 'lucide-react'
+import {
+  ChevronRight,
+  FileText,
+  AlertCircle,
+  Copy,
+  Check,
+} from 'lucide-react'
+import { toast } from 'sonner'
 import { readPlanFile } from '@/services/chat'
 import { Markdown } from '@/components/ui/markdown'
 import { cn } from '@/lib/utils'
 import { getFilename } from '@/lib/path-utils'
+import { copyToClipboard } from '@/lib/clipboard'
 import { Collapsible, CollapsibleTrigger } from '@/components/ui/collapsible'
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipTrigger,
+} from '@/components/ui/tooltip'
 
 interface PlanDisplayBaseProps {
   className?: string
@@ -69,6 +82,19 @@ export function PlanDisplay({
   // Use inline content if provided, otherwise use fetched content
   const content = inlineContent ?? fetchedContent
 
+  const [copied, setCopied] = useState(false)
+  const handleCopy = useCallback(
+    async (e: React.MouseEvent) => {
+      e.stopPropagation()
+      if (!content) return
+      await copyToClipboard(content)
+      toast.success('Plan copied to clipboard')
+      setCopied(true)
+      setTimeout(() => setCopied(false), 2000)
+    },
+    [content]
+  )
+
   if (!inlineContent && isLoading) {
     return (
       <div
@@ -106,11 +132,11 @@ export function PlanDisplay({
       open={isOpen}
       onOpenChange={setIsOpen}
       className={cn(
-        'rounded-md border border-border/50 bg-muted/30',
+        'relative rounded-md border border-border/50 bg-muted/30',
         className
       )}
     >
-      <CollapsibleTrigger className="flex w-full items-center gap-2 px-3 py-2 text-sm text-muted-foreground hover:bg-muted/50 cursor-pointer">
+      <CollapsibleTrigger className="flex w-full items-center gap-2 px-3 py-2 text-sm text-muted-foreground hover:bg-muted/50">
         <FileText className="h-4 w-4 shrink-0" />
         <span className="font-medium">Plan</span>
         {filename && (
@@ -125,6 +151,23 @@ export function PlanDisplay({
           )}
         />
       </CollapsibleTrigger>
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <button
+            type="button"
+            onClick={handleCopy}
+            aria-label="Copy plan markdown"
+            className="absolute right-8 top-1/2 -translate-y-1/2 opacity-50 hover:opacity-100 transition-opacity p-1 rounded-md hover:bg-background/80 text-muted-foreground hover:text-foreground cursor-pointer"
+          >
+            {copied ? (
+              <Check className="size-3.5" />
+            ) : (
+              <Copy className="size-3.5" />
+            )}
+          </button>
+        </TooltipTrigger>
+        <TooltipContent>Copy markdown</TooltipContent>
+      </Tooltip>
       {isOpen && (
         <div className="border-t border-border/50 px-3 py-3">
           <div>

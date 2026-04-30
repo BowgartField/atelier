@@ -42,7 +42,7 @@ export function SetupScriptOutput({
         )}
       >
         <div className="flex items-center">
-          <CollapsibleTrigger className="flex flex-1 cursor-pointer items-center gap-2 px-3 py-2 text-left hover:bg-muted/50">
+          <CollapsibleTrigger className="flex flex-1 items-center gap-2 px-3 py-2 text-left hover:bg-muted/50">
             <ChevronRight
               className={cn(
                 'h-4 w-4 shrink-0 text-muted-foreground transition-transform duration-200',

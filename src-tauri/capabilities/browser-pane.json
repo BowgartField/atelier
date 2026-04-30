@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "browser-pane",
+  "description": "Restricted capability for embedded browser child webviews. Pages loaded inside a browser pane have NO IPC commands available — they cannot call any Jean Tauri commands even if they tried.",
+  "webviews": ["browser-*"],
+  "permissions": []
+}

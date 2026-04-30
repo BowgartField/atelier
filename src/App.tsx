@@ -419,6 +419,60 @@ function App() {
       })
   }, [queryClient, seedCache])
 
+  // Global safety net for uncaught async errors / promise rejections.
+  // Without this, a thrown invoke() (e.g. auth/network failure) can leave the
+  // app in a half-broken state until the next ErrorBoundary catches it.
+  useEffect(() => {
+    const truncate = (s: string, n: number) =>
+      s.length > n ? `${s.slice(0, n)}…` : s
+
+    const isAlreadySurfacedAuthError = (msg: string): boolean => {
+      const lower = msg.toLowerCase()
+      return (
+        lower.includes('not authenticated') ||
+        lower.includes('unauthorized') ||
+        lower.includes('connection failed')
+      )
+    }
+
+    const handleRejection = (event: PromiseRejectionEvent) => {
+      const reason = event.reason
+      const message =
+        reason instanceof Error
+          ? reason.message
+          : typeof reason === 'string'
+            ? reason
+            : 'Unknown error'
+      logger.error('Unhandled promise rejection', {
+        message,
+        stack: reason instanceof Error ? reason.stack : undefined,
+      })
+      if (!isAlreadySurfacedAuthError(message)) {
+        toast.error(`Unexpected error: ${truncate(message, 200)}`)
+      }
+      event.preventDefault()
+    }
+
+    const handleError = (event: ErrorEvent) => {
+      const message = event.error?.message ?? event.message ?? 'Unknown error'
+      logger.error('Uncaught window error', {
+        message,
+        stack: event.error?.stack,
+        filename: event.filename,
+      })
+      if (!isAlreadySurfacedAuthError(message)) {
+        toast.error(`Unexpected error: ${truncate(message, 200)}`)
+      }
+    }
+
+    window.addEventListener('unhandledrejection', handleRejection)
+    window.addEventListener('error', handleError)
+    return () => {
+      window.removeEventListener('unhandledrejection', handleRejection)
+      window.removeEventListener('error', handleError)
+    }
+  }, [])
+
   // Apply font settings from preferences
   useFontSettings()
 

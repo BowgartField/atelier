@@ -13,6 +13,7 @@ const MIGRATED_KEYBINDINGS: Partial<Record<keyof KeybindingsMap, string>> = {
   open_provider_dropdown: 'alt+p', // Changed to 'mod+shift+p' (macOS dead key fix)
   open_model_dropdown: 'alt+m', // Changed to 'mod+shift+m' (macOS dead key fix)
   open_thinking_dropdown: 'alt+e', // Changed to 'mod+shift+e' (macOS dead key fix)
+  toggle_browser: 'mod+alt+b', // Changed to 'mod+shift+backquote'
 }
 
 // Migrate keybindings: if a stored value matches an old default, use the new default

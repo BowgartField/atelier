@@ -242,7 +242,7 @@ export function AskUserQuestion({
         className="min-w-0"
       >
         <div className="my-2 min-w-0 rounded border border-muted bg-muted/30 font-mono text-sm">
-          <CollapsibleTrigger className="flex w-full cursor-pointer items-center gap-2 px-3 py-2 text-left text-sm text-muted-foreground hover:bg-muted/50">
+          <CollapsibleTrigger className="flex w-full items-center gap-2 px-3 py-2 text-left text-sm text-muted-foreground hover:bg-muted/50">
             <CheckCircle2 className="h-4 w-4 shrink-0 text-green-500" />
             <span className="truncate font-medium">{getAnswerSummary()}</span>
             <ChevronRight

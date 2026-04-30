@@ -21,18 +21,24 @@ export function hasMeaningfulAssistantPayload(
   })
 }
 
+const PLAN_TOOL_NAMES = new Set(['CodexPlan', 'ExitPlanMode'])
+
 export function shouldHydrateCompletedSessionFromBackend(
   content: string,
   contentBlocks: ContentBlock[] = [],
   toolCalls: ToolCall[] = []
 ): boolean {
-  const hasPlanTool = toolCalls.some(tc => tc.name === 'CodexPlan')
-  const hasPlanToolBlock = contentBlocks.some(
-    block => block.type === 'tool_use' && block.tool_call_id.trim().length > 0
-  )
-  const extractedPlan = splitTextAroundPlan(content).plan
+  // Always hydrate after a plan tool: chat:done adds an optimistic assistant
+  // message with a frontend-generated id, which can race past useSendMessage
+  // onSuccess and leave the cache holding an id that doesn't match the
+  // backend's NDJSON id. mark_plan_approved keys on that id, so without
+  // hydration the approval never sticks and the plan dialog re-shows.
+  const hasPlanTool = toolCalls.some(tc => PLAN_TOOL_NAMES.has(tc.name))
+  if (hasPlanTool) return true
 
-  if (extractedPlan && (!hasPlanTool || !hasPlanToolBlock)) {
+  // No plan tool emitted, but text contains a plan section → hydrate so the
+  // backend can re-parse and persist a structured plan.
+  if (splitTextAroundPlan(content).plan) {
     return true
   }
 

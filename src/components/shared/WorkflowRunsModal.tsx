@@ -515,7 +515,7 @@ export function WorkflowRunsModal() {
         // Ignore — we'll create a new session below
       }
 
-      const emptySession = existingSessions?.sessions.find(
+      const emptySession = existingSessions?.sessions?.find(
         s =>
           !s.archived_at && (s.message_count === 0 || s.message_count == null)
       )

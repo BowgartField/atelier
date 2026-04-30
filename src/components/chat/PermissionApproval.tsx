@@ -233,7 +233,7 @@ export function PermissionApproval({
     return (
       <Collapsible open={isExpanded} onOpenChange={setIsExpanded}>
         <div className="my-2 rounded border border-border/50 bg-muted/30 font-mono text-sm">
-          <CollapsibleTrigger className="flex w-full cursor-pointer items-center gap-2 px-3 py-2 text-left hover:bg-muted/50">
+          <CollapsibleTrigger className="flex w-full items-center gap-2 px-3 py-2 text-left hover:bg-muted/50">
             <ChevronRight
               className={cn(
                 'h-4 w-4 shrink-0 text-muted-foreground transition-transform duration-200',

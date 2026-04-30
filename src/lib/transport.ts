@@ -299,6 +299,10 @@ class WsTransport {
   private reconnectAttempt = 0
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null
   private connectWatchdog: ReturnType<typeof setTimeout> | null = null
+  /** Periodic check that we're seeing inbound traffic from the server.
+   *  Server pings every 20s, so a 50s gap means the connection is dead. */
+  private livenessTimer: ReturnType<typeof setInterval> | null = null
+  private _lastInbound = 0
   private queue: { data: string; resolve: () => void }[] = []
   // Buffer for events that arrive before listeners are registered.
   // Covers the ~16ms gap between WS onopen and React effect listener setup.
@@ -320,6 +324,10 @@ class WsTransport {
   private _lastSeqBySession = new Map<string, number>()
   /** Sessions that were actively streaming when we disconnected. */
   private _activeStreamingSessions = new Set<string>()
+  /** Track last seen seq per terminal for replay on reconnect. */
+  private _lastSeqByTerminal = new Map<string, number>()
+  /** Terminals that were running when we (potentially) disconnected. */
+  private _activeTerminals = new Set<string>()
 
   get connected(): boolean {
     return this._connected
@@ -482,6 +490,8 @@ class WsTransport {
     this.ws.onopen = () => {
       this.clearConnectWatchdog()
       this._lastConnectTime = Date.now()
+      this._lastInbound = Date.now()
+      this.startLivenessTimer()
       this.setConnected(true)
       this.reconnectAttempt = 0
 
@@ -499,6 +509,20 @@ class WsTransport {
         }
       }
 
+      // Replay missed terminal output (heals output gap during disconnect)
+      for (const terminalId of this._activeTerminals) {
+        const lastSeq = this._lastSeqByTerminal.get(terminalId)
+        if (lastSeq != null) {
+          this.ws?.send(
+            JSON.stringify({
+              type: 'terminal_replay',
+              terminal_id: terminalId,
+              last_seq: lastSeq,
+            })
+          )
+        }
+      }
+
       // Flush queued messages
       for (const item of this.queue) {
         this.ws?.send(item.data)
@@ -508,6 +532,7 @@ class WsTransport {
     }
 
     this.ws.onmessage = event => {
+      this._lastInbound = Date.now()
       try {
         const msg: WsMessage = JSON.parse(event.data)
         this.handleMessage(msg)
@@ -518,6 +543,7 @@ class WsTransport {
 
     this.ws.onclose = () => {
       this.clearConnectWatchdog()
+      this.stopLivenessTimer()
       this.ws = null
 
       // If the socket closed within 2s of opening, the token may have been
@@ -570,6 +596,11 @@ class WsTransport {
   private static readonly DEFAULT_TIMEOUT = 60_000
   private static readonly CONNECT_TIMEOUT = 12_000
   private static readonly MAX_QUEUE_SIZE = 500
+  /** If no inbound traffic for this long, assume connection is dead.
+   *  Must exceed server PONG_TIMEOUT (45s) — browser auto-replies to
+   *  server pings, so any healthy connection sees inbound frames every 20s. */
+  private static readonly INBOUND_TIMEOUT = 50_000
+  private static readonly LIVENESS_CHECK_INTERVAL = 10_000
 
   /** Call a backend command over WebSocket. */
   async invoke<T>(command: string, args?: Record<string, unknown>): Promise<T> {
@@ -709,6 +740,22 @@ class WsTransport {
             this._lastSeqBySession.delete(sessionId)
           }
         }
+
+        // Track terminal seq for replay on reconnect (output gap healing)
+        const terminalId = payload.terminal_id as string | undefined
+        if (terminalId && msg.event.startsWith('terminal:')) {
+          const lastSeen = this._lastSeqByTerminal.get(terminalId)
+          if (lastSeen != null && msg.seq <= lastSeen) {
+            return // Duplicate from replay — skip
+          }
+          this._lastSeqByTerminal.set(terminalId, msg.seq)
+          if (msg.event === 'terminal:started') {
+            this._activeTerminals.add(terminalId)
+          } else if (msg.event === 'terminal:stopped') {
+            this._activeTerminals.delete(terminalId)
+            this._lastSeqByTerminal.delete(terminalId)
+          }
+        }
       }
 
       const handlers = this.listeners.get(msg.event)
@@ -755,6 +802,29 @@ class WsTransport {
     if (!this.connectWatchdog) return
     clearTimeout(this.connectWatchdog)
     this.connectWatchdog = null
+  }
+
+  private startLivenessTimer(): void {
+    this.stopLivenessTimer()
+    this.livenessTimer = setInterval(() => {
+      if (this.ws?.readyState !== WebSocket.OPEN) return
+      if (Date.now() - this._lastInbound > WsTransport.INBOUND_TIMEOUT) {
+        console.warn(
+          '[WsTransport] No inbound traffic, forcing reconnect (proxy/NAT idle drop?)'
+        )
+        try {
+          this.ws.close()
+        } catch {
+          // Ignore close errors; onclose will schedule reconnect.
+        }
+      }
+    }, WsTransport.LIVENESS_CHECK_INTERVAL)
+  }
+
+  private stopLivenessTimer(): void {
+    if (!this.livenessTimer) return
+    clearInterval(this.livenessTimer)
+    this.livenessTimer = null
   }
 
   private forceReconnect(): void {
@@ -832,6 +902,26 @@ export function setWsDataReady(value: boolean): void {
 export function connectTransport(): void {
   if (isNativeApp() || isE2eMocked) return
   wsTransport.enableConnect()
+}
+
+/**
+ * Imperative connection check for non-React paths (e.g. xterm onData handler).
+ * Native Tauri / E2E mock: always true (no transport drop concept).
+ * Web mode: reflects current WebSocket connected state.
+ */
+export function isTransportConnected(): boolean {
+  if (isNativeApp() || isE2eMocked) return true
+  return wsTransport.connected
+}
+
+/**
+ * Subscribe to transport connection state changes. No-op on native / E2E.
+ * Used by non-React modules (e.g. terminal-instances.ts banner).
+ * Returns unsubscribe.
+ */
+export function subscribeTransportStatus(cb: () => void): () => void {
+  if (isNativeApp() || isE2eMocked) return noopSubscribe()
+  return wsTransport.subscribe(cb)
 }
 
 /** Feed replayed server events through the normal event pipeline before connect. */

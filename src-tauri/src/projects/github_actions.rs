@@ -54,7 +54,7 @@ pub async fn list_workflow_runs(
         "databaseId,name,displayTitle,status,conclusion,event,headBranch,createdAt,url,workflowName"
             .to_string(),
         "-L".to_string(),
-        "30".to_string(),
+        "100".to_string(),
     ];
 
     if let Some(ref b) = branch {

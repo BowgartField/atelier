@@ -16,6 +16,10 @@ static EVENT_SEQ: AtomicU64 = AtomicU64::new(1);
 /// Maximum events buffered per session for replay.
 const SESSION_BUFFER_CAP: usize = 2000;
 
+/// Maximum events buffered per terminal for replay on reconnect.
+/// Terminals can stream high-volume output; cap protects memory.
+const TERMINAL_BUFFER_CAP: usize = 4000;
+
 /// Events that are worth buffering for replay on reconnect.
 const REPLAYABLE_EVENTS: &[&str] = &[
     "chat:sending",
@@ -35,6 +39,10 @@ const REPLAYABLE_EVENTS: &[&str] = &[
     "chat:error",
 ];
 
+/// Terminal events buffered for replay on reconnect.
+/// Keyed by `terminal_id` field in payload.
+const TERMINAL_REPLAYABLE_EVENTS: &[&str] = &["terminal:output", "terminal:started"];
+
 /// Broadcast channel for sending events to all connected WebSocket clients.
 /// Managed as Tauri state so any code with an AppHandle can broadcast.
 pub struct WsBroadcaster {
@@ -42,6 +50,9 @@ pub struct WsBroadcaster {
     /// Per-session ring buffer for event replay on WebSocket reconnect.
     /// Key: session_id extracted from the event payload.
     session_buffers: Mutex<HashMap<String, VecDeque<(u64, Arc<str>)>>>,
+    /// Per-terminal ring buffer for terminal event replay on reconnect.
+    /// Key: terminal_id extracted from the event payload.
+    terminal_buffers: Mutex<HashMap<String, VecDeque<(u64, Arc<str>)>>>,
 }
 
 /// A pre-serialized WebSocket event.
@@ -75,6 +86,7 @@ impl WsBroadcaster {
             Self {
                 tx,
                 session_buffers: Mutex::new(HashMap::new()),
+                terminal_buffers: Mutex::new(HashMap::new()),
             },
             tx_clone,
         )
@@ -129,6 +141,34 @@ impl WsBroadcaster {
             }
         }
 
+        // Buffer replayable terminal events keyed by terminal_id
+        if TERMINAL_REPLAYABLE_EVENTS.contains(&event) {
+            if let Ok(val) = serde_json::to_value(payload) {
+                if let Some(tid) = val.get("terminal_id").and_then(|v| v.as_str()) {
+                    if let Ok(mut buffers) = self.terminal_buffers.lock() {
+                        let buf = buffers
+                            .entry(tid.to_string())
+                            .or_insert_with(|| VecDeque::with_capacity(TERMINAL_BUFFER_CAP));
+                        if buf.len() >= TERMINAL_BUFFER_CAP {
+                            buf.pop_front();
+                        }
+                        buf.push_back((seq, json_arc.clone()));
+                    }
+                }
+            }
+        }
+
+        // Drop terminal buffer on terminal:stopped — no further output expected
+        if event == "terminal:stopped" {
+            if let Ok(val) = serde_json::to_value(payload) {
+                if let Some(tid) = val.get("terminal_id").and_then(|v| v.as_str()) {
+                    if let Ok(mut buffers) = self.terminal_buffers.lock() {
+                        buffers.remove(tid);
+                    }
+                }
+            }
+        }
+
         // Ignore send errors (no active receivers is fine)
         let _ = self.tx.send(WsEvent {
             json: json_arc,
@@ -148,6 +188,26 @@ impl WsBroadcaster {
             Err(_) => return Vec::new(),
         };
         match buffers.get(session_id) {
+            Some(buf) => buf
+                .iter()
+                .filter(|(seq, _)| *seq > after_seq)
+                .cloned()
+                .collect(),
+            None => Vec::new(),
+        }
+    }
+
+    /// Replay buffered terminal events after the given sequence number.
+    pub fn replay_terminal_events(
+        &self,
+        terminal_id: &str,
+        after_seq: u64,
+    ) -> Vec<(u64, Arc<str>)> {
+        let buffers = match self.terminal_buffers.lock() {
+            Ok(b) => b,
+            Err(_) => return Vec::new(),
+        };
+        match buffers.get(terminal_id) {
             Some(buf) => buf
                 .iter()
                 .filter(|(seq, _)| *seq > after_seq)

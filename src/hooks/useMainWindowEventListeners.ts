@@ -7,6 +7,7 @@ import { useUIStore } from '@/store/ui-store'
 import { useProjectsStore } from '@/store/projects-store'
 import { useChatStore } from '@/store/chat-store'
 import { useTerminalStore } from '@/store/terminal-store'
+import { useBrowserStore } from '@/store/browser-store'
 import { projectsQueryKeys } from '@/services/projects'
 import { chatQueryKeys } from '@/services/chat'
 import type { QueuedMessage } from '@/types/chat'
@@ -389,16 +390,28 @@ function executeKeybindingAction(
     case 'toggle_terminal': {
       logger.debug('Keybinding: toggle_terminal')
       const uiState = useUIStore.getState()
+      const chatState = useChatStore.getState()
       if (uiState.sessionChatModalOpen) {
-        // Modal view → sheet drawer
         const wid =
-          uiState.sessionChatModalWorktreeId ??
-          useChatStore.getState().activeWorktreeId
+          uiState.sessionChatModalWorktreeId ?? chatState.activeWorktreeId
         if (wid) useTerminalStore.getState().toggleModalTerminal(wid)
       } else {
-        // Standalone view → resizable panel
-        const wid = useChatStore.getState().activeWorktreeId
+        const wid = chatState.activeWorktreeId
         if (wid) useTerminalStore.getState().toggleTerminal(wid)
+      }
+      break
+    }
+    case 'toggle_browser': {
+      logger.debug('Keybinding: toggle_browser')
+      const uiState = useUIStore.getState()
+      const chatState = useChatStore.getState()
+      if (uiState.sessionChatModalOpen) {
+        const wid =
+          uiState.sessionChatModalWorktreeId ?? chatState.activeWorktreeId
+        if (wid) useBrowserStore.getState().toggleModal(wid)
+      } else {
+        const wid = chatState.activeWorktreeId
+        if (wid) useBrowserStore.getState().toggleSidePane(wid)
       }
       break
     }
@@ -574,6 +587,7 @@ export function useMainWindowEventListeners() {
           }
           if (
             shortcut === kb.toggle_terminal ||
+            shortcut === kb.toggle_browser ||
             shortcut === kb.cancel_prompt
           ) {
             // Let these fall through to the normal keybinding handler below
@@ -723,6 +737,24 @@ export function useMainWindowEventListeners() {
           logger.debug('Magic menu event received from native menu')
           executeKeybindingAction(
             'open_magic_modal',
+            commandContext,
+            queryClient
+          )
+        }),
+
+        listen('menu-toggle-terminal', () => {
+          logger.debug('Toggle terminal menu event received from native menu')
+          executeKeybindingAction(
+            'toggle_terminal',
+            commandContext,
+            queryClient
+          )
+        }),
+
+        listen('menu-toggle-browser', () => {
+          logger.debug('Toggle browser menu event received from native menu')
+          executeKeybindingAction(
+            'toggle_browser',
             commandContext,
             queryClient
           )

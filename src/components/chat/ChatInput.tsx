@@ -917,7 +917,7 @@ export const ChatInput = memo(function ChatInput({
         onKeyDown={handleKeyDown}
         onPaste={handlePaste}
         disabled={false}
-        className="custom-scrollbar min-h-[40px] max-h-[50vh] w-full resize-none overflow-x-hidden overflow-y-auto border-0 dark:bg-transparent p-0 font-mono text-base shadow-none focus-visible:ring-0 focus-visible:ring-offset-0 md:text-sm"
+        className="min-h-[40px] max-h-[50vh] w-full resize-none overflow-x-hidden overflow-y-auto border-0 dark:bg-transparent p-0 font-mono text-base shadow-none focus-visible:ring-0 focus-visible:ring-offset-0 md:text-sm"
         rows={1}
         autoFocus={!isMobile}
       />

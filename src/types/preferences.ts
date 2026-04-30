@@ -492,30 +492,37 @@ export const DEFAULT_GLOBAL_SYSTEM_PROMPT = `### 1. Plan Mode Default
 - Make the plan extremely concise. Sacrifice grammar for the sake of concision.
 - At the end of each plan, give me a list of unresolved questions to answer, if any.
 
-### 2. Subagent Strategy to keep main context window clean
+### 2. Documentation First
+- Before designing or coding against any external library/framework/SDK/API/CLI, run WebSearch for current docs.
+- Verify version, API shape, and breaking changes — training data may be stale.
+- Cite the source URL in your plan or commit reasoning when behavior is non-obvious.
+- Skip only for trivial edits to code already read this session.
+- Do NOT use Context7 — WebSearch only.
+
+### 3. Subagent Strategy to keep main context window clean
 - Offload research, exploration, and parallel analysis to subagents
 - For complex problems, throw more compute at it via subagents
 - One task per subagent for focused execution
 
-### 3. Self-Improvement Loop
+### 4. Self-Improvement Loop
 - After ANY correction from the user: update '.ai/lessons.md' with the pattern
 - Write rules for yourself that prevent the same mistake
 - Ruthlessly iterate on these lessons until mistake rate drops
 - Review lessons at session start for relevant project
 
-### 4. Verification Before Done
+### 5. Verification Before Done
 - Never mark a task complete without proving it works
 - Diff behavior between main and your changes when relevant
 - Ask yourself: "Would a staff engineer approve this?"
 - Run tests, check logs, demonstrate correctness
 
-### 5. Demand Elegance (Balanced)
+### 6. Demand Elegance (Balanced)
 - For non-trivial changes: pause and ask "is there a more elegant way?"
 - If a fix feels hacky: "Knowing everything I know now, implement the elegant solution"
 - Skip this for simple, obvious fixes - don't over-engineer
 - Challenge your own work before presenting it
 
-### 6. Autonomous Bug Fixing
+### 7. Autonomous Bug Fixing
 - When given a bug report: just fix it. Don't ask for hand-holding
 - Point at logs, errors, failing tests -> then resolve them
 - Zero context switching required from the user
@@ -1077,6 +1084,7 @@ export const fileEditModeOptions: { value: FileEditMode; label: string }[] = [
 
 export type ClaudeModel =
   | 'claude-opus-4-7'
+  | 'claude-opus-4-7[1m]'
   | 'claude-opus-4-6'
   | 'claude-opus-4-5-20251101'
   | 'claude-opus-4-6[1m]'
@@ -1089,6 +1097,7 @@ export type ClaudeModel =
 
 export const modelOptions: { value: ClaudeModel; label: string }[] = [
   { value: 'claude-opus-4-7', label: 'Claude Opus 4.7' },
+  { value: 'claude-opus-4-7[1m]', label: 'Claude Opus 4.7 (1M)' },
   { value: 'claude-opus-4-6', label: 'Claude Opus 4.6' },
   { value: 'claude-opus-4-5-20251101', label: 'Claude Opus 4.5' },
   { value: 'claude-opus-4-6[1m]', label: 'Claude Opus 4.6 (1M)' },

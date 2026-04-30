@@ -25,6 +25,7 @@ export type KeybindingAction =
   | 'restore_last_archived'
   | 'focus_canvas_search'
   | 'toggle_terminal'
+  | 'toggle_browser'
   | 'toggle_session_label'
   | 'open_provider_dropdown'
   | 'open_model_dropdown'
@@ -83,6 +84,7 @@ export const DEFAULT_KEYBINDINGS: KeybindingsMap = {
   restore_last_archived: 'mod+shift+t',
   focus_canvas_search: 'slash',
   toggle_terminal: 'mod+backquote',
+  toggle_browser: 'mod+shift+backquote',
   toggle_session_label: 'mod+s',
   open_provider_dropdown: 'mod+shift+p',
   open_model_dropdown: 'mod+shift+m',
@@ -276,6 +278,13 @@ export const KEYBINDING_DEFINITIONS: KeybindingDefinition[] = [
     description: 'Show or hide the terminal panel',
     default_shortcut: 'mod+backquote',
     category: 'chat',
+  },
+  {
+    action: 'toggle_browser',
+    label: 'Toggle browser',
+    description: 'Show or hide the embedded browser side pane',
+    default_shortcut: 'mod+shift+backquote',
+    category: 'navigation',
   },
   {
     action: 'toggle_session_label',

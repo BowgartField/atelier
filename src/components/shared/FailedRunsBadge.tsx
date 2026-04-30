@@ -34,7 +34,7 @@ export function FailedRunsBadge({
     staleTime: BADGE_STALE_TIME,
   })
 
-  const totalRuns = result?.runs.length ?? 0
+  const totalRuns = result?.runs?.length ?? 0
   const failedCount = result?.failedCount ?? 0
 
   const handleClick = useCallback(

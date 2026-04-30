@@ -98,7 +98,7 @@ export function ToolCallInline({
           isOpen && 'bg-muted/50'
         )}
       >
-        <CollapsibleTrigger className="flex w-full items-center gap-1.5 px-2.5 py-1.5 text-xs text-muted-foreground hover:bg-muted/50 cursor-pointer select-none min-w-0">
+        <CollapsibleTrigger className="flex w-full items-center gap-1.5 px-2.5 py-1.5 text-xs text-muted-foreground hover:bg-muted/50 select-none min-w-0">
           {icon}
           <span className="font-medium">{label}</span>
           {detail && filePath && onFileClick ? (
@@ -202,7 +202,7 @@ export function TaskCallInline({
           isOpen && 'bg-muted/50'
         )}
       >
-        <CollapsibleTrigger className="flex w-full items-center gap-1.5 px-2.5 py-1.5 text-xs text-muted-foreground hover:bg-muted/50 cursor-pointer select-none min-w-0">
+        <CollapsibleTrigger className="flex w-full items-center gap-1.5 px-2.5 py-1.5 text-xs text-muted-foreground hover:bg-muted/50 select-none min-w-0">
           <Bot className="h-3.5 w-3.5 shrink-0" />
           <span className="font-medium">
             {subagentType ? `Task (${subagentType})` : 'Task'}
@@ -344,7 +344,7 @@ export function StackedGroup({
           isOpen && 'bg-muted/50'
         )}
       >
-        <CollapsibleTrigger className="flex w-full items-center gap-1.5 px-2.5 py-1.5 text-xs text-muted-foreground hover:bg-muted/50 cursor-pointer select-none min-w-0">
+        <CollapsibleTrigger className="flex w-full items-center gap-1.5 px-2.5 py-1.5 text-xs text-muted-foreground hover:bg-muted/50 select-none min-w-0">
           <Layers className="h-3.5 w-3.5 shrink-0" />
           <span className="font-medium">{summary}</span>
           {isStreaming && isIncomplete ? (
@@ -403,7 +403,7 @@ function SubThinkingItem({ thinking }: SubThinkingItemProps) {
           isOpen && 'bg-muted/30'
         )}
       >
-        <CollapsibleTrigger className="flex w-full items-center gap-1.5 px-2 py-1 text-xs text-muted-foreground/80 hover:bg-muted/30 cursor-pointer select-none">
+        <CollapsibleTrigger className="flex w-full items-center gap-1.5 px-2 py-1 text-xs text-muted-foreground/80 hover:bg-muted/30 select-none">
           <Brain className="h-3 w-3 shrink-0 text-purple-500" />
           <span className="font-medium">Thinking</span>
           <ChevronRight
@@ -457,7 +457,7 @@ function SubToolItem({ toolCall, onFileClick }: SubToolItemProps) {
           isOpen && 'bg-muted/30'
         )}
       >
-        <CollapsibleTrigger className="flex w-full items-center gap-1.5 px-2 py-1 text-xs text-muted-foreground/80 hover:bg-muted/30 cursor-pointer select-none">
+        <CollapsibleTrigger className="flex w-full items-center gap-1.5 px-2 py-1 text-xs text-muted-foreground/80 hover:bg-muted/30 select-none">
           <span className="[&>svg]:h-3 [&>svg]:w-3">{icon}</span>
           <span className="font-medium">{label}</span>
           {detail && filePath && onFileClick ? (

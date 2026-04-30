@@ -26,6 +26,7 @@ interface MagicCommandHandlers {
   handleOpenPr: () => void
   handleReview: () => void
   handleMerge: () => void
+  handleMergePr: () => void
   handleResolveConflicts: (override?: InvestigateOverride) => void
   handleInvestigateWorkflowRun: (detail: WorkflowRunDetail) => void
   handleInvestigate: (
@@ -62,6 +63,7 @@ export function useMagicCommands({
   handleOpenPr,
   handleReview,
   handleMerge,
+  handleMergePr,
   handleResolveConflicts,
   handleInvestigateWorkflowRun,
   handleInvestigate,
@@ -81,6 +83,7 @@ export function useMagicCommands({
     handleOpenPr,
     handleReview,
     handleMerge,
+    handleMergePr,
     handleResolveConflicts,
     handleInvestigateWorkflowRun,
     handleInvestigate,
@@ -101,6 +104,7 @@ export function useMagicCommands({
       handleOpenPr,
       handleReview,
       handleMerge,
+      handleMergePr,
       handleResolveConflicts,
       handleInvestigateWorkflowRun,
       handleInvestigate,
@@ -153,6 +157,9 @@ export function useMagicCommands({
         case 'merge':
           handlers.handleMerge()
           break
+        case 'merge-pr':
+          handlers.handleMergePr()
+          break
         case 'resolve-conflicts':
           handlers.handleResolveConflicts(
             (rest as { override?: InvestigateOverride }).override
@@ -201,6 +208,9 @@ export function useMagicCommands({
     switch (pendingMagicCommand.command) {
       case 'merge':
         handlers.handleMerge()
+        break
+      case 'merge-pr':
+        handlers.handleMergePr()
         break
       case 'resolve-conflicts':
         handlers.handleResolveConflicts()
