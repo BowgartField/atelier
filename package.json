@@ -30,6 +30,7 @@
     "tauri:dev:rdp": "bash scripts/tauri-dev-rdp.sh",
     "tauri:dev": "tauri dev --config src-tauri/tauri.conf.dev.json",
     "tauri:build": "bun run tauri build",
+    "tauri:build:fast": "tauri build --bundles dmg --config '{\"bundle\":{\"createUpdaterArtifacts\":false}}' -- --profile release-fast",
     "tauri:build:macos": "tauri build --target universal-apple-darwin --bundles app,dmg",
     "tauri:build:linux": "tauri build --bundles deb,rpm",
     "tauri:build:linux:appimage": "bash scripts/build-appimage.sh",

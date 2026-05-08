@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useState, type ReactNode } from 'react'
 import { invoke } from '@/lib/transport'
 import {
   Loader2,
@@ -27,6 +27,7 @@ import { useChatStore } from '@/store/chat-store'
 import { useWorktrees } from '@/services/projects'
 import { usePreferences } from '@/services/preferences'
 import { DEFAULT_REVIEW_COMMENTS_PROMPT } from '@/types/preferences'
+import { Markdown } from '@/components/ui/markdown'
 import type {
   GitHubReviewComment,
   GitHubComment,
@@ -50,6 +51,58 @@ function getCreatedAt(
     ((obj as Record<string, unknown>).created_at as string) ||
     ''
   )
+}
+
+function previewLine(body: string): string {
+  const firstLine =
+    body
+      .split('\n')
+      .map(l => l.trim())
+      .find(l => l.length > 0) ?? ''
+  return firstLine
+    .replace(/^#+\s*/, '')
+    .replace(/^>+\s*/, '')
+    .replace(/^[-*+]\s+/, '')
+}
+
+function renderInlineMarkdown(line: string): ReactNode[] {
+  // Tokenize for **bold**, *italic* / _italic_, `code`. Emojis/text untouched.
+  const pattern = /(\*\*[^*]+\*\*|\*[^*]+\*|_[^_]+_|`[^`]+`)/g
+  const parts = line.split(pattern).filter(p => p !== '')
+  return parts.map((part, i) => {
+    if (part.startsWith('**') && part.endsWith('**')) {
+      return (
+        <strong key={i} className="font-semibold">
+          {part.slice(2, -2)}
+        </strong>
+      )
+    }
+    if (part.startsWith('*') && part.endsWith('*') && part.length > 2) {
+      return (
+        <em key={i} className="italic">
+          {part.slice(1, -1)}
+        </em>
+      )
+    }
+    if (part.startsWith('_') && part.endsWith('_') && part.length > 2) {
+      return (
+        <em key={i} className="italic">
+          {part.slice(1, -1)}
+        </em>
+      )
+    }
+    if (part.startsWith('`') && part.endsWith('`')) {
+      return (
+        <code
+          key={i}
+          className="rounded bg-muted px-1 py-0.5 text-[0.875em] font-mono"
+        >
+          {part.slice(1, -1)}
+        </code>
+      )
+    }
+    return <span key={i}>{part}</span>
+  })
 }
 
 function reviewStateLabel(state: string): string {
@@ -118,12 +171,16 @@ export function ReviewCommentsDialog() {
   const [comments, setComments] = useState<GitHubReviewComment[]>([])
   const [selected, setSelected] = useState<Set<number>>(new Set())
   const [expanded, setExpanded] = useState<Set<number>>(new Set())
+  const [diffExpanded, setDiffExpanded] = useState<Set<number>>(new Set())
 
   // Conversation comments state
   const [conversationItems, setConversationItems] = useState<
     ConversationItem[]
   >([])
   const [conversationSelected, setConversationSelected] = useState<Set<number>>(
+    new Set()
+  )
+  const [conversationExpanded, setConversationExpanded] = useState<Set<number>>(
     new Set()
   )
 
@@ -135,8 +192,10 @@ export function ReviewCommentsDialog() {
     setComments([])
     setSelected(new Set())
     setExpanded(new Set())
+    setDiffExpanded(new Set())
     setConversationItems([])
     setConversationSelected(new Set())
+    setConversationExpanded(new Set())
 
     try {
       const [inlineResult, prDetail] = await Promise.all([
@@ -195,8 +254,10 @@ export function ReviewCommentsDialog() {
         setComments([])
         setSelected(new Set())
         setExpanded(new Set())
+        setDiffExpanded(new Set())
         setConversationItems([])
         setConversationSelected(new Set())
+        setConversationExpanded(new Set())
         setError(null)
         setIsSending(false)
         setTab('inline')
@@ -225,9 +286,27 @@ export function ReviewCommentsDialog() {
     })
   }, [])
 
+  const toggleDiffExpand = useCallback((index: number) => {
+    setDiffExpanded(prev => {
+      const next = new Set(prev)
+      if (next.has(index)) next.delete(index)
+      else next.add(index)
+      return next
+    })
+  }, [])
+
   // Conversation selection helper
   const toggleConversationSelect = useCallback((index: number) => {
     setConversationSelected(prev => {
+      const next = new Set(prev)
+      if (next.has(index)) next.delete(index)
+      else next.add(index)
+      return next
+    })
+  }, [])
+
+  const toggleConversationExpand = useCallback((index: number) => {
+    setConversationExpanded(prev => {
       const next = new Set(prev)
       if (next.has(index)) next.delete(index)
       else next.add(index)
@@ -439,7 +518,9 @@ ${c.body}`
                 <div className="divide-y">
                   {comments.map((comment, index) => {
                     const isExpanded = expanded.has(index)
+                    const isDiffExpanded = diffExpanded.has(index)
                     const lineInfo = comment.line ? `:${comment.line}` : ''
+                    const preview = previewLine(comment.body)
 
                     return (
                       <div key={index} className="px-3 py-2.5">
@@ -448,35 +529,61 @@ ${c.body}`
                             checked={selected.has(index)}
                             onCheckedChange={() => toggleSelect(index)}
                             className="mt-0.5"
+                            onClick={e => e.stopPropagation()}
                           />
                           <div className="flex-1 min-w-0">
-                            <div className="flex items-center gap-2 text-xs">
-                              <code className="font-mono text-foreground truncate">
-                                {comment.path}
-                                {lineInfo}
-                              </code>
-                              <span className="text-muted-foreground shrink-0">
-                                @{comment.author.login}
-                              </span>
-                            </div>
-                            <p className="mt-1 text-sm text-foreground/90 whitespace-pre-wrap">
-                              {comment.body}
-                            </p>
                             <button
-                              className="mt-1 flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground transition-colors"
+                              type="button"
                               onClick={() => toggleExpand(index)}
+                              className="w-full text-left cursor-pointer group"
                             >
-                              {isExpanded ? (
-                                <ChevronDown className="size-3" />
-                              ) : (
-                                <ChevronRight className="size-3" />
-                              )}
-                              Diff context
+                              <div className="flex items-center gap-2 min-w-0">
+                                {isExpanded ? (
+                                  <ChevronDown className="size-3.5 shrink-0 text-muted-foreground" />
+                                ) : (
+                                  <ChevronRight className="size-3.5 shrink-0 text-muted-foreground" />
+                                )}
+                                <p className="text-sm text-foreground truncate min-w-0">
+                                  {preview ? (
+                                    renderInlineMarkdown(preview)
+                                  ) : (
+                                    <span className="text-muted-foreground italic">
+                                      (no body)
+                                    </span>
+                                  )}
+                                </p>
+                              </div>
+                              <div className="mt-1 pl-5 flex items-center gap-2 text-xs min-w-0">
+                                <code className="font-mono text-muted-foreground truncate">
+                                  {comment.path}
+                                  {lineInfo}
+                                </code>
+                                <span className="text-muted-foreground/70 shrink-0">
+                                  @{comment.author.login}
+                                </span>
+                              </div>
                             </button>
                             {isExpanded && (
-                              <pre className="mt-1.5 p-2 text-xs font-mono bg-muted rounded overflow-x-auto max-h-40">
-                                {comment.diffHunk}
-                              </pre>
+                              <div className="mt-2 pl-5">
+                                <Markdown compact>{comment.body}</Markdown>
+                                <button
+                                  type="button"
+                                  className="mt-2 flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground transition-colors cursor-pointer"
+                                  onClick={() => toggleDiffExpand(index)}
+                                >
+                                  {isDiffExpanded ? (
+                                    <ChevronDown className="size-3" />
+                                  ) : (
+                                    <ChevronRight className="size-3" />
+                                  )}
+                                  Diff context
+                                </button>
+                                {isDiffExpanded && (
+                                  <pre className="mt-1.5 p-2 text-xs font-mono bg-muted rounded overflow-x-auto max-h-40">
+                                    {comment.diffHunk}
+                                  </pre>
+                                )}
+                              </div>
                             )}
                           </div>
                         </div>
@@ -501,42 +608,72 @@ ${c.body}`
             {tab === 'conversation' && conversationItems.length > 0 && (
               <ScrollArea className="flex-1 min-h-0 border rounded-md">
                 <div className="divide-y">
-                  {conversationItems.map((item, index) => (
-                    <div key={index} className="px-3 py-2.5">
-                      <div className="flex items-start gap-2">
-                        <Checkbox
-                          checked={conversationSelected.has(index)}
-                          onCheckedChange={() =>
-                            toggleConversationSelect(index)
-                          }
-                          className="mt-0.5"
-                        />
-                        <div className="flex-1 min-w-0">
-                          <div className="flex items-center gap-2 text-xs flex-wrap">
-                            <span className="text-muted-foreground shrink-0">
-                              @{item.data.author.login}
-                            </span>
-                            {item.kind === 'review' && (
-                              <ReviewStateBadge state={item.data.state} />
-                            )}
-                            <span className="text-muted-foreground/60 text-[10px]">
-                              {item.kind === 'review'
-                                ? (item.data.submittedAt ?? '')
-                                : getCreatedAt(
-                                    item.data as unknown as Record<
-                                      string,
-                                      unknown
-                                    >
+                  {conversationItems.map((item, index) => {
+                    const isExpanded = conversationExpanded.has(index)
+                    const body = item.data.body ?? ''
+                    const preview = previewLine(body)
+                    const date =
+                      item.kind === 'review'
+                        ? (item.data.submittedAt ?? '')
+                        : getCreatedAt(
+                            item.data as unknown as Record<string, unknown>
+                          )
+
+                    return (
+                      <div key={index} className="px-3 py-2.5">
+                        <div className="flex items-start gap-2">
+                          <Checkbox
+                            checked={conversationSelected.has(index)}
+                            onCheckedChange={() =>
+                              toggleConversationSelect(index)
+                            }
+                            className="mt-0.5"
+                            onClick={e => e.stopPropagation()}
+                          />
+                          <div className="flex-1 min-w-0">
+                            <button
+                              type="button"
+                              onClick={() => toggleConversationExpand(index)}
+                              className="w-full text-left cursor-pointer group"
+                            >
+                              <div className="flex items-center gap-2 min-w-0">
+                                {isExpanded ? (
+                                  <ChevronDown className="size-3.5 shrink-0 text-muted-foreground" />
+                                ) : (
+                                  <ChevronRight className="size-3.5 shrink-0 text-muted-foreground" />
+                                )}
+                                <p className="text-sm text-foreground truncate min-w-0">
+                                  {preview ? (
+                                    renderInlineMarkdown(preview)
+                                  ) : (
+                                    <span className="text-muted-foreground italic">
+                                      (no body)
+                                    </span>
                                   )}
-                            </span>
+                                </p>
+                              </div>
+                              <div className="mt-1 pl-5 flex items-center gap-2 text-xs flex-wrap min-w-0">
+                                <span className="text-muted-foreground shrink-0">
+                                  @{item.data.author.login}
+                                </span>
+                                {item.kind === 'review' && (
+                                  <ReviewStateBadge state={item.data.state} />
+                                )}
+                                <span className="text-muted-foreground/60 text-[10px]">
+                                  {date}
+                                </span>
+                              </div>
+                            </button>
+                            {isExpanded && (
+                              <div className="mt-2 pl-5">
+                                <Markdown compact>{body}</Markdown>
+                              </div>
+                            )}
                           </div>
-                          <p className="mt-1 text-sm text-foreground/90 whitespace-pre-wrap">
-                            {item.data.body}
-                          </p>
                         </div>
                       </div>
-                    </div>
-                  ))}
+                    )
+                  })}
                 </div>
               </ScrollArea>
             )}

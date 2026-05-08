@@ -310,7 +310,6 @@ export const ChatToolbar = memo(function ChatToolbar({
           onReview={onReview}
           onMerge={onMerge}
           onMergePr={onMergePr}
-          onResolveConflicts={onResolveConflicts}
           handlePullClick={handlePullClick}
           handlePushClick={handlePushClick}
         />

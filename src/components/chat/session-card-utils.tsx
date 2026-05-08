@@ -380,9 +380,9 @@ const STATUS_GROUP_ORDER: {
   title: string
   statuses: SessionStatus[]
 }[] = [
-  { key: 'idle', title: 'Idle', statuses: ['idle'] },
-  { key: 'review', title: 'Review', statuses: ['review', 'completed'] },
   { key: 'waiting', title: 'Waiting', statuses: ['waiting', 'permission'] },
+  { key: 'review', title: 'Review', statuses: ['review', 'completed'] },
+  { key: 'idle', title: 'Idle', statuses: ['idle'] },
   {
     key: 'inProgress',
     title: 'In Progress',

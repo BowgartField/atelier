@@ -2008,6 +2008,7 @@ pub async fn send_chat_message(
 \n\
 - Make the plan extremely concise. Sacrifice grammar for the sake of concision.\n\
 - At the end of each plan, give me a list of unresolved questions to answer, if any.\n\
+- In planning mode, present plans using the backend's native plan tool/UI call when available (Claude ExitPlanMode, Codex update_plan/CodexPlan, Cursor/OpenCode equivalent), not plain text only.\n\
 \n\
 ## Not Plan Mode\n\
 \n\
@@ -2023,7 +2024,8 @@ pub async fn send_chat_message(
                             "You are in PLANNING MODE (read-only sandbox). Create a detailed implementation plan. \
                              Do NOT attempt to make any file changes — you are running in a read-only sandbox and writes will fail. \
                              Describe exactly what changes you WOULD make: which files to create/modify, \
-                             what code to write, and in what order. End with any unresolved questions."
+                             what code to write, and in what order. Use the native plan tool/UI call to show the plan when available. \
+                             End with any unresolved questions."
                                 .to_string(),
                         );
                     }

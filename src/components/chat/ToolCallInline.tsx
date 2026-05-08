@@ -1,4 +1,4 @@
-import { useState, useMemo, useEffect } from 'react'
+import { useState, useEffect } from 'react'
 import { usePreferences } from '@/services/preferences'
 import { useChatStore } from '@/store/chat-store'
 import {
@@ -29,7 +29,6 @@ import {
   Code,
   Activity,
 } from 'lucide-react'
-import { diffLines } from 'diff'
 import type { ToolCall } from '@/types/chat'
 import type { StackableItem } from './tool-call-utils'
 import { Markdown } from '@/components/ui/markdown'
@@ -40,6 +39,7 @@ import {
   CollapsibleContent,
   CollapsibleTrigger,
 } from '@/components/ui/collapsible'
+import { InlineFileDiff } from './InlineFileDiff'
 
 function shouldRenderRawOutput(toolCall: ToolCall): boolean {
   return (
@@ -536,52 +536,6 @@ interface ToolDisplay {
   expandedContent: React.ReactNode
 }
 
-/** Renders a unified diff view with colored +/- lines */
-function DiffView({
-  oldString,
-  newString,
-  filePath,
-  className,
-}: {
-  oldString: string
-  newString: string
-  filePath: string
-  className?: string
-}) {
-  const parts = useMemo(
-    () => diffLines(oldString, newString),
-    [oldString, newString]
-  )
-
-  return (
-    <div className={className}>
-      <div className="text-muted-foreground mb-1.5 font-mono">
-        Path: {filePath}
-      </div>
-      <div className="rounded border border-border/30 overflow-auto max-h-64">
-        {parts.map((part, i) => {
-          const lines = part.value.replace(/\n$/, '').split('\n')
-          return lines.map((line, j) => (
-            <div
-              key={`${i}-${j}`}
-              className={cn(
-                'px-2 font-mono',
-                part.added && 'bg-green-500/15 text-green-400',
-                part.removed && 'bg-red-500/15 text-red-400'
-              )}
-            >
-              <span className="inline-block w-4 select-none opacity-60">
-                {part.added ? '+' : part.removed ? '-' : ' '}
-              </span>
-              {line}
-            </div>
-          ))
-        })}
-      </div>
-    </div>
-  )
-}
-
 /** A single Codex file change entry */
 interface CodexFileChange {
   diff?: string
@@ -615,32 +569,18 @@ function parseCodexFileChanges(input: unknown): CodexFileChange[] {
   return []
 }
 
-/** Renders a pre-computed unified diff patch with colored +/- lines */
-function PatchDiffView({ patch }: { patch: string }) {
-  const lines = patch.split('\n')
-  if (lines.length > 0 && lines[lines.length - 1] === '') {
-    lines.pop()
+/** Map Codex file change kind to status color matching MemoizedFileDiff/FileDiffModal. */
+function codexChangeColor(kind: string | undefined): string {
+  switch (kind) {
+    case 'create':
+      return 'text-green-500'
+    case 'delete':
+      return 'text-red-500'
+    case 'rename':
+      return 'text-yellow-500'
+    default:
+      return 'text-blue-500'
   }
-
-  return (
-    <div className="rounded border border-border/30 overflow-auto max-h-64">
-      {lines.map((line, i) => (
-        <div
-          key={i}
-          className={cn(
-            'px-2 font-mono',
-            line.startsWith('@@') && 'text-blue-400 bg-blue-500/10',
-            line.startsWith('+') &&
-              !line.startsWith('@@') &&
-              'bg-green-500/15 text-green-400',
-            line.startsWith('-') && 'bg-red-500/15 text-red-400'
-          )}
-        >
-          {line}
-        </div>
-      ))}
-    </div>
-  )
 }
 
 /** Renders one or more Codex file changes with diffs */
@@ -658,27 +598,15 @@ function FileChangeDiffView({ input }: { input: unknown }) {
           ? getFilename(change.path)
           : `file ${idx + 1}`
         const changeType = change.kind?.type ?? 'update'
-        const typeColor =
-          changeType === 'create'
-            ? 'text-green-500'
-            : changeType === 'delete'
-              ? 'text-red-500'
-              : changeType === 'rename'
-                ? 'text-yellow-500'
-                : 'text-blue-500'
+        const statusColor = codexChangeColor(change.kind?.type)
 
         return (
           <div key={change.path ?? idx}>
             <div className="flex items-center gap-1.5 mb-1">
-              <span className={cn('font-mono truncate', typeColor)}>
+              <span className={cn('font-mono truncate', statusColor)}>
                 {filename}
               </span>
-              <span
-                className={cn(
-                  'text-[0.625rem] uppercase font-medium px-1 rounded',
-                  typeColor
-                )}
-              >
+              <span className="text-[0.625rem] uppercase tracking-wide font-medium px-1.5 py-0.5 rounded bg-muted text-muted-foreground">
                 {changeType}
               </span>
               {change.kind?.move_path && (
@@ -688,7 +616,7 @@ function FileChangeDiffView({ input }: { input: unknown }) {
               )}
             </div>
             {change.diff ? (
-              <PatchDiffView patch={change.diff} />
+              <InlineFileDiff patch={change.diff} filePath={change.path} />
             ) : (
               <div className="text-muted-foreground/50 italic">
                 No diff available
@@ -796,7 +724,7 @@ function getToolDisplay(toolCall: ToolCall): ToolDisplay {
         detail: filename,
         filePath,
         expandedContent: filePath ? (
-          <DiffView
+          <InlineFileDiff
             filePath={filePath}
             oldString={oldString ?? ''}
             newString={newString ?? ''}

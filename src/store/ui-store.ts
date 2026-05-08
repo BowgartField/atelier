@@ -44,6 +44,7 @@ interface UIState {
   loadContextModalOpen: boolean
   linkedProjectsModalOpen: boolean
   magicModalOpen: boolean
+  resolveConflictsDialogOpen: boolean
   newWorktreeModalOpen: boolean
   newWorktreeModalDefaultTab: 'quick' | 'issues' | 'prs' | 'security' | null
   releaseNotesModalOpen: boolean
@@ -121,6 +122,7 @@ interface UIState {
   setLoadContextModalOpen: (open: boolean) => void
   setLinkedProjectsModalOpen: (open: boolean) => void
   setMagicModalOpen: (open: boolean) => void
+  setResolveConflictsDialogOpen: (open: boolean) => void
   setNewWorktreeModalOpen: (open: boolean) => void
   setNewWorktreeModalDefaultTab: (
     tab: 'quick' | 'issues' | 'prs' | 'security' | null
@@ -207,6 +209,7 @@ export const useUIStore = create<UIState>()(
       loadContextModalOpen: false,
       linkedProjectsModalOpen: false,
       magicModalOpen: false,
+      resolveConflictsDialogOpen: false,
       newWorktreeModalOpen: false,
       newWorktreeModalDefaultTab: null,
       releaseNotesModalOpen: false,
@@ -363,6 +366,13 @@ export const useUIStore = create<UIState>()(
 
       setMagicModalOpen: open =>
         set({ magicModalOpen: open }, undefined, 'setMagicModalOpen'),
+
+      setResolveConflictsDialogOpen: open =>
+        set(
+          { resolveConflictsDialogOpen: open },
+          undefined,
+          'setResolveConflictsDialogOpen'
+        ),
 
       setNewWorktreeModalOpen: open =>
         set(

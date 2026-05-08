@@ -511,12 +511,16 @@ export function SessionChatModal({
     )
   }, [worktreeId, worktreePath, createSession])
 
-  // Sorted tab order: waiting/permission pinned (need user attention),
-  // everything else stays in chronological order so click never reorders.
+  // Sorted tab order: waiting/permission first (need user attention),
+  // idle/review/completed next, running sessions (plan/build/yolo) last.
+  // Within each tier, oldest first so click never reorders.
   const sortedCards = useMemo(() => {
     const priority: Record<string, number> = {
       waiting: 0,
       permission: 0,
+      planning: 2,
+      vibing: 2,
+      yoloing: 2,
     }
     return [...cards].sort((a, b) => {
       const pa = priority[a.status] ?? 1

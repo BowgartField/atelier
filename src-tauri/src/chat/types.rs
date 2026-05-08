@@ -198,6 +198,8 @@ pub struct CodexPermissionRequest {
     pub item_id: String,
     pub permissions: serde_json::Value,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
 }
 
@@ -249,6 +251,10 @@ pub struct CodexCommandApprovalRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub network_approval_context: Option<CodexNetworkApprovalContext>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub additional_permissions: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub available_decisions: Option<Vec<serde_json::Value>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub proposed_execpolicy_amendment: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub proposed_network_policy_amendments: Option<Vec<CodexNetworkPolicyAmendment>>,
@@ -288,6 +294,8 @@ pub struct CodexMcpElicitationRequest {
 pub struct CodexDynamicToolCallRequest {
     pub rpc_id: u64,
     pub call_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub namespace: Option<String>,
     pub tool: String,
     pub arguments: serde_json::Value,
 }

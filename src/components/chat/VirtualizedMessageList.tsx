@@ -17,6 +17,7 @@ import type {
   ReviewFinding,
 } from '@/types/chat'
 import { MessageItem } from './MessageItem'
+import type { FileEdit } from './FileEditsDiffModal'
 
 /** Number of messages to render initially (from the end) */
 const INITIAL_VISIBLE_COUNT = 10
@@ -85,7 +86,7 @@ interface VirtualizedMessageListProps {
   /** Callback when user clicks a file path */
   onFileClick: (path: string) => void
   /** Callback when user clicks an edited file badge (opens diff modal) */
-  onEditedFileClick: (path: string) => void
+  onEditedFileClick: (path: string, edits: FileEdit[]) => void
   /** Callback when user fixes a finding */
   onFixFinding: (finding: ReviewFinding, suggestion?: string) => Promise<void>
   /** Callback when user fixes all findings */

@@ -236,7 +236,12 @@ export function useCliVersionCheck() {
       const handleUpdates = () => {
         if (autoUpdate) {
           for (const update of updates) {
-            void runBackgroundUpdate(update, queryClient)
+            void runBackgroundUpdate(
+              update,
+              queryClient,
+              true,
+              notifiedRef.current
+            )
           }
         } else {
           showUpdateToasts(updates, queryClient)
@@ -281,6 +286,22 @@ export function useCliVersionCheck() {
     preferences?.gh_cli_source,
     queryClient,
   ])
+
+  // Re-check CLI versions every hour so deferred updates retry once any
+  // blocking sessions have stopped (or once a new release ships).
+  useEffect(() => {
+    if (!shouldCheck) return
+    const id = setInterval(
+      () => {
+        queryClient.invalidateQueries({ queryKey: claudeCliQueryKeys.all })
+        queryClient.invalidateQueries({ queryKey: ghCliQueryKeys.all })
+        queryClient.invalidateQueries({ queryKey: codexCliQueryKeys.all })
+        queryClient.invalidateQueries({ queryKey: opencodeCliQueryKeys.all })
+      },
+      60 * 60 * 1000
+    )
+    return () => clearInterval(id)
+  }, [shouldCheck, queryClient])
 }
 
 /**
@@ -298,10 +319,10 @@ function showUpdateToasts(updates: CliUpdateInfo[], queryClient: QueryClient) {
       description: `v${update.currentVersion} → v${update.latestVersion}`,
       duration: Infinity,
       action: {
-        label: 'Update in background',
+        label: 'Update',
         onClick: () => {
           toast.dismiss(toastId)
-          void runBackgroundUpdate(update, queryClient)
+          void runBackgroundUpdate(update, queryClient, false)
         },
       },
       cancel: {
@@ -331,10 +352,26 @@ function isActiveSessionConflict(message: string): boolean {
  */
 async function runBackgroundUpdate(
   update: CliUpdateInfo,
-  queryClient: QueryClient
+  queryClient: QueryClient,
+  autoUpdate: boolean,
+  notified?: Set<string>
 ) {
   const cliName = CLI_DISPLAY_NAMES[update.type]
   const toastId = `cli-update-bg-${update.type}`
+  const versionKey = `${update.type}:${update.currentVersion}→${update.latestVersion}`
+
+  const handleActiveSessionConflict = () => {
+    toast.dismiss(toastId)
+    if (autoUpdate) {
+      // Auto-update is ON: silent skip. Allow retry on next hook tick.
+      notified?.delete(versionKey)
+      logger.info('Skipped silent CLI update: active sessions', {
+        type: update.type,
+      })
+      return
+    }
+    showUpdateToasts([update], queryClient)
+  }
 
   toast.loading(`Updating ${cliName}…`, {
     id: toastId,
@@ -371,8 +408,7 @@ async function runBackgroundUpdate(
           msg,
         })
         if (isActiveSessionConflict(msg)) {
-          toast.dismiss(toastId)
-          showUpdateToasts([update], queryClient)
+          handleActiveSessionConflict()
           return
         }
         toast.error(`Failed to update ${cliName}`, {
@@ -402,8 +438,7 @@ async function runBackgroundUpdate(
           msg,
         })
         if (isActiveSessionConflict(msg)) {
-          toast.dismiss(toastId)
-          showUpdateToasts([update], queryClient)
+          handleActiveSessionConflict()
           return
         }
         toast.error(`Failed to update ${cliName}`, {

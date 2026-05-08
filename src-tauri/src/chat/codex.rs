@@ -441,13 +441,17 @@ pub fn build_thread_start_params(
         }
     }
 
-    // Permission mode mapping
+    // Permission mode mapping.
     //
-    // Always use granular approval policy with mcp_elicitations=false to
+    // Plan mode must never ask the user for permissions. It is read-only, so
+    // any attempted writes or denied commands should fail/decline rather than
+    // surfacing an approval prompt.
+    //
+    // Build mode uses granular approval policy with mcp_elicitations=false to
     // auto-approve MCP elicitation requests (matching Claude Code's behavior).
     // Codex reads MCP config from TOML files directly, so we can't detect
     // whether MCP servers are configured — but setting mcp_elicitations=false
-    // is a no-op when no MCP servers exist, so it's safe to always use it.
+    // is a no-op when no MCP servers exist, so it's safe to use in build mode.
     match execution_mode.unwrap_or("plan") {
         "build" => {
             params["approvalPolicy"] = serde_json::json!({
@@ -466,14 +470,7 @@ pub fn build_thread_start_params(
         }
         // "plan" or default: read-only sandbox
         _ => {
-            params["approvalPolicy"] = serde_json::json!({
-                "granular": {
-                    "mcp_elicitations": false,
-                    "sandbox_approval": true,
-                    "rules": true,
-                    "request_permissions": true,
-                }
-            });
+            params["approvalPolicy"] = serde_json::json!("never");
             params["sandbox"] = serde_json::json!("read-only");
         }
     }
@@ -541,29 +538,27 @@ pub fn build_turn_start_params(
     // in ALL modes, and writable roots only in build/yolo modes.
     // Also include git metadata dirs so worktree commits work (issue #280).
     let mode = execution_mode.unwrap_or("plan");
-    if !add_dirs.is_empty() || !git_writable_roots.is_empty() {
-        let is_writable = mode == "build" || mode == "yolo";
-        let writable_roots: Vec<serde_json::Value> = if is_writable {
-            let mut roots = vec![serde_json::json!(working_dir.to_string_lossy())];
-            for dir in add_dirs {
-                roots.push(serde_json::json!(dir));
-            }
-            for dir in git_writable_roots {
-                roots.push(serde_json::json!(dir));
-            }
-            roots
-        } else {
-            vec![]
-        };
-        params["sandboxPolicy"] = serde_json::json!({
-            "type": if is_writable { "workspaceWrite" } else { "readOnly" },
-            "writableRoots": writable_roots,
-            "readOnlyAccess": { "type": "fullAccess" },
-            "networkAccess": true,
-            "excludeTmpdirEnvVar": false,
-            "excludeSlashTmp": false,
-        });
-    }
+    let is_writable = mode == "build" || mode == "yolo";
+    let writable_roots: Vec<serde_json::Value> = if is_writable {
+        let mut roots = vec![serde_json::json!(working_dir.to_string_lossy())];
+        for dir in add_dirs {
+            roots.push(serde_json::json!(dir));
+        }
+        for dir in git_writable_roots {
+            roots.push(serde_json::json!(dir));
+        }
+        roots
+    } else {
+        vec![]
+    };
+    params["sandboxPolicy"] = serde_json::json!({
+        "type": if is_writable { "workspaceWrite" } else { "readOnly" },
+        "writableRoots": writable_roots,
+        "readOnlyAccess": { "type": "fullAccess" },
+        "networkAccess": true,
+        "excludeTmpdirEnvVar": false,
+        "excludeSlashTmp": false,
+    });
 
     // Override cwd per turn
     params["cwd"] = serde_json::json!(working_dir.to_string_lossy());
@@ -1757,6 +1752,20 @@ fn handle_approval_request(
                 .unwrap_or("")
                 .to_string();
 
+            if is_plan_mode {
+                log::trace!("Denying command approval in plan mode (rpc_id={rpc_id}): {command}");
+                if let Err(e) = super::codex_server::send_response(
+                    rpc_id,
+                    serde_json::json!({"decision": "decline"}),
+                ) {
+                    log::error!(
+                        "Failed to deny command approval in plan mode (rpc_id={rpc_id}): {e}"
+                    );
+                    emit_connection_error();
+                }
+                return;
+            }
+
             // Auto-approve embedded/resolved CLI binaries (matches Claude's --allowedTools)
             let gh_binary = crate::gh_cli::config::resolve_gh_binary(app);
             let gh_str = gh_binary.to_string_lossy();
@@ -1812,6 +1821,10 @@ fn handle_approval_request(
                 network_approval_context: params.get("networkApprovalContext").and_then(|value| {
                     serde_json::from_value::<CodexNetworkApprovalContext>(value.clone()).ok()
                 }),
+                additional_permissions: params.get("additionalPermissions").cloned(),
+                available_decisions: params.get("availableDecisions").and_then(|value| {
+                    serde_json::from_value::<Vec<serde_json::Value>>(value.clone()).ok()
+                }),
                 proposed_execpolicy_amendment: params
                     .get("proposedExecpolicyAmendment")
                     .and_then(|value| serde_json::from_value::<Vec<String>>(value.clone()).ok()),
@@ -1832,6 +1845,20 @@ fn handle_approval_request(
             );
         }
         "item/permissions/requestApproval" => {
+            if is_plan_mode {
+                log::trace!("Denying permissions request in plan mode (rpc_id={rpc_id})");
+                if let Err(e) = super::codex_server::send_response(
+                    rpc_id,
+                    serde_json::json!({"permissions": {}, "scope": "turn"}),
+                ) {
+                    log::error!(
+                        "Failed to deny permissions request in plan mode (rpc_id={rpc_id}): {e}"
+                    );
+                    emit_connection_error();
+                }
+                return;
+            }
+
             let request = CodexPermissionRequest {
                 rpc_id,
                 item_id: params
@@ -1843,6 +1870,10 @@ fn handle_approval_request(
                     .get("permissions")
                     .cloned()
                     .unwrap_or(serde_json::Value::Null),
+                cwd: params
+                    .get("cwd")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string()),
                 reason: params
                     .get("reason")
                     .and_then(|v| v.as_str())
@@ -1910,6 +1941,10 @@ fn handle_approval_request(
                     .and_then(|v| v.as_str())
                     .unwrap_or_default()
                     .to_string(),
+                namespace: params
+                    .get("namespace")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string()),
                 tool: params
                     .get("tool")
                     .and_then(|v| v.as_str())
@@ -1928,6 +1963,74 @@ fn handle_approval_request(
                     request,
                 },
             );
+        }
+        "account/chatgptAuthTokens/refresh" => {
+            let previous_account_id = params
+                .get("previousAccountId")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            let app = app.clone();
+            let session_id = session_id.to_string();
+            let worktree_id = worktree_id.to_string();
+            tauri::async_runtime::spawn(async move {
+                match crate::codex_cli::refresh_codex_app_server_auth_tokens(previous_account_id)
+                    .await
+                {
+                    Ok(tokens) => {
+                        let payload = match serde_json::to_value(tokens) {
+                            Ok(payload) => payload,
+                            Err(e) => {
+                                let error =
+                                    format!("Failed to serialize Codex auth refresh response: {e}");
+                                log::error!("{error}");
+                                if let Err(send_err) =
+                                    super::codex_server::send_error_response(rpc_id, -32000, &error)
+                                {
+                                    log::error!(
+                                        "Failed to send Codex auth refresh serialization error \
+                                         (rpc_id={rpc_id}): {send_err}"
+                                    );
+                                }
+                                return;
+                            }
+                        };
+                        if let Err(e) = super::codex_server::send_response(rpc_id, payload) {
+                            log::error!(
+                                "Failed to send Codex auth refresh response (rpc_id={rpc_id}): {e}"
+                            );
+                        }
+                    }
+                    Err(error) => {
+                        log::error!("Codex auth refresh request failed (rpc_id={rpc_id}): {error}");
+                        let _ = app.emit_all(
+                            "chat:error",
+                            &ErrorEvent {
+                                session_id,
+                                worktree_id,
+                                error: error.clone(),
+                            },
+                        );
+                        if let Err(e) =
+                            super::codex_server::send_error_response(rpc_id, -32000, &error)
+                        {
+                            log::error!(
+                                "Failed to send Codex auth refresh error (rpc_id={rpc_id}): {e}"
+                            );
+                        }
+                    }
+                }
+            });
+        }
+        "applyPatchApproval" | "execCommandApproval" => {
+            let error = format!(
+                "Deprecated Codex server request {method} is unsupported by Jean's current \
+                 app-server flow."
+            );
+            log::warn!("{error}");
+            if let Err(e) = super::codex_server::send_error_response(rpc_id, -32601, &error) {
+                log::error!("Failed to reject deprecated Codex request (rpc_id={rpc_id}): {e}");
+                emit_connection_error();
+            }
         }
         _ => {
             let error = format!("Unsupported Codex server request: {method}. Please update Jean.");
@@ -3441,7 +3544,7 @@ mod tests {
     }
 
     #[test]
-    fn plan_mode_uses_granular_approval_policy() {
+    fn plan_mode_uses_never_approval_policy_and_read_only_sandbox() {
         let params = build_thread_start_params(
             std::path::Path::new("/tmp"),
             Some("gpt-5.4"),
@@ -3451,11 +3554,46 @@ mod tests {
             false,
             None,
         );
-        let policy = &params["approvalPolicy"]["granular"];
-        assert_eq!(policy["mcp_elicitations"], false);
-        assert_eq!(policy["sandbox_approval"], true);
-        assert_eq!(policy["rules"], true);
-        assert_eq!(policy["request_permissions"], true);
+        assert_eq!(params["approvalPolicy"], "never");
+        assert_eq!(params["sandbox"], "read-only");
+    }
+
+    #[test]
+    fn plan_turn_always_uses_read_only_sandbox_policy() {
+        let params = build_turn_start_params(
+            "thread-1",
+            "hello",
+            std::path::Path::new("/tmp/worktree"),
+            Some("plan"),
+            None,
+            &[],
+            &[],
+        );
+        let policy = &params["sandboxPolicy"];
+        assert_eq!(policy["type"], "readOnly");
+        assert_eq!(policy["writableRoots"].as_array().unwrap().len(), 0);
+        assert_eq!(policy["readOnlyAccess"]["type"], "fullAccess");
+        assert_eq!(policy["networkAccess"], true);
+    }
+
+    #[test]
+    fn build_turn_uses_workspace_write_sandbox_policy() {
+        let params = build_turn_start_params(
+            "thread-1",
+            "hello",
+            std::path::Path::new("/tmp/worktree"),
+            Some("build"),
+            None,
+            &["/tmp/context".to_string()],
+            &["/tmp/git".to_string()],
+        );
+        let policy = &params["sandboxPolicy"];
+        assert_eq!(policy["type"], "workspaceWrite");
+        assert_eq!(
+            policy["writableRoots"],
+            serde_json::json!(["/tmp/worktree", "/tmp/context", "/tmp/git"])
+        );
+        assert_eq!(policy["readOnlyAccess"]["type"], "fullAccess");
     }
 
     #[test]

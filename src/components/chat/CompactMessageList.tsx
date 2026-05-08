@@ -38,6 +38,7 @@ import {
   TOOL_CALL_DETAIL_PILL_CLASS,
 } from './ToolCallInline'
 import type { VirtualizedMessageListHandle } from './VirtualizedMessageList'
+import type { FileEdit } from './FileEditsDiffModal'
 
 const SCROLL_THRESHOLD = 300
 
@@ -67,7 +68,7 @@ interface CompactMessageListProps {
   ) => void
   onQuestionSkip: (toolCallId: string) => void
   onFileClick: (path: string) => void
-  onEditedFileClick: (path: string) => void
+  onEditedFileClick: (path: string, edits: FileEdit[]) => void
   onFixFinding: (finding: ReviewFinding, suggestion?: string) => Promise<void>
   onFixAllFindings: (
     findings: { finding: ReviewFinding; suggestion?: string }[]
@@ -644,6 +645,16 @@ export const CompactMessageList = memo(
         [hasFollowUpMap]
       )
 
+      const latestRunHasPlan = useMemo(() => {
+        for (let i = messages.length - 1; i >= 0; i--) {
+          const m = messages[i]
+          if (!m) continue
+          if (m.role === 'user') return false
+          if (m.tool_calls?.some(isPlanToolCall)) return true
+        }
+        return false
+      }, [messages])
+
       const durationFor = useCallback(
         (globalIndex: number, message: ChatMessage): number | null => {
           if (message.role !== 'assistant') return null
@@ -984,9 +995,14 @@ export const CompactMessageList = memo(
             const isLatestCompact =
               renderItems.length > 0 &&
               renderItems[renderItems.length - 1] === item
-            const showLatestText = isLatestCompact && Boolean(item.latestText)
             const latestTextIsRecap =
-              showLatestText && RECAP_HEADING_RE.test(item.latestText ?? '')
+              Boolean(item.latestText) &&
+              RECAP_HEADING_RE.test(item.latestText ?? '')
+            const showLatestText =
+              isLatestCompact &&
+              Boolean(item.latestText) &&
+              !(latestTextIsRecap && latestRunHasPlan)
+            const surfaceRecap = latestTextIsRecap && showLatestText
             return (
               <div key={item.key}>
                 <CompactActivityRow
@@ -995,7 +1011,7 @@ export const CompactMessageList = memo(
                   renderMessage={renderMessageItem}
                   hasFollowUpFor={hasFollowUpFor}
                   durationFor={durationFor}
-                  recapShownExternally={latestTextIsRecap}
+                  recapShownExternally={surfaceRecap}
                 />
                 {showLatestText && (
                   <div className="pb-4">

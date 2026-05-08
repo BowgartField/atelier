@@ -72,5 +72,15 @@ opt-level = "s"          # Optimize for size over speed
 panic = "abort"          # Don't include panic unwinding code
 strip = true             # Remove debug symbols
 
+# Fast local release profile — for testing release builds without distribution-grade size optimization.
+# Use via: bun run tauri:build:fast
+[profile.release-fast]
+inherits = "release"
+codegen-units = 16       # Parallel codegen (was 1)
+lto = "thin"             # Thin LTO (was fat) — much faster link
+opt-level = 2            # Speed-tuned, drops size-optimizer passes
+strip = "debuginfo"      # Keep symbols for crash reports, drop debuginfo
+incremental = true       # Reuse compilation across local rebuilds
+
 [dev-dependencies]
 tempfile = "3.23.0"

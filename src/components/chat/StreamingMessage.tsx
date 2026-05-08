@@ -19,6 +19,7 @@ import {
 import { ToolCallsDisplay } from './ToolCallsDisplay'
 import { PlanDisplay } from './PlanFileDisplay'
 import { EditedFilesDisplay } from './EditedFilesDisplay'
+import type { FileEdit } from './FileEditsDiffModal'
 import { ThinkingBlock } from './ThinkingBlock'
 import { ErrorBoundary } from '@/components/ui/ErrorBoundary'
 import { logger } from '@/lib/logger'
@@ -43,7 +44,7 @@ interface StreamingMessageProps {
   /** Callback when user clicks a file path */
   onFileClick: (path: string) => void
   /** Callback when user clicks an edited file badge (opens diff modal) */
-  onEditedFileClick: (path: string) => void
+  onEditedFileClick: (path: string, edits: FileEdit[]) => void
   /** Check if a question has been answered */
   isQuestionAnswered: (sessionId: string, toolCallId: string) => boolean
   /** Get submitted answers for a question */

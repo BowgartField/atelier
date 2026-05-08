@@ -72,25 +72,13 @@ export const UsagePane: React.FC = () => {
 
   return (
     <div className="space-y-6">
-      <div className="rounded-md border border-border bg-muted/30 px-3 py-2">
-        <div className="flex items-center justify-between gap-3 text-xs">
-          <span className="text-muted-foreground">
-            Usage data auto-refreshes every 5 minutes.
-          </span>
-          <span className="inline-flex items-center gap-1.5 text-muted-foreground">
-            {isRefreshing ? (
-              <>
-                <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                Refreshing...
-              </>
-            ) : (
-              <>
-                <RefreshCw className="h-3.5 w-3.5" />
-                Up to date
-              </>
-            )}
-          </span>
-        </div>
+      <div className="flex items-center justify-between gap-3 text-xs">
+        <span className="text-muted-foreground">
+          Usage data auto-refreshes every 5 minutes.
+        </span>
+        <span className="inline-flex items-center gap-1.5 text-muted-foreground">
+          {isRefreshing ? 'Refreshing...' : 'Up to date'}
+        </span>
       </div>
 
       <SettingsSection title="Claude" anchorId="pref-usage-section-claude">

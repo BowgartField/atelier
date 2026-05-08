@@ -1,4 +1,4 @@
-import { memo } from 'react'
+import { memo, useMemo } from 'react'
 import type { ToolCall } from '@/types/chat'
 import { Badge } from '@/components/ui/badge'
 import { getFilename } from '@/lib/path-utils'
@@ -7,43 +7,60 @@ import {
   TooltipTrigger,
   TooltipContent,
 } from '@/components/ui/tooltip'
+import type { FileEdit } from './FileEditsDiffModal'
 
-/** Type guard to check if a tool call is Edit */
+interface EditInput {
+  file_path: string
+  old_string?: string
+  new_string?: string
+}
+
+/** Type guard: ToolCall is a Claude Edit with file_path. */
 function isEditTool(
   toolCall: ToolCall
-): toolCall is ToolCall & { input: { file_path: string } } {
+): toolCall is ToolCall & { input: EditInput } {
   return (
     toolCall.name === 'Edit' &&
     typeof toolCall.input === 'object' &&
     toolCall.input !== null &&
-    'file_path' in toolCall.input
+    'file_path' in toolCall.input &&
+    typeof (toolCall.input as Record<string, unknown>).file_path === 'string'
   )
 }
 
 interface EditedFilesDisplayProps {
   toolCalls: ToolCall[] | undefined
-  onFileClick: (path: string) => void
+  onFileClick: (path: string, edits: FileEdit[]) => void
 }
 
 /**
- * Display edited files at the bottom of assistant messages
- * Collects all Edit tool calls and shows unique file paths
- * Clicking a file opens it in the file content modal
- * Memoized to prevent re-renders when parent state changes
+ * Display edited files at the bottom of assistant messages.
+ * Collects all Edit tool calls and shows unique file paths as clickable pills.
+ * Clicking a pill opens the diff modal with every edit applied to that file
+ * during this turn (in order).
  */
 export const EditedFilesDisplay = memo(function EditedFilesDisplay({
   toolCalls,
   onFileClick,
 }: EditedFilesDisplayProps) {
-  if (!toolCalls) return null
+  const editsByPath = useMemo(() => {
+    const map = new Map<string, FileEdit[]>()
+    if (!toolCalls) return map
+    for (const tc of toolCalls) {
+      if (!isEditTool(tc)) continue
+      const list = map.get(tc.input.file_path) ?? []
+      list.push({
+        oldString: tc.input.old_string ?? '',
+        newString: tc.input.new_string ?? '',
+      })
+      map.set(tc.input.file_path, list)
+    }
+    return map
+  }, [toolCalls])
 
-  const editTools = toolCalls.filter(isEditTool)
-  if (editTools.length === 0) return null
+  if (editsByPath.size === 0) return null
 
-  // Deduplicate by file path
-  const uniqueFilePaths = Array.from(
-    new Set(editTools.map(t => t.input.file_path))
-  )
+  const uniqueFilePaths = Array.from(editsByPath.keys())
 
   return (
     <div className="mt-2 flex flex-wrap items-center gap-1.5 text-xs text-muted-foreground/70">
@@ -57,7 +74,9 @@ export const EditedFilesDisplay = memo(function EditedFilesDisplay({
             <Badge
               variant="outline"
               className="cursor-pointer"
-              onClick={() => onFileClick(filePath)}
+              onClick={() =>
+                onFileClick(filePath, editsByPath.get(filePath) ?? [])
+              }
             >
               {getFilename(filePath)}
             </Badge>

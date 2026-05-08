@@ -73,7 +73,7 @@ describe('ToolCallInline', () => {
   })
 
   it('renders FileChange diffs without duplicate raw output', () => {
-    render(
+    const { container } = render(
       <ToolCallInline
         toolCall={{
           id: 'tool-file-change-1',
@@ -94,13 +94,14 @@ describe('ToolCallInline', () => {
     fireEvent.click(screen.getByRole('button'))
 
     expect(screen.getByText('chat-store.ts')).toBeInTheDocument()
-    expect(screen.getByText('@@ -1 +1 @@')).toBeInTheDocument()
-    expect(screen.getByText('+new')).toBeInTheDocument()
+    expect(screen.getByText('update')).toBeInTheDocument()
+    // <FileDiff> renders its diff inside a <diffs-container> custom element
+    expect(container.querySelector('diffs-container')).not.toBeNull()
     expect(screen.queryByText('Output:')).not.toBeInTheDocument()
   })
 
   it('falls back to parsing legacy FileChange output when input is empty', () => {
-    render(
+    const { container } = render(
       <ToolCallInline
         toolCall={{
           id: 'tool-file-change-2',
@@ -115,7 +116,7 @@ describe('ToolCallInline', () => {
     fireEvent.click(screen.getByRole('button'))
 
     expect(screen.getAllByText('legacy.ts')).toHaveLength(2)
-    expect(screen.getByText('+after')).toBeInTheDocument()
+    expect(container.querySelector('diffs-container')).not.toBeNull()
     expect(screen.queryByText('Output:')).not.toBeInTheDocument()
   })
 })

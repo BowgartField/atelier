@@ -460,6 +460,14 @@
   pointer-events: auto !important;
 }
 
+/* Make text column grow so action/cancel buttons align to the right edge
+   regardless of title length. Sonner ships [data-content] with flex-column
+   only; without flex:1 the buttons sit flush to text and shift per-toast. */
+[data-sonner-toaster] [data-sonner-toast] [data-content] {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
 /* Ensures the title bar window controls (minimize, maximize, close) remain clickable
    above Radix modal overlays (e.g. onboarding dialog). The title bar uses
    data-tauri-drag-region and z-[60] to sit above the z-50 dialog overlay. */

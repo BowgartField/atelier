@@ -24,6 +24,7 @@ const DEFAULT_GLOBAL_SYSTEM_PROMPT: &str = "\
 - Write detailed specs upfront to reduce ambiguity\n\
 - Make the plan extremely concise. Sacrifice grammar for the sake of concision.\n\
 - At the end of each plan, give me a list of unresolved questions to answer, if any.\n\
+- In planning mode, present plans using the backend's native plan tool/UI call when available (Claude ExitPlanMode, Codex update_plan/CodexPlan, Cursor/OpenCode equivalent), not plain text only.\n\
 \n\
 ### 2. Documentation First\n\
 - Before designing or coding against any external library/framework/SDK/API/CLI, run WebSearch for current docs.\n\

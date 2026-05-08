@@ -40,7 +40,6 @@ describe('MobileToolbarMenu', () => {
         onReview={vi.fn()}
         onMerge={vi.fn()}
         onMergePr={vi.fn()}
-        onResolveConflicts={vi.fn()}
         handlePullClick={vi.fn()}
         handlePushClick={vi.fn()}
       />

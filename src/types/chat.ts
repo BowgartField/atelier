@@ -553,6 +553,16 @@ export interface PermissionDeniedEvent {
 }
 
 export interface CodexRequestedFileSystemPermissions {
+  entries?:
+    | {
+        access: 'read' | 'write' | 'none'
+        path:
+          | { type: 'path'; path: string }
+          | { type: 'globPattern'; pattern: string }
+          | { type: 'special'; value: unknown }
+      }[]
+    | null
+  globScanMaxDepth?: number | null
   read?: string[] | null
   write?: string[] | null
 }
@@ -568,6 +578,7 @@ export interface CodexPermissionRequest {
     fileSystem?: CodexRequestedFileSystemPermissions | null
     network?: CodexRequestedNetworkPermissions | null
   }
+  cwd?: string | null
   reason?: string | null
 }
 
@@ -606,6 +617,8 @@ export interface CodexCommandApprovalRequest {
   cwd?: string | null
   reason?: string | null
   network_approval_context?: CodexNetworkApprovalContext | null
+  additional_permissions?: unknown
+  available_decisions?: unknown[] | null
   proposed_execpolicy_amendment?: string[] | null
   proposed_network_policy_amendments?: CodexNetworkPolicyAmendment[] | null
 }
@@ -664,6 +677,7 @@ export interface CodexMcpElicitationRequestEvent {
 export interface CodexDynamicToolCallRequest {
   rpc_id: number
   call_id: string
+  namespace?: string | null
   tool: string
   arguments: unknown
 }

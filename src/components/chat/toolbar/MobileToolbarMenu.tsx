@@ -40,7 +40,6 @@ interface MobileToolbarMenuProps {
   onReview: () => void
   onMerge: () => void
   onMergePr: () => void
-  onResolveConflicts: () => void
 
   handlePullClick: () => void
   handlePushClick: () => void
@@ -57,7 +56,6 @@ export function MobileToolbarMenu({
   onReview,
   onMerge,
   onMergePr,
-  onResolveConflicts,
   handlePullClick,
   handlePushClick,
 }: MobileToolbarMenuProps) {
@@ -370,7 +368,11 @@ export function MobileToolbarMenu({
             M
           </span>
         </DropdownMenuItem>
-        <DropdownMenuItem onClick={onResolveConflicts}>
+        <DropdownMenuItem
+          onClick={() =>
+            useUIStore.getState().setResolveConflictsDialogOpen(true)
+          }
+        >
           <GitMerge className="h-4 w-4" />
           Resolve Conflicts
           <span

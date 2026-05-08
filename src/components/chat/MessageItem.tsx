@@ -27,6 +27,7 @@ import { SkillBadge } from './SkillBadge'
 import { ToolCallsDisplay } from './ToolCallsDisplay'
 import { ExitPlanModeButton } from './ExitPlanModeButton'
 import { EditedFilesDisplay } from './EditedFilesDisplay'
+import type { FileEdit } from './FileEditsDiffModal'
 import {
   Tooltip,
   TooltipTrigger,
@@ -103,7 +104,7 @@ interface MessageItemProps {
   /** Callback when user clicks a file path */
   onFileClick: (path: string) => void
   /** Callback when user clicks an edited file badge (opens diff modal) */
-  onEditedFileClick: (path: string) => void
+  onEditedFileClick: (path: string, edits: FileEdit[]) => void
   /** Callback when user fixes a finding */
   onFixFinding: (finding: ReviewFinding, suggestion?: string) => Promise<void>
   /** Callback when user fixes all findings */

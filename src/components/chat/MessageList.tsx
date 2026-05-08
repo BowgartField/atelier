@@ -6,6 +6,7 @@ import type {
   ReviewFinding,
 } from '@/types/chat'
 import { MessageItem } from './MessageItem'
+import type { FileEdit } from './FileEditsDiffModal'
 
 interface MessageListProps {
   messages: ChatMessage[]
@@ -32,7 +33,7 @@ interface MessageListProps {
   ) => void
   onQuestionSkip: (toolCallId: string) => void
   onFileClick: (path: string) => void
-  onEditedFileClick: (path: string) => void
+  onEditedFileClick: (path: string, edits: FileEdit[]) => void
   onFixFinding: (finding: ReviewFinding, suggestion?: string) => Promise<void>
   onFixAllFindings: (
     findings: { finding: ReviewFinding; suggestion?: string }[]
