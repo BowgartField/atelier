@@ -18,6 +18,12 @@ describe('GitHub service error classification', () => {
     expect(isGhAuthError(error)).toBe(false)
   })
 
+  it('detects raw GitHub CLI auth prompts after excluding repo eligibility errors', () => {
+    expect(
+      isGhAuthError('To get started with GitHub CLI, please run: gh auth login')
+    ).toBe(true)
+  })
+
   it('detects standardized GitHub CLI auth errors', () => {
     expect(
       isGhAuthError("GitHub CLI not authenticated. Run 'gh auth login' first.")

@@ -56,6 +56,7 @@ export function isGhAuthError(error: unknown): boolean {
 
   return (
     lower.includes('github cli not authenticated') ||
+    lower.includes('gh auth login') ||
     lower.includes('not logged into any github hosts') ||
     lower.includes('you are not logged into any github hosts') ||
     lower.includes('requires authentication') ||
