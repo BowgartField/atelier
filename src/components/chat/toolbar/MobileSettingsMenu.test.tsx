@@ -32,6 +32,7 @@ const baseProps = {
   selectedProvider: null,
   backendModelLabel: 'Claude · Sonnet',
   backendModelLabelText: 'Claude · Sonnet',
+  hasMultipleBackendModelChoices: true,
   selectedEffortLevel: 'medium' as const,
   selectedThinkingLevel: 'think' as const,
   useAdaptiveThinking: false,
@@ -60,6 +61,35 @@ const baseProps = {
 }
 
 describe('MobileSettingsMenu', () => {
+  it('hides model row chevron when there is only one backend/model choice', async () => {
+    const user = userEvent.setup()
+
+    render(
+      <MobileSettingsMenu
+        {...baseProps}
+        hasMultipleBackendModelChoices={false}
+      />
+    )
+
+    await user.click(screen.getByRole('button', { name: /settings/i }))
+
+    const modelItem = screen.getByText('Model').closest('[role="menuitem"]')
+    expect(modelItem?.querySelector('svg.lucide-chevron-right')).toBeNull()
+  })
+
+  it('shows MCP as a plain disabled row when no servers are configured', async () => {
+    const user = userEvent.setup()
+
+    render(<MobileSettingsMenu {...baseProps} availableMcpServers={[]} />)
+
+    await user.click(screen.getByRole('button', { name: /settings/i }))
+
+    const mcpItem = screen.getByText('MCP').closest('[role="menuitem"]')
+    expect(mcpItem).toHaveAttribute('aria-disabled', 'true')
+    expect(mcpItem?.querySelector('svg.lucide-chevron-right')).toBeNull()
+    expect(screen.getByText('None')).toBeInTheDocument()
+  })
+
   it('opens backend/model picker via gear menu', async () => {
     const user = userEvent.setup()
     const onOpenBackendModelPicker = vi.fn()
@@ -103,9 +133,11 @@ describe('MobileSettingsMenu', () => {
 
   it('renders worktree PR row when prUrl + prNumber set; click opens externally', async () => {
     const user = userEvent.setup()
-    const openSpy = vi.spyOn(platform, 'openExternal').mockImplementation(() => {
-      return undefined as unknown as ReturnType<typeof platform.openExternal>
-    })
+    const openSpy = vi
+      .spyOn(platform, 'openExternal')
+      .mockImplementation(() => {
+        return undefined as unknown as ReturnType<typeof platform.openExternal>
+      })
 
     render(
       <MobileSettingsMenu
@@ -137,5 +169,44 @@ describe('MobileSettingsMenu', () => {
     await user.click(screen.getByRole('button', { name: /settings/i }))
 
     expect(screen.queryByText('Linked')).not.toBeInTheDocument()
+  })
+
+  it('hides Claude-only Max effort for Codex', async () => {
+    const user = userEvent.setup()
+
+    render(
+      <MobileSettingsMenu
+        {...baseProps}
+        selectedBackend="codex"
+        backendModelLabel="Codex · GPT 5.5"
+        backendModelLabelText="Codex · GPT 5.5"
+        selectedEffortLevel="max"
+        useAdaptiveThinking={false}
+        isCodex
+      />
+    )
+
+    await user.click(screen.getByRole('button', { name: /settings/i }))
+    await user.click(screen.getByText('Effort'))
+
+    expect(screen.getByText('xHigh')).toBeInTheDocument()
+    expect(screen.queryByText('Max')).not.toBeInTheDocument()
+  })
+
+  it('keeps Max effort available for Claude adaptive thinking', async () => {
+    const user = userEvent.setup()
+
+    render(
+      <MobileSettingsMenu
+        {...baseProps}
+        selectedEffortLevel="max"
+        useAdaptiveThinking
+      />
+    )
+
+    await user.click(screen.getByRole('button', { name: /settings/i }))
+    await user.click(screen.getByText('Effort'))
+
+    expect(screen.getAllByText('Max').length).toBeGreaterThan(0)
   })
 })

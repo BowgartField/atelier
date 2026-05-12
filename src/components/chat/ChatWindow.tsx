@@ -108,6 +108,7 @@ import { ChatInput } from './ChatInput'
 import { SessionDebugPanel } from './SessionDebugPanel'
 import { ChatToolbar } from './ChatToolbar'
 import { ReviewResultsPanel } from './ReviewResultsPanel'
+import { ReviewMethodModal } from './ReviewMethodModal'
 import { QueuedMessagesList } from './QueuedMessageItem'
 import { FloatingButtons } from './FloatingButtons'
 import { PlanDialog } from './PlanDialog'
@@ -647,8 +648,12 @@ export function ChatWindow({
   const sessionEffortLevel = useChatStore(state =>
     deferredSessionId ? state.effortLevels[deferredSessionId] : undefined
   )
-  const selectedEffortLevel: EffortLevel =
+  const rawSelectedEffortLevel: EffortLevel =
     sessionEffortLevel ?? defaultEffortLevel
+  const selectedEffortLevel: EffortLevel =
+    isCodexBackend && rawSelectedEffortLevel === 'max'
+      ? 'high'
+      : rawSelectedEffortLevel
 
   // MCP servers: resolve enabled servers cascade (session → project → global)
   // Fetches from ALL installed backends so toolbar shows grouped sections
@@ -1789,6 +1794,8 @@ export function ChatWindow({
     handlePush,
     handleOpenPr,
     handleReview,
+    handleCodeRabbitReview,
+    handleCodeRabbitPrReview,
     handleMerge,
     handleMergePr,
     handleResolveConflicts,
@@ -1937,6 +1944,8 @@ export function ChatWindow({
     cliVersion: cliStatus?.version ?? null,
     worktreeProjectId: worktree?.project_id,
   })
+
+  const [reviewMethodModalOpen, setReviewMethodModalOpen] = useState(false)
 
   // Linked projects modal state
   const linkedProjectsModalOpen = useUIStore(
@@ -2319,6 +2328,14 @@ export function ChatWindow({
       )}
     >
       <div className="flex h-full w-full min-w-0 flex-col overflow-hidden">
+        <ReviewMethodModal
+          open={reviewMethodModalOpen}
+          onOpenChange={setReviewMethodModalOpen}
+          onAiReview={handleReview}
+          onCodeRabbitCliReview={handleCodeRabbitReview}
+          onCodeRabbitPrReview={handleCodeRabbitPrReview}
+          codeRabbitPrAvailable={Boolean(worktree?.pr_number)}
+        />
         {showReviewFullWidth && activeSessionId ? (
           <div className="flex-1 min-h-0">
             <ReviewResultsPanel
@@ -2985,7 +3002,7 @@ export function ChatWindow({
                                 onCommit={handleCommit}
                                 onCommitAndPush={handleCommitAndPushWithPicker}
                                 onOpenPr={handleOpenPr}
-                                onReview={() => handleReview()}
+                                onReview={() => setReviewMethodModalOpen(true)}
                                 onMerge={handleMerge}
                                 onMergePr={handleMergePr}
                                 onResolvePrConflicts={handleResolvePrConflicts}

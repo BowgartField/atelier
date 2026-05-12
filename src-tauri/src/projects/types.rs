@@ -95,6 +95,9 @@ pub struct Project {
     /// Path to custom avatar image (relative to app data dir, e.g., "avatars/abc123.png")
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub avatar_path: Option<String>,
+    /// Auto-detected project icon path (absolute path in project dir)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_avatar_path: Option<String>,
     /// MCP server names enabled by default for this project (None = inherit from global)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub enabled_mcp_servers: Option<Vec<String>>,

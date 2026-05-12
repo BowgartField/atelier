@@ -2,6 +2,8 @@ import type { ThinkingLevel, EffortLevel, ExecutionMode } from './chat'
 import { DEFAULT_KEYBINDINGS, type KeybindingsMap } from './keybindings'
 import { isMacOS, isWindows } from '../lib/platform'
 
+export type CodexGoalExecutionMode = Extract<ExecutionMode, 'build' | 'yolo'>
+
 // =============================================================================
 // Notification Sounds
 // =============================================================================
@@ -495,8 +497,11 @@ export const DEFAULT_GLOBAL_SYSTEM_PROMPT = `### 1. Plan Mode Default
 - Use plan mode for verification steps, not just building
 - Write detailed specs upfront to reduce ambiguity
 - Make the plan extremely concise. Sacrifice grammar for the sake of concision.
-- At the end of each plan, give me a list of unresolved questions to answer, if any.
-- In planning mode, present plans using the backend's native plan tool/UI call when available (Claude ExitPlanMode, Codex update_plan/CodexPlan, Cursor/OpenCode equivalent), not plain text only.
+- In planning mode, use the backend's native plan tool/UI call when available (Claude ExitPlanMode, Codex update_plan/CodexPlan, Cursor/OpenCode equivalent), not plain text only.
+- For unresolved questions in plan mode, prefer the backend-native interactive question UI instead of plain text when available: Claude AskUserQuestion, Codex request_user_input, OpenCode question.
+- For Codex specifically: after the user answers native \`request_user_input\`/open questions in plan mode, immediately call \`update_plan\`/emit \`CodexPlan\` again with the revised plan before any implementation.
+- Every Codex plan-mode response that contains or revises a plan must use \`update_plan\`/\`CodexPlan\`; do not provide plain-text-only plans.
+- Use a plain-text Unresolved Questions section only for non-actionable notes or when the backend cannot ask interactively.
 
 ### 2. Documentation First
 - Before designing or coding against any external library/framework/SDK/API/CLI, run WebSearch for current docs.
@@ -960,6 +965,7 @@ export interface AppPreferences {
   selected_opencode_model: string // Default OpenCode model (provider/model)
   selected_cursor_model: CursorModel // Default Cursor model
   default_codex_reasoning_effort: CodexReasoningEffort // Default reasoning effort for Codex: 'low' | 'medium' | 'high' | 'xhigh'
+  codex_goal_execution_mode: CodexGoalExecutionMode // Execution mode used when starting a Codex /goal
   codex_multi_agent_enabled: boolean // Enable Codex multi-agent collaboration (experimental)
   codex_max_agent_threads: number // Max concurrent agent threads (1-8) when multi-agent is enabled
   restore_last_session: boolean // Restore last session when switching projects (default: true)
@@ -978,6 +984,7 @@ export interface AppPreferences {
   codex_cli_source: 'jean' | 'path' // Codex CLI source: 'jean' (managed) or 'path' (system PATH)
   opencode_cli_source: 'jean' | 'path' // OpenCode CLI source: 'jean' (managed) or 'path' (system PATH)
   gh_cli_source: 'jean' | 'path' // GitHub CLI source: 'jean' (managed) or 'path' (system PATH)
+  coderabbit_cli_source?: 'jean' | 'path' // CodeRabbit CLI source: 'jean' (managed) or 'path' (system PATH)
   expand_tool_calls_by_default: boolean // Expand all tool call collapsibles by default
   window_vibrancy: boolean // macOS window vibrancy effect (high GPU cost, default false)
   auto_update_ai_backends: boolean // Auto-install CLI updates in background when a new version is detected
@@ -1652,7 +1659,7 @@ export const defaultPreferences: AppPreferences = {
   archive_retention_days: 7,
   syntax_theme_dark: 'vitesse-black',
   syntax_theme_light: 'github-light',
-  parallel_execution_prompt_enabled: false, // Default: disabled (experimental)
+  parallel_execution_prompt_enabled: true, // Default: enabled
   compact_chat_view_enabled: false, // Default: disabled (experimental)
   magic_prompts: DEFAULT_MAGIC_PROMPTS,
   magic_prompt_models: DEFAULT_MAGIC_PROMPT_MODELS,
@@ -1693,6 +1700,7 @@ export const defaultPreferences: AppPreferences = {
   selected_opencode_model: 'opencode/gpt-5.3-codex', // Default OpenCode model
   selected_cursor_model: 'cursor/auto', // Default Cursor model
   default_codex_reasoning_effort: 'high', // Default: high reasoning
+  codex_goal_execution_mode: 'build', // Default: build mode for goals
   codex_multi_agent_enabled: false, // Default: disabled
   codex_max_agent_threads: 3, // Default: 3 threads
   restore_last_session: true, // Default: enabled
@@ -1711,6 +1719,7 @@ export const defaultPreferences: AppPreferences = {
   codex_cli_source: 'jean', // Default: Jean-managed
   opencode_cli_source: 'jean', // Default: Jean-managed
   gh_cli_source: 'jean', // Default: Jean-managed
+  coderabbit_cli_source: 'jean', // Default: Jean-managed
   expand_tool_calls_by_default: false, // Default: collapsed
   window_vibrancy: false, // Default: disabled (high GPU cost)
   auto_update_ai_backends: true, // Default: auto-update AI backends in the background

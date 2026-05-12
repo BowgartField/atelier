@@ -6,7 +6,7 @@ import {
   MoreHorizontal,
   Plus,
 } from 'lucide-react'
-import { convertFileSrc } from '@/lib/transport'
+import { convertFileSrc, convertProjectFileSrc } from '@/lib/transport'
 import { cn } from '@/lib/utils'
 import { dismissibleToast } from '@/lib/dismissible-toast'
 import type { Project } from '@/types/projects'
@@ -56,16 +56,20 @@ export function ProjectTreeItem({ project }: ProjectTreeItemProps) {
     state => state.setNewWorktreeModalOpen
   )
 
+  const avatarKey = project.avatar_path ?? project.default_avatar_path ?? null
+
   // Track image load errors to fall back to letter avatar
-  // Use avatar_path as key to reset error state when it changes
+  // Use avatar key to reset error state when it changes
   const [imgErrorKey, setImgErrorKey] = useState<string | null>(null)
-  const imgError = imgErrorKey === project.avatar_path
+  const imgError = imgErrorKey === avatarKey
 
   // Build avatar URL from relative path
   const avatarUrl =
     project.avatar_path && appDataDir && !imgError
       ? convertFileSrc(`${appDataDir}/${project.avatar_path}`)
-      : null
+      : project.default_avatar_path && !imgError
+        ? convertProjectFileSrc(project.default_avatar_path)
+        : null
 
   // Fetch git status for all worktrees when project is expanded
   useFetchWorktreesStatus(project.id, isExpanded)
@@ -173,7 +177,7 @@ export function ProjectTreeItem({ project }: ProjectTreeItemProps) {
               src={avatarUrl}
               alt={project.name}
               className="size-4 shrink-0 rounded object-cover"
-              onError={() => setImgErrorKey(project.avatar_path ?? null)}
+              onError={() => setImgErrorKey(avatarKey)}
             />
           ) : (
             <div className="flex size-4 shrink-0 items-center justify-center rounded bg-muted-foreground/20">

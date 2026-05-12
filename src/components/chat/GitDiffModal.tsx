@@ -39,6 +39,7 @@ import {
   DialogTitle,
 } from '@/components/ui/dialog'
 import { Button } from '@/components/ui/button'
+import { Kbd } from '@/components/ui/kbd'
 import { ModalCloseButton } from '@/components/ui/modal-close-button'
 import {
   ResizablePanelGroup,
@@ -202,6 +203,13 @@ interface GitDiffModalProps {
 }
 
 type DiffStyle = 'split' | 'unified'
+type DiffType = 'uncommitted' | 'branch' | 'commits'
+
+const DIFF_TYPE_SHORTCUTS: Record<DiffType, string> = {
+  uncommitted: '1',
+  branch: '2',
+  commits: '3',
+}
 
 /**
  * Modal dialog for viewing GitHub-style git diffs using @pierre/diffs
@@ -225,9 +233,9 @@ export function GitDiffModal({
   const [diffStyle, setDiffStyle] = useState<DiffStyle>(
     window.innerWidth < 768 ? 'unified' : 'split'
   )
-  const [activeDiffType, setActiveDiffType] = useState<
-    'uncommitted' | 'branch' | 'commits'
-  >(diffRequest?.type ?? 'uncommitted')
+  const [activeDiffType, setActiveDiffType] = useState<DiffType>(
+    diffRequest?.type ?? 'uncommitted'
+  )
   const dialogContentRef = useRef<HTMLDivElement>(null)
   const { theme } = useTheme()
   const isMobile = useIsMobile()
@@ -799,7 +807,7 @@ export function GitDiffModal({
 
   // Handle switching between diff types
   const handleSwitchDiffType = useCallback(
-    (type: 'uncommitted' | 'branch' | 'commits') => {
+    (type: DiffType) => {
       if (!diffRequest || type === activeDiffType) return
       setActiveDiffType(type)
       setSelectedFileIndex(0)
@@ -814,6 +822,44 @@ export function GitDiffModal({
     },
     [diffRequest, activeDiffType, loadDiff]
   )
+
+  // Keyboard shortcuts for switching diff tabs
+  useEffect(() => {
+    if (!diffRequest || !showSwitcher) return
+
+    const handleKeyDown = (e: KeyboardEvent) => {
+      const target = e.target as HTMLElement
+      if (
+        target.tagName === 'INPUT' ||
+        target.tagName === 'TEXTAREA' ||
+        target.isContentEditable ||
+        e.metaKey ||
+        e.ctrlKey ||
+        e.altKey ||
+        e.shiftKey
+      ) {
+        return
+      }
+
+      const shortcutType =
+        e.code === 'Digit1' || e.code === 'Numpad1'
+          ? 'uncommitted'
+          : e.code === 'Digit2' || e.code === 'Numpad2'
+            ? 'branch'
+            : e.code === 'Digit3' || e.code === 'Numpad3'
+              ? 'commits'
+              : null
+
+      if (!shortcutType) return
+
+      e.preventDefault()
+      e.stopPropagation()
+      handleSwitchDiffType(shortcutType)
+    }
+
+    document.addEventListener('keydown', handleKeyDown)
+    return () => document.removeEventListener('keydown', handleKeyDown)
+  }, [diffRequest, showSwitcher, handleSwitchDiffType])
 
   const title =
     activeDiffType === 'uncommitted'
@@ -872,6 +918,9 @@ export function GitDiffModal({
                   >
                     <Pencil className="h-3.5 w-3.5 shrink-0" />
                     <span className="hidden sm:inline">Uncommitted</span>
+                    <Kbd className="hidden h-4 min-w-4 px-1 text-[10px] opacity-70 sm:inline-flex">
+                      {DIFF_TYPE_SHORTCUTS.uncommitted}
+                    </Kbd>
                     <span className="text-green-500">+{uncommittedAdded}</span>
                     <span className="text-red-500">-{uncommittedRemoved}</span>
                   </button>
@@ -887,6 +936,9 @@ export function GitDiffModal({
                   >
                     <GitBranch className="h-3.5 w-3.5 shrink-0" />
                     <span className="hidden sm:inline">Branch</span>
+                    <Kbd className="hidden h-4 min-w-4 px-1 text-[10px] opacity-70 sm:inline-flex">
+                      {DIFF_TYPE_SHORTCUTS.branch}
+                    </Kbd>
                     <span className="text-green-500">+{branchAdded}</span>
                     <span className="text-red-500">-{branchRemoved}</span>
                   </button>
@@ -902,6 +954,9 @@ export function GitDiffModal({
                   >
                     <GitCommitHorizontal className="h-3.5 w-3.5 shrink-0" />
                     <span className="hidden sm:inline">Commits</span>
+                    <Kbd className="hidden h-4 min-w-4 px-1 text-[10px] opacity-70 sm:inline-flex">
+                      {DIFF_TYPE_SHORTCUTS.commits}
+                    </Kbd>
                   </button>
                 </div>
               ) : (

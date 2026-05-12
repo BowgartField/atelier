@@ -13,6 +13,7 @@ mod browser;
 mod chat;
 mod claude_cli;
 mod cli_update;
+mod coderabbit_cli;
 mod codex_cli;
 mod cursor_cli;
 mod gh_cli;
@@ -206,6 +207,8 @@ pub struct AppPreferences {
     pub selected_cursor_model: String, // Default Cursor model
     #[serde(default = "default_codex_reasoning_effort")]
     pub default_codex_reasoning_effort: String, // Codex reasoning effort: low, medium, high, xhigh
+    #[serde(default = "default_codex_goal_execution_mode")]
+    pub codex_goal_execution_mode: String, // Codex /goal execution mode: build or yolo
     #[serde(default)]
     pub codex_multi_agent_enabled: bool, // Enable multi-agent collaboration (experimental)
     #[serde(default = "default_codex_max_agent_threads")]
@@ -240,6 +243,8 @@ pub struct AppPreferences {
     pub opencode_cli_source: String, // OpenCode CLI source: "jean" (managed) or "path" (system PATH)
     #[serde(default = "default_cli_source")]
     pub gh_cli_source: String, // GitHub CLI source: "jean" (managed) or "path" (system PATH)
+    #[serde(default = "default_cli_source")]
+    pub coderabbit_cli_source: String, // CodeRabbit CLI source: "jean" (managed) or "path" (system PATH)
     #[serde(default)]
     pub expand_tool_calls_by_default: bool, // Expand all tool call collapsibles by default (default: false)
     #[serde(default)]
@@ -393,7 +398,7 @@ fn default_file_edit_mode() -> String {
 }
 
 fn default_parallel_execution_prompt_enabled() -> bool {
-    false // Disabled by default (experimental)
+    true // Enabled by default
 }
 
 fn default_compact_chat_view_enabled() -> bool {
@@ -428,6 +433,24 @@ fn default_cli_source() -> String {
     "jean".to_string()
 }
 
+fn maybe_auto_select_system_coderabbit(
+    app: &AppHandle,
+    preferences: &mut AppPreferences,
+    raw_preferences: Option<&Value>,
+) -> bool {
+    let coderabbit_source_missing = raw_preferences
+        .and_then(Value::as_object)
+        .map(|object| !object.contains_key("coderabbit_cli_source"))
+        .unwrap_or(true);
+
+    if coderabbit_source_missing && coderabbit_cli::should_auto_use_system_coderabbit(app) {
+        preferences.coderabbit_cli_source = "path".to_string();
+        return true;
+    }
+
+    false
+}
+
 fn default_codex_model() -> String {
     "gpt-5.5".to_string()
 }
@@ -442,6 +465,10 @@ fn default_cursor_model() -> String {
 
 fn default_codex_reasoning_effort() -> String {
     "high".to_string()
+}
+
+fn default_codex_goal_execution_mode() -> String {
+    "build".to_string()
 }
 
 fn default_codex_max_agent_threads() -> u32 {
@@ -491,8 +518,21 @@ fn resolve_http_server_bind_host(prefs: &AppPreferences) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{resolve_http_server_bind_host, AppPreferences};
+    use super::{default_global_system_prompt, resolve_http_server_bind_host, AppPreferences};
     use serde_json::json;
+
+    #[test]
+    fn default_global_system_prompt_prefers_interactive_plan_questions() {
+        let prompt = default_global_system_prompt();
+
+        assert!(prompt.contains("backend-native interactive question UI"));
+        assert!(prompt.contains("Codex request_user_input"));
+        assert!(prompt.contains("after the user answers native `request_user_input`"));
+        assert!(prompt.contains("Every Codex plan-mode response"));
+        assert!(prompt.contains("Claude AskUserQuestion"));
+        assert!(prompt.contains("OpenCode question"));
+        assert!(prompt.contains("Use a plain-text Unresolved Questions section only"));
+    }
 
     #[test]
     fn resolve_http_server_bind_host_prefers_explicit_host() {
@@ -1074,8 +1114,11 @@ fn default_global_system_prompt() -> String {
 - Use plan mode for verification steps, not just building
 - Write detailed specs upfront to reduce ambiguity
 - Make the plan extremely concise. Sacrifice grammar for the sake of concision.
-- At the end of each plan, give me a list of unresolved questions to answer, if any.
-- In planning mode, present plans using the backend's native plan tool/UI call when available (Claude ExitPlanMode, Codex update_plan/CodexPlan, Cursor/OpenCode equivalent), not plain text only.
+- In planning mode, use the backend's native plan tool/UI call when available (Claude ExitPlanMode, Codex update_plan/CodexPlan, Cursor/OpenCode equivalent), not plain text only.
+- For unresolved questions in plan mode, prefer the backend-native interactive question UI instead of plain text when available: Claude AskUserQuestion, Codex request_user_input, OpenCode question.
+- For Codex specifically: after the user answers native `request_user_input`/open questions in plan mode, immediately call `update_plan`/emit `CodexPlan` again with the revised plan before any implementation.
+- Every Codex plan-mode response that contains or revises a plan must use `update_plan`/`CodexPlan`; do not provide plain-text-only plans.
+- Use a plain-text Unresolved Questions section only for non-actionable notes or when the backend cannot ask interactively.
 
 ### 2. Documentation First
 - Before designing or coding against any external library/framework/SDK/API/CLI, run WebSearch for current docs.
@@ -1461,6 +1504,7 @@ impl Default for AppPreferences {
             selected_opencode_model: default_opencode_model(),
             selected_cursor_model: default_cursor_model(),
             default_codex_reasoning_effort: default_codex_reasoning_effort(),
+            codex_goal_execution_mode: default_codex_goal_execution_mode(),
             codex_multi_agent_enabled: false,
             codex_max_agent_threads: default_codex_max_agent_threads(),
             restore_last_session: true,
@@ -1478,6 +1522,7 @@ impl Default for AppPreferences {
             codex_cli_source: default_cli_source(),
             opencode_cli_source: default_cli_source(),
             gh_cli_source: default_cli_source(),
+            coderabbit_cli_source: default_cli_source(),
             expand_tool_calls_by_default: false,
             window_vibrancy: false,
             auto_update_ai_backends: default_auto_update_ai_backends(),
@@ -1692,12 +1737,17 @@ pub fn get_preferences_path(app: &AppHandle) -> Result<PathBuf, String> {
 pub fn load_preferences_sync(app: &AppHandle) -> Result<AppPreferences, String> {
     let prefs_path = get_preferences_path(app)?;
     if !prefs_path.exists() {
-        return Ok(AppPreferences::default());
+        let mut preferences = AppPreferences::default();
+        maybe_auto_select_system_coderabbit(app, &mut preferences, None);
+        return Ok(preferences);
     }
     let contents = std::fs::read_to_string(&prefs_path)
         .map_err(|e| format!("Failed to read preferences file: {e}"))?;
-    let preferences: AppPreferences =
+    let raw_preferences: Value =
         serde_json::from_str(&contents).map_err(|e| format!("Failed to parse preferences: {e}"))?;
+    let mut preferences: AppPreferences = serde_json::from_value(raw_preferences.clone())
+        .map_err(|e| format!("Failed to parse preferences: {e}"))?;
+    maybe_auto_select_system_coderabbit(app, &mut preferences, Some(&raw_preferences));
     Ok(preferences)
 }
 
@@ -1708,7 +1758,14 @@ async fn load_preferences(app: AppHandle) -> Result<AppPreferences, String> {
 
     if !prefs_path.exists() {
         log::trace!("Preferences file not found, using defaults");
-        return Ok(AppPreferences::default());
+        let mut preferences = AppPreferences::default();
+        if maybe_auto_select_system_coderabbit(&app, &mut preferences, None) {
+            if let Ok(json) = serde_json::to_string_pretty(&preferences) {
+                let _ = std::fs::write(&prefs_path, json);
+                log::trace!("Saved preferences after CodeRabbit PATH auto-detection");
+            }
+        }
+        return Ok(preferences);
     }
 
     let contents = std::fs::read_to_string(&prefs_path).map_err(|e| {
@@ -1716,10 +1773,15 @@ async fn load_preferences(app: AppHandle) -> Result<AppPreferences, String> {
         format!("Failed to read preferences file: {e}")
     })?;
 
-    let mut preferences: AppPreferences = serde_json::from_str(&contents).map_err(|e| {
+    let raw_preferences: Value = serde_json::from_str(&contents).map_err(|e| {
         log::error!("Failed to parse preferences JSON: {e}");
         format!("Failed to parse preferences: {e}")
     })?;
+    let mut preferences: AppPreferences =
+        serde_json::from_value(raw_preferences.clone()).map_err(|e| {
+            log::error!("Failed to parse preferences JSON: {e}");
+            format!("Failed to parse preferences: {e}")
+        })?;
 
     // Migrate magic prompts: convert prompts matching current defaults to None
     // so they auto-update when new defaults are shipped
@@ -1738,6 +1800,9 @@ async fn load_preferences(app: AppHandle) -> Result<AppPreferences, String> {
     needs_resave |= preferences.magic_prompt_models.migrate_legacy_defaults();
     if preferences.branch_naming_model == "haiku" {
         preferences.branch_naming_model = default_branch_naming_model();
+        needs_resave = true;
+    }
+    if maybe_auto_select_system_coderabbit(&app, &mut preferences, Some(&raw_preferences)) {
         needs_resave = true;
     }
     if preferences.session_naming_model == "haiku" {
@@ -3241,6 +3306,8 @@ pub fn run() {
             projects::create_commit_with_ai,
             projects::revert_last_local_commit,
             projects::run_review_with_ai,
+            projects::run_coderabbit_review,
+            projects::trigger_coderabbit_pr_review,
             projects::cancel_review_with_ai,
             projects::list_github_releases,
             projects::generate_release_notes,
@@ -3472,6 +3539,13 @@ pub fn run() {
             codex_cli::get_available_codex_versions,
             codex_cli::install_codex_cli,
             codex_cli::uninstall_codex_cli,
+            // CodeRabbit CLI management commands
+            coderabbit_cli::check_coderabbit_cli_installed,
+            coderabbit_cli::detect_coderabbit_in_path,
+            coderabbit_cli::check_coderabbit_cli_auth,
+            coderabbit_cli::install_coderabbit_cli,
+            coderabbit_cli::uninstall_coderabbit_cli,
+            coderabbit_cli::update_coderabbit_cli,
             // Cursor CLI management commands
             cursor_cli::check_cursor_cli_installed,
             cursor_cli::detect_cursor_in_path,
@@ -3525,15 +3599,22 @@ pub fn run() {
         .expect("error building tauri application")
         .run(move |app_handle, event| match &event {
             tauri::RunEvent::Exit => {
+                let has_running_sessions = chat::has_running_sessions();
                 eprintln!("[TERMINAL CLEANUP] RunEvent::Exit received");
                 let killed = terminal::cleanup_all_terminals();
                 eprintln!("[TERMINAL CLEANUP] Killed {killed} terminal(s)");
-                match opencode_server::shutdown_managed_server() {
-                    Ok(true) => eprintln!("[OPENCODE CLEANUP] Stopped managed OpenCode server"),
-                    Ok(false) => {}
-                    Err(e) => eprintln!("[OPENCODE CLEANUP] Failed during Exit: {e}"),
+                if has_running_sessions {
+                    log::warn!(
+                        "RunEvent::Exit while sessions are running; skipping managed AI server shutdown"
+                    );
+                } else {
+                    match opencode_server::shutdown_managed_server() {
+                        Ok(true) => eprintln!("[OPENCODE CLEANUP] Stopped managed OpenCode server"),
+                        Ok(false) => {}
+                        Err(e) => eprintln!("[OPENCODE CLEANUP] Failed during Exit: {e}"),
+                    }
+                    chat::codex_server::shutdown_server();
                 }
-                chat::codex_server::shutdown_server();
             }
             tauri::RunEvent::ExitRequested { api, .. } => {
                 // In headless mode, prevent exit when window closes

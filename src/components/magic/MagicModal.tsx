@@ -87,6 +87,7 @@ import {
   OPENCODE_MODEL_OPTIONS,
 } from '@/components/chat/toolbar/toolbar-options'
 import { formatOpencodeModelLabel } from '@/components/chat/toolbar/toolbar-utils'
+import { ReviewMethodModal } from '@/components/chat/ReviewMethodModal'
 
 type MagicOption =
   | 'save-context'
@@ -109,6 +110,12 @@ type MagicOption =
   | 'merge-pr'
   | 'review-comments'
   | 'revert-last-commit'
+
+interface TriggerCodeRabbitPrReviewResponse {
+  pr_number: number
+  pr_url: string
+  comment_body: string
+}
 
 /** Options that work on canvas without an open session (git-only operations) */
 const CANVAS_ALLOWED_OPTIONS = new Set<MagicOption>([
@@ -366,6 +373,7 @@ export function MagicModal() {
   const [customInvestigateModel, setCustomInvestigateModel] =
     useState<string>('sonnet')
   const [resolveDialogOpen, setResolveDialogOpen] = useState(false)
+  const [reviewMethodDialogOpen, setReviewMethodDialogOpen] = useState(false)
   const [resolveSelectionMode, setResolveSelectionMode] =
     useState<ResolveSelectionMode>('settings-default')
   const [customResolveBackend, setCustomResolveBackend] =
@@ -789,7 +797,8 @@ export function MagicModal() {
   const executeGitDirectly = useCallback(
     async (
       option: MagicOption,
-      override?: { backend: CliBackend; model: string }
+      override?: { backend: CliBackend; model: string },
+      reviewSource: 'ai' | 'coderabbit-cli' | 'coderabbit-pr' = 'ai'
     ) => {
       if (!selectedWorktreeId || !worktree?.path) return
 
@@ -1200,37 +1209,98 @@ ${resolveInstructions}`
           const projectName = project?.name ?? 'project'
           const worktreeName = worktree.name ?? worktree.branch ?? ''
           const reviewTarget = `${projectName}/${worktreeName}`
+          if (reviewSource === 'coderabbit-pr') {
+            const toastId = toast.loading(
+              `Triggering CodeRabbit review for ${reviewTarget}...`
+            )
+
+            try {
+              if (!worktree.pr_number) {
+                throw new Error('Open or link a PR in Jean first')
+              }
+
+              const result = await invoke<TriggerCodeRabbitPrReviewResponse>(
+                'trigger_coderabbit_pr_review',
+                {
+                  worktreeId: selectedWorktreeId,
+                  worktreePath: worktree.path,
+                  prNumber: worktree.pr_number,
+                }
+              )
+
+              if (worktree.project_id) {
+                queryClient.invalidateQueries({
+                  queryKey: projectsQueryKeys.worktrees(worktree.project_id),
+                })
+                queryClient.invalidateQueries({
+                  queryKey: [
+                    ...projectsQueryKeys.all,
+                    'worktree',
+                    selectedWorktreeId,
+                  ],
+                })
+              }
+
+              toast.success(
+                `CodeRabbit review triggered on PR #${result.pr_number}`,
+                {
+                  id: toastId,
+                  action: result.pr_url
+                    ? {
+                        label: 'Open',
+                        onClick: () => openExternal(result.pr_url),
+                      }
+                    : undefined,
+                }
+              )
+            } catch (error) {
+              toast.error(`Failed to trigger CodeRabbit review: ${error}`, {
+                id: toastId,
+              })
+            } finally {
+              clearWorktreeLoading(selectedWorktreeId)
+            }
+            break
+          }
+
           const reviewRunId = generateId()
           let cancelRequested = false
-          const toastId = toast.loading(`Reviewing ${reviewTarget}...`, {
-            cancel: {
-              label: 'Cancel',
-              onClick: () => {
-                cancelRequested = true
-                toast.loading(`Cancelling review for ${reviewTarget}...`, {
-                  id: toastId,
-                })
-                invoke<boolean>('cancel_review_with_ai', { reviewRunId })
-                  .then(cancelled => {
-                    if (cancelled) {
-                      toast.info(`Review cancelled for ${reviewTarget}`, {
+          const reviewLabel =
+            reviewSource === 'coderabbit-cli'
+              ? 'CodeRabbit CLI review'
+              : 'Review'
+          const toastId = toast.loading(
+            `${reviewLabel} for ${reviewTarget}...`,
+            {
+              cancel: {
+                label: 'Cancel',
+                onClick: () => {
+                  cancelRequested = true
+                  toast.loading(`Cancelling review for ${reviewTarget}...`, {
+                    id: toastId,
+                  })
+                  invoke<boolean>('cancel_review_with_ai', { reviewRunId })
+                    .then(cancelled => {
+                      if (cancelled) {
+                        toast.info(`Review cancelled for ${reviewTarget}`, {
+                          id: toastId,
+                        })
+                      } else {
+                        toast.info(
+                          `No active review to cancel for ${reviewTarget}`,
+                          { id: toastId }
+                        )
+                      }
+                    })
+                    .catch(error => {
+                      toast.error(`Failed to cancel review: ${error}`, {
                         id: toastId,
                       })
-                    } else {
-                      toast.info(
-                        `No active review to cancel for ${reviewTarget}`,
-                        { id: toastId }
-                      )
-                    }
-                  })
-                  .catch(error => {
-                    toast.error(`Failed to cancel review: ${error}`, {
-                      id: toastId,
                     })
-                  })
+                },
               },
-            },
-          })
+            }
+          )
 
           // Fire-and-forget: detect and link PR if not already linked
           if (!worktree.pr_number) {
@@ -1258,19 +1328,31 @@ ${resolveInstructions}`
           }
 
           try {
-            const result = await invoke<ReviewResponse>('run_review_with_ai', {
-              worktreePath: worktree.path,
-              customPrompt: preferences?.magic_prompts?.code_review,
-              model: preferences?.magic_prompt_models?.code_review_model,
-              customProfileName: resolveMagicPromptProvider(
-                preferences?.magic_prompt_providers,
-                'code_review_provider',
-                preferences?.default_provider
-              ),
-              reasoningEffort:
-                preferences?.magic_prompt_efforts?.code_review_effort ?? null,
-              reviewRunId,
-            })
+            const result = await invoke<ReviewResponse>(
+              reviewSource === 'coderabbit-cli'
+                ? 'run_coderabbit_review'
+                : 'run_review_with_ai',
+              reviewSource === 'coderabbit-cli'
+                ? {
+                    worktreePath: worktree.path,
+                    reviewRunId,
+                    reviewType: 'all',
+                  }
+                : {
+                    worktreePath: worktree.path,
+                    customPrompt: preferences?.magic_prompts?.code_review,
+                    model: preferences?.magic_prompt_models?.code_review_model,
+                    customProfileName: resolveMagicPromptProvider(
+                      preferences?.magic_prompt_providers,
+                      'code_review_provider',
+                      preferences?.default_provider
+                    ),
+                    reasoningEffort:
+                      preferences?.magic_prompt_efforts?.code_review_effort ??
+                      null,
+                    reviewRunId,
+                  }
+            )
 
             const newSession = await invoke<Session>('create_session', {
               worktreeId: selectedWorktreeId,
@@ -1315,7 +1397,7 @@ ${resolveInstructions}`
 
             const findingCount = result.findings.length
             toast.success(
-              `Review done on ${reviewTarget} (${findingCount} findings)`,
+              `${reviewSource === 'coderabbit-cli' ? 'CodeRabbit CLI review' : 'Review'} done on ${reviewTarget} (${findingCount} findings)`,
               {
                 id: toastId,
                 action: {
@@ -1409,6 +1491,17 @@ ${resolveInstructions}`
     async (option: MagicOption) => {
       // Block disabled options on canvas
       if (isOnCanvas && !CANVAS_ALLOWED_OPTIONS.has(option)) {
+        return
+      }
+
+      if (option === 'review') {
+        if (!selectedWorktreeId || !worktree?.path) {
+          notify('No worktree selected', undefined, { type: 'error' })
+          setMagicModalOpen(false)
+          return
+        }
+        setMagicModalOpen(false)
+        setReviewMethodDialogOpen(true)
         return
       }
 
@@ -1637,6 +1730,18 @@ ${resolveInstructions}`
 
   return (
     <>
+      <ReviewMethodModal
+        open={reviewMethodDialogOpen}
+        onOpenChange={setReviewMethodDialogOpen}
+        onAiReview={() => executeGitDirectly('review', undefined, 'ai')}
+        onCodeRabbitCliReview={() =>
+          executeGitDirectly('review', undefined, 'coderabbit-cli')
+        }
+        onCodeRabbitPrReview={() =>
+          executeGitDirectly('review', undefined, 'coderabbit-pr')
+        }
+        codeRabbitPrAvailable={Boolean(worktree?.pr_number)}
+      />
       <Dialog open={magicModalOpen} onOpenChange={handleOpenChange}>
         <DialogContent
           ref={contentRef}
@@ -1819,6 +1924,11 @@ ${resolveInstructions}`
                     >
                       <SelectTrigger
                         size="sm"
+                        hideIcon={
+                          installedBackends.filter(backend =>
+                            ['claude', 'codex', 'opencode'].includes(backend)
+                          ).length <= 1
+                        }
                         onClick={() => setInvestigateSelectionMode('custom')}
                       >
                         <SelectValue />
@@ -1848,7 +1958,10 @@ ${resolveInstructions}`
                         setCustomInvestigateModel(value)
                       }}
                     >
-                      <SelectTrigger size="sm">
+                      <SelectTrigger
+                        size="sm"
+                        hideIcon={customInvestigateModelOptions.length <= 1}
+                      >
                         <SelectValue />
                       </SelectTrigger>
                       <SelectContent>
@@ -1959,6 +2072,11 @@ ${resolveInstructions}`
                     >
                       <SelectTrigger
                         size="sm"
+                        hideIcon={
+                          installedBackends.filter(backend =>
+                            ['claude', 'codex', 'opencode'].includes(backend)
+                          ).length <= 1
+                        }
                         onClick={() => setResolveSelectionMode('custom')}
                       >
                         <SelectValue />
@@ -1988,7 +2106,10 @@ ${resolveInstructions}`
                         setCustomResolveModel(value)
                       }}
                     >
-                      <SelectTrigger size="sm">
+                      <SelectTrigger
+                        size="sm"
+                        hideIcon={customResolveModelOptions.length <= 1}
+                      >
                         <SelectValue />
                       </SelectTrigger>
                       <SelectContent>

@@ -1,16 +1,4 @@
-import {
-  MODEL_OPTIONS,
-  CODEX_MODEL_OPTIONS,
-  OPENCODE_MODEL_OPTIONS,
-  CURSOR_MODEL_OPTIONS,
-} from './toolbar/toolbar-options'
-
-const ALL_MODEL_OPTIONS = [
-  ...MODEL_OPTIONS,
-  ...CODEX_MODEL_OPTIONS,
-  ...OPENCODE_MODEL_OPTIONS,
-  ...CURSOR_MODEL_OPTIONS,
-]
+import { getMessageModelLabel } from '@/components/chat/message-settings-labels'
 
 /**
  * Resolves a human-readable label for the backend + model that will be used
@@ -56,10 +44,7 @@ export function resolveApprovalLabel(
           : (preferences.selected_model ?? null)
   const resolvedModel = model ?? backendDefaultModel
   if (!resolvedModel && !resolvedBackend) return null
-  const modelLabel = resolvedModel
-    ? (ALL_MODEL_OPTIONS.find(o => o.value === resolvedModel)?.label ??
-      resolvedModel)
-    : null
+  const modelLabel = resolvedModel ? getMessageModelLabel(resolvedModel) : null
   const parts: string[] = []
   if (resolvedBackend && resolvedBackend !== 'claude')
     parts.push(resolvedBackend)

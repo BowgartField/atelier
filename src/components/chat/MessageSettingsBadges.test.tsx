@@ -63,6 +63,23 @@ describe('MessageSettingsBadges', () => {
     expect(screen.getByText('· Think')).toBeVisible()
   })
 
+  it('renders Claude fast model labels instead of raw ids', () => {
+    render(
+      <MessageSettingsBadges
+        model="claude-opus-4-6[1m]-fast"
+        executionMode="plan"
+        thinkingLevel={undefined}
+        effortLevel="high"
+        isCursor={false}
+      />
+    )
+
+    expect(screen.getByText('Opus 4.6 (1M) Fast')).toBeVisible()
+    expect(screen.getByText('· plan')).toBeVisible()
+    expect(screen.getByText('· High')).toBeVisible()
+    expect(screen.queryByText('claude-opus-4-6[1m]-fast')).toBeNull()
+  })
+
   it('formats unknown slash models as provider labels', () => {
     render(
       <MessageSettingsBadges

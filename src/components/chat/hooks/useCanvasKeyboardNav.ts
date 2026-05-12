@@ -11,6 +11,10 @@ interface UseCanvasKeyboardNavOptions<T> {
   onSelectedIndexChange: (index: number | null) => void
   /** Callback when Enter is pressed on selected item */
   onSelect: (index: number) => void
+  /** Optional callback when ArrowLeft is pressed */
+  onNavigateLeft?: () => void
+  /** Optional callback when ArrowRight is pressed */
+  onNavigateRight?: () => void
   /** Whether keyboard navigation is enabled (disable when modal open) */
   enabled: boolean
   /** Optional callback when selection changes (for tracking in store) */
@@ -35,6 +39,8 @@ export function useCanvasKeyboardNav<T>({
   selectedIndex,
   onSelectedIndexChange,
   onSelect,
+  onNavigateLeft,
+  onNavigateRight,
   enabled,
   onSelectionChange,
 }: UseCanvasKeyboardNavOptions<T>): UseCanvasKeyboardNavResult {
@@ -113,6 +119,19 @@ export function useCanvasKeyboardNav<T>({
       // Use refs to get current values (avoids stale closures)
       const currentIndex = selectedIndexRef.current
       const total = cardsLengthRef.current
+
+      if (e.key === 'ArrowLeft' && onNavigateLeft) {
+        e.preventDefault()
+        onNavigateLeft()
+        return
+      }
+
+      if (e.key === 'ArrowRight' && onNavigateRight) {
+        e.preventDefault()
+        onNavigateRight()
+        return
+      }
+
       if (total === 0) return
 
       if (currentIndex === null) {
@@ -154,7 +173,14 @@ export function useCanvasKeyboardNav<T>({
 
     window.addEventListener('keydown', handleKeyDown)
     return () => window.removeEventListener('keydown', handleKeyDown)
-  }, [enabled, onSelectedIndexChange, onSelect, onSelectionChange])
+  }, [
+    enabled,
+    onSelectedIndexChange,
+    onSelect,
+    onNavigateLeft,
+    onNavigateRight,
+    onSelectionChange,
+  ])
 
   // Scroll selected card into view when selection changes
   // Uses manual scroll to ensure group/section headers above the card stay visible

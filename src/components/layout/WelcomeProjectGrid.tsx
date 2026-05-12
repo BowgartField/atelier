@@ -1,6 +1,6 @@
 import { useMemo, useState } from 'react'
 import { Plus } from 'lucide-react'
-import { convertFileSrc } from '@/lib/transport'
+import { convertFileSrc, convertProjectFileSrc } from '@/lib/transport'
 import type { Project } from '@/types/projects'
 import { useAppDataDir } from '@/services/projects'
 import { Button } from '@/components/ui/button'
@@ -22,13 +22,16 @@ function ProjectCard({
   appDataDir: string
   onClick: () => void
 }) {
+  const avatarKey = project.avatar_path ?? project.default_avatar_path ?? null
   const [imgErrorKey, setImgErrorKey] = useState<string | null>(null)
-  const imgError = imgErrorKey === project.avatar_path
+  const imgError = imgErrorKey === avatarKey
 
   const avatarUrl =
     project.avatar_path && appDataDir && !imgError
       ? convertFileSrc(`${appDataDir}/${project.avatar_path}`)
-      : null
+      : project.default_avatar_path && !imgError
+        ? convertProjectFileSrc(project.default_avatar_path)
+        : null
 
   return (
     <button
@@ -40,7 +43,7 @@ function ProjectCard({
           src={avatarUrl}
           alt={project.name}
           className="size-8 shrink-0 rounded-md object-cover"
-          onError={() => setImgErrorKey(project.avatar_path ?? null)}
+          onError={() => setImgErrorKey(avatarKey)}
         />
       ) : (
         <div className="flex size-8 shrink-0 items-center justify-center rounded-md bg-muted-foreground/20">
