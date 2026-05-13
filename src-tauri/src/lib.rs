@@ -153,6 +153,8 @@ pub struct AppPreferences {
     pub waiting_sound: String, // Sound when session is waiting for input: none, workwork
     #[serde(default = "default_review_sound")]
     pub review_sound: String, // Sound when session finishes reviewing: none, workwork
+    #[serde(default = "default_web_access_sounds_enabled")]
+    pub web_access_sounds_enabled: bool, // Play notification sounds in browser/web access views
     #[serde(default)]
     pub http_server_enabled: bool, // Whether HTTP server is enabled
     #[serde(default)]
@@ -509,6 +511,10 @@ fn default_review_sound() -> String {
     "none".to_string()
 }
 
+fn default_web_access_sounds_enabled() -> bool {
+    true
+}
+
 fn default_http_server_port() -> u16 {
     3456
 }
@@ -570,6 +576,19 @@ mod tests {
 
         prefs.http_server_localhost_only = false;
         assert_eq!(resolve_http_server_bind_host(&prefs), "0.0.0.0");
+    }
+
+    #[test]
+    fn app_preferences_default_web_access_sounds_enabled_for_existing_prefs() {
+        let mut prefs_json = serde_json::to_value(AppPreferences::default()).unwrap();
+        prefs_json
+            .as_object_mut()
+            .unwrap()
+            .remove("web_access_sounds_enabled");
+
+        let prefs: AppPreferences = serde_json::from_value(prefs_json).unwrap();
+
+        assert!(prefs.web_access_sounds_enabled);
     }
 
     #[test]
@@ -1494,6 +1513,7 @@ impl Default for AppPreferences {
             allow_web_tools_in_plan_mode: default_allow_web_tools_in_plan_mode(),
             waiting_sound: default_waiting_sound(),
             review_sound: default_review_sound(),
+            web_access_sounds_enabled: default_web_access_sounds_enabled(),
             http_server_enabled: false,
             http_server_auto_start: false,
             http_server_port: default_http_server_port(),
@@ -3313,6 +3333,7 @@ pub fn run() {
             projects::delete_all_archives,
             projects::rename_worktree,
             projects::update_worktree_label,
+            projects::update_worktree_labels,
             projects::set_worktree_last_opened,
             projects::open_worktree_in_finder,
             projects::open_log_directory,
@@ -3437,6 +3458,7 @@ pub fn run() {
             projects::get_app_data_dir,
             // Terminal commands
             terminal::start_terminal,
+            terminal::prepare_backend_terminal_context,
             terminal::terminal_write,
             terminal::terminal_resize,
             terminal::stop_terminal,
@@ -3466,6 +3488,7 @@ pub fn run() {
             chat::list_all_sessions,
             chat::get_session,
             chat::load_older_session_messages,
+            chat::list_native_cli_sessions,
             chat::create_session,
             chat::rename_session,
             chat::regenerate_session_name,
@@ -3564,6 +3587,7 @@ pub fn run() {
             coderabbit_cli::check_coderabbit_cli_installed,
             coderabbit_cli::detect_coderabbit_in_path,
             coderabbit_cli::check_coderabbit_cli_auth,
+            coderabbit_cli::get_available_coderabbit_versions,
             coderabbit_cli::install_coderabbit_cli,
             coderabbit_cli::uninstall_coderabbit_cli,
             coderabbit_cli::update_coderabbit_cli,
