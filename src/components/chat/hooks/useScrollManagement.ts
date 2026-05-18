@@ -81,12 +81,32 @@ export function useScrollManagement({
   const isAtBottomRef = useRef(true)
   // Ref to track if we're currently auto-scrolling (to avoid race conditions)
   const isAutoScrollingRef = useRef(false)
+  // Explicit "follow live tail" state. This is intentionally separate from
+  // isAtBottom because some auto-scroll modes (for example desktop plan
+  // pinning) can leave the viewport away from the physical bottom while the
+  // user still wants the stream to be followed. Once the user scrolls away,
+  // streaming must not fight them until they intentionally return to bottom.
+  const isFollowingTailRef = useRef(true)
   // State for tracking if findings are visible in viewport
   const [areFindingsVisible, setAreFindingsVisible] = useState(true)
   // Ref for scroll timeout cleanup
   const scrollTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   // Cooldown: when user scrolls up, block handleScroll from re-setting isAtBottom for a short period
   const userScrollUpUntilRef = useRef(0)
+  const lastScrollTopRef = useRef(0)
+  const touchStartYRef = useRef<number | null>(null)
+
+  const stopFollowingTail = useCallback(() => {
+    if (scrollTimeoutRef.current) {
+      clearTimeout(scrollTimeoutRef.current)
+      scrollTimeoutRef.current = null
+    }
+    isAutoScrollingRef.current = false
+    isFollowingTailRef.current = false
+    isAtBottomRef.current = false
+    setIsAtBottom(false)
+    userScrollUpUntilRef.current = Date.now() + 1000
+  }, [])
 
   // Cleanup scroll timeout on unmount
   useEffect(() => {
@@ -167,23 +187,68 @@ export function useScrollManagement({
         // floating "Bottom" button.
         if (!hasScrollableOverflow(viewport)) {
           userScrollUpUntilRef.current = 0
+          isFollowingTailRef.current = true
           isAtBottomRef.current = true
           setIsAtBottom(prev => (prev ? prev : true))
           return
         }
 
-        isAtBottomRef.current = false
-        setIsAtBottom(false)
-        userScrollUpUntilRef.current = Date.now() + 1000
+        stopFollowingTail()
       } else if (e.deltaY > 0) {
         // User scrolling down — clear cooldown so bottom detection works
         userScrollUpUntilRef.current = 0
+        if (isViewportAtBottom(viewport)) {
+          isFollowingTailRef.current = true
+        }
       }
     }
 
     viewport.addEventListener('wheel', handleWheel, { passive: true })
     return () => viewport.removeEventListener('wheel', handleWheel)
-  }, [])
+  }, [stopFollowingTail])
+
+  // Touch scrolling does not emit wheel events. Disable follow mode when the
+  // gesture moves content upward (finger moves down), and resume only when the
+  // actual scroll position reaches bottom.
+  useEffect(() => {
+    const viewport = scrollViewportRef.current
+    if (!viewport) return
+
+    const handleTouchStart = (e: TouchEvent) => {
+      touchStartYRef.current = e.touches[0]?.clientY ?? null
+    }
+
+    const handleTouchMove = (e: TouchEvent) => {
+      if (!hasScrollableOverflow(viewport)) return
+      const startY = touchStartYRef.current
+      const currentY = e.touches[0]?.clientY
+      if (startY == null || currentY == null) return
+
+      // Finger moving down scrolls the content upward / toward older messages.
+      if (currentY - startY > 4) {
+        stopFollowingTail()
+      }
+    }
+
+    const handleTouchEnd = () => {
+      touchStartYRef.current = null
+      if (isViewportAtBottom(viewport)) {
+        userScrollUpUntilRef.current = 0
+        isFollowingTailRef.current = true
+      }
+    }
+
+    viewport.addEventListener('touchstart', handleTouchStart, { passive: true })
+    viewport.addEventListener('touchmove', handleTouchMove, { passive: true })
+    viewport.addEventListener('touchend', handleTouchEnd, { passive: true })
+    viewport.addEventListener('touchcancel', handleTouchEnd, { passive: true })
+    return () => {
+      viewport.removeEventListener('touchstart', handleTouchStart)
+      viewport.removeEventListener('touchmove', handleTouchMove)
+      viewport.removeEventListener('touchend', handleTouchEnd)
+      viewport.removeEventListener('touchcancel', handleTouchEnd)
+    }
+  }, [stopFollowingTail])
 
   // Keep scroll state honest when content/viewport size changes. If the chat no
   // longer overflows (short message list, window got taller, content collapsed),
@@ -199,6 +264,7 @@ export function useScrollManagement({
       rafId = requestAnimationFrame(() => {
         if (!hasScrollableOverflow(viewport)) {
           userScrollUpUntilRef.current = 0
+          isFollowingTailRef.current = true
           isAtBottomRef.current = true
           setIsAtBottom(prev => (prev ? prev : true))
         }
@@ -237,8 +303,8 @@ export function useScrollManagement({
       rafId = requestAnimationFrame(() => {
         // Respect cooldown after user scrolled up
         if (Date.now() < userScrollUpUntilRef.current) return
-        // Don't scroll if user has scrolled away from bottom
-        if (!isAtBottomRef.current) return
+        // Don't scroll if user has intentionally scrolled away from the stream
+        if (!isFollowingTailRef.current) return
 
         // [Tier 5] If a plan is visible on desktop, pin it to the top using
         // direct scrollTop. Mobile should keep following the streaming tail.
@@ -279,10 +345,14 @@ export function useScrollManagement({
       const viewport = scrollViewportRef.current
       // Only follow if user was already at bottom. Otherwise leave them where they are —
       // FloatingButtons' "Bottom" button is the manual escape hatch.
-      if (viewport && isAtBottomRef.current && !isAutoScrollingRef.current) {
+      if (
+        viewport &&
+        isFollowingTailRef.current &&
+        !isAutoScrollingRef.current
+      ) {
         let cancelled = false
         requestAnimationFrame(() => {
-          if (cancelled || !isAtBottomRef.current) return
+          if (cancelled || !isFollowingTailRef.current) return
           isAutoScrollingRef.current = true
           viewport.scrollTo({
             top: viewport.scrollHeight,
@@ -298,7 +368,7 @@ export function useScrollManagement({
             // Correct any stale-scrollHeight undershoot from DOM changes mid-animation
             const { scrollTop, scrollHeight, clientHeight } = viewport
             if (
-              isAtBottomRef.current &&
+              isFollowingTailRef.current &&
               scrollHeight - scrollTop - clientHeight > 2
             ) {
               scrollToTail(viewport)
@@ -317,13 +387,13 @@ export function useScrollManagement({
     }
 
     // Streaming just ended — pin to actual bottom
-    if (wasSendingRef.current && !isSending && isAtBottomRef.current) {
+    if (wasSendingRef.current && !isSending && isFollowingTailRef.current) {
       let cancelled = false
       requestAnimationFrame(() => {
         requestAnimationFrame(() => {
           if (cancelled) return
           const viewport = scrollViewportRef.current
-          if (viewport && isAtBottomRef.current) {
+          if (viewport && isFollowingTailRef.current) {
             const { scrollTop, scrollHeight, clientHeight } = viewport
             if (scrollHeight - scrollTop - clientHeight > 1) {
               scrollToTail(viewport)
@@ -343,6 +413,8 @@ export function useScrollManagement({
   useLayoutEffect(() => {
     const viewport = scrollViewportRef.current
     if (viewport) {
+      isFollowingTailRef.current = true
+      userScrollUpUntilRef.current = 0
       scrollToTail(viewport)
     }
   }, [activeWorktreeId])
@@ -358,6 +430,8 @@ export function useScrollManagement({
     if (prevLength === 0 && currentLength > 0) {
       const viewport = scrollViewportRef.current
       if (viewport) {
+        isFollowingTailRef.current = true
+        userScrollUpUntilRef.current = 0
         scrollToTail(viewport)
       }
     }
@@ -372,7 +446,23 @@ export function useScrollManagement({
     }
 
     const target = e.target as HTMLDivElement
+    const previousScrollTop = lastScrollTopRef.current
+    lastScrollTopRef.current = target.scrollTop
+
+    if (
+      hasScrollableOverflow(target) &&
+      target.scrollTop < previousScrollTop - SCROLL_EPSILON_PX
+    ) {
+      isFollowingTailRef.current = false
+      userScrollUpUntilRef.current = Date.now() + 1000
+    }
+
     const atBottom = isViewportAtBottom(target)
+
+    if (atBottom) {
+      userScrollUpUntilRef.current = 0
+      isFollowingTailRef.current = true
+    }
 
     // During cooldown after user scrolled up, only allow transitions to NOT-at-bottom
     if (Date.now() < userScrollUpUntilRef.current && atBottom) {
@@ -386,6 +476,8 @@ export function useScrollManagement({
 
   // Handle scroll-to-bottom completion from VirtualizedMessageList
   const handleScrollToBottomHandled = useCallback(() => {
+    isFollowingTailRef.current = true
+    userScrollUpUntilRef.current = 0
     isAtBottomRef.current = true
     setIsAtBottom(true)
   }, [])
@@ -406,6 +498,8 @@ export function useScrollManagement({
     }
 
     isAtBottomRef.current = true
+    isFollowingTailRef.current = true
+    userScrollUpUntilRef.current = 0
     setIsAtBottom(true)
 
     if (instant) {
@@ -458,6 +552,8 @@ export function useScrollManagement({
   // Used when sending a message so VirtualizedMessageList's gentle scrollIntoView
   // handles the actual scrolling.
   const markAtBottom = useCallback(() => {
+    isFollowingTailRef.current = true
+    userScrollUpUntilRef.current = 0
     isAtBottomRef.current = true
     setIsAtBottom(true)
   }, [])
@@ -472,6 +568,7 @@ export function useScrollManagement({
       scrollTimeoutRef.current = null
     }
     isAutoScrollingRef.current = true
+    isFollowingTailRef.current = false
     isAtBottomRef.current = false
     setIsAtBottom(false)
   }, [])
@@ -483,6 +580,12 @@ export function useScrollManagement({
     const viewport = scrollViewportRef.current
     if (viewport) {
       const atBottom = isViewportAtBottom(viewport)
+      if (atBottom) {
+        userScrollUpUntilRef.current = 0
+        isFollowingTailRef.current = true
+      } else {
+        isFollowingTailRef.current = false
+      }
       isAtBottomRef.current = atBottom
       setIsAtBottom(prev => (prev === atBottom ? prev : atBottom))
     }

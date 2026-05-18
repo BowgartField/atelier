@@ -1,4 +1,4 @@
-import { act, render } from '@testing-library/react'
+import { act, fireEvent, render } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { useScrollManagement } from './useScrollManagement'
 
@@ -11,6 +11,8 @@ vi.mock('@/hooks/use-mobile', () => ({
 type ResizeObserverCallback = ConstructorParameters<typeof ResizeObserver>[0]
 
 let resizeObserverCallbacks: ResizeObserverCallback[] = []
+const originalResizeObserver = globalThis.ResizeObserver
+const originalIntersectionObserver = globalThis.IntersectionObserver
 
 class ResizeObserverMock {
   constructor(callback: ResizeObserverCallback) {
@@ -47,15 +49,21 @@ function setupHook({ isSending = true }: SetupHookOptions = {}) {
   const virtualizedListRef = { current: null }
 
   function TestHarness() {
-    const { isAtBottom, scrollViewportRef } = useScrollManagement({
-      messages: [],
-      virtualizedListRef,
-      activeWorktreeId: 'worktree-1',
-      isSending,
-    })
+    const { isAtBottom, scrollViewportRef, handleScroll } = useScrollManagement(
+      {
+        messages: [],
+        virtualizedListRef,
+        activeWorktreeId: 'worktree-1',
+        isSending,
+      }
+    )
 
     return (
-      <div ref={scrollViewportRef} data-testid="viewport">
+      <div
+        ref={scrollViewportRef}
+        data-testid="viewport"
+        onScroll={handleScroll}
+      >
         <span data-testid="is-at-bottom">{String(isAtBottom)}</span>
         <div data-testid="content">
           <div data-plan-display data-testid="plan" />
@@ -90,8 +98,14 @@ describe('useScrollManagement streaming auto-scroll', () => {
   beforeEach(() => {
     isMobile = false
     resizeObserverCallbacks = []
-    vi.stubGlobal('ResizeObserver', ResizeObserverMock)
-    vi.stubGlobal('IntersectionObserver', IntersectionObserverMock)
+    Object.defineProperty(globalThis, 'ResizeObserver', {
+      configurable: true,
+      value: ResizeObserverMock,
+    })
+    Object.defineProperty(globalThis, 'IntersectionObserver', {
+      configurable: true,
+      value: IntersectionObserverMock,
+    })
     Object.defineProperty(HTMLElement.prototype, 'scrollTo', {
       configurable: true,
       value: function scrollTo(options: ScrollToOptions) {
@@ -109,7 +123,14 @@ describe('useScrollManagement streaming auto-scroll', () => {
 
   afterEach(() => {
     vi.restoreAllMocks()
-    vi.unstubAllGlobals()
+    Object.defineProperty(globalThis, 'ResizeObserver', {
+      configurable: true,
+      value: originalResizeObserver,
+    })
+    Object.defineProperty(globalThis, 'IntersectionObserver', {
+      configurable: true,
+      value: originalIntersectionObserver,
+    })
   })
 
   it('keeps desktop plan pinning during streaming', async () => {
@@ -140,6 +161,36 @@ describe('useScrollManagement streaming auto-scroll', () => {
     await triggerResize()
 
     expect(viewport.scrollTop).toBe(1500)
+  })
+
+  it('does not pin the desktop plan after the user scrolls up during streaming', async () => {
+    const { viewport } = setupHook()
+    viewport.scrollTop = 1500
+
+    act(() => {
+      viewport.dispatchEvent(new WheelEvent('wheel', { deltaY: -100 }))
+    })
+    await triggerResize()
+
+    expect(viewport.scrollTop).toBe(1500)
+  })
+
+  it('resumes streaming auto-scroll after the user returns to bottom', async () => {
+    isMobile = true
+    const { viewport } = setupHook()
+    viewport.scrollTop = 1500
+
+    act(() => {
+      viewport.dispatchEvent(new WheelEvent('wheel', { deltaY: -100 }))
+    })
+    await triggerResize()
+    expect(viewport.scrollTop).toBe(1500)
+
+    viewport.scrollTop = 1600
+    fireEvent.scroll(viewport)
+    await triggerResize()
+
+    expect(viewport.scrollTop).toBe(2000)
   })
 
   it('keeps non-scrollable chats at bottom after upward wheel gestures', () => {

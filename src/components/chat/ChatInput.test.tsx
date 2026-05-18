@@ -2,6 +2,7 @@ import { createRef } from 'react'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { fireEvent, render, screen, waitFor } from '@/test/test-utils'
 import { ChatInput } from './ChatInput'
+import { invoke } from '@/lib/transport'
 import {
   appendPromptMetadataToPlainText,
   encodePromptAttachmentMetadata,
@@ -9,6 +10,7 @@ import {
 } from './message-content-utils'
 
 const processAttachmentFile = vi.fn()
+const invokeMock = invoke as unknown as ReturnType<typeof vi.fn>
 
 const storeState = {
   inputDrafts: {} as Record<string, string>,
@@ -72,6 +74,7 @@ describe('ChatInput attachments', () => {
 
   beforeEach(() => {
     processAttachmentFile.mockReset()
+    invokeMock.mockReset()
     storeState.setInputDraft.mockReset()
     storeState.getPendingFiles.mockReset()
     storeState.getPendingFiles.mockReturnValue([])
@@ -260,5 +263,74 @@ describe('ChatInput attachments', () => {
     })
 
     expect(textarea.value).toBe('Check this')
+  })
+
+  it('preserves both image and small text when pasted together', async () => {
+    const textarea = renderInput()
+    const image = new File(['png'], 'clip.png', { type: 'image/png' })
+    processAttachmentFile.mockResolvedValue(undefined)
+
+    fireEvent.paste(textarea, {
+      clipboardData: {
+        getData: (type: string) =>
+          type === 'text/plain' ? 'caption text' : '',
+        items: [
+          {
+            type: 'image/png',
+            getAsFile: () => image,
+          },
+        ],
+      },
+    })
+
+    await waitFor(() => {
+      expect(processAttachmentFile).toHaveBeenCalledWith(image, 'session-1')
+      expect(storeState.setInputDraft).toHaveBeenCalledWith(
+        'session-1',
+        'caption text'
+      )
+    })
+    expect(textarea.value).toBe('caption text')
+  })
+
+  it('saves large text as an attachment when pasted with an image', async () => {
+    const textarea = renderInput()
+    const image = new File(['png'], 'clip.png', { type: 'image/png' })
+    const largeText = 'x'.repeat(2100)
+    processAttachmentFile.mockResolvedValue(undefined)
+    invokeMock.mockResolvedValue({
+      id: 'text-1',
+      path: '/tmp/paste.txt',
+      filename: 'paste.txt',
+      size: largeText.length,
+    })
+
+    fireEvent.paste(textarea, {
+      clipboardData: {
+        getData: (type: string) => (type === 'text/plain' ? largeText : ''),
+        items: [
+          {
+            type: 'image/png',
+            getAsFile: () => image,
+          },
+        ],
+      },
+    })
+
+    await waitFor(() => {
+      expect(processAttachmentFile).toHaveBeenCalledWith(image, 'session-1')
+      expect(invokeMock).toHaveBeenCalledWith('save_pasted_text', {
+        content: largeText,
+      })
+      expect(storeState.addPendingTextFile).toHaveBeenCalledWith(
+        'session-1',
+        expect.objectContaining({
+          id: 'text-1',
+          path: '/tmp/paste.txt',
+          content: largeText,
+        })
+      )
+    })
+    expect(textarea.value).toBe('')
   })
 })
