@@ -16,6 +16,7 @@ export function resolveApprovalLabel(
         selected_codex_model?: string | null
         selected_opencode_model?: string | null
         selected_cursor_model?: string | null
+        selected_commandcode_model?: string | null
         default_backend?: string | null
       }
     | undefined,
@@ -41,7 +42,9 @@ export function resolveApprovalLabel(
         ? (preferences.selected_opencode_model ?? 'opencode/gpt-5.3-codex')
         : resolvedBackend === 'cursor'
           ? (preferences.selected_cursor_model ?? 'cursor/auto')
-          : (preferences.selected_model ?? null)
+          : resolvedBackend === 'commandcode'
+            ? (preferences.selected_commandcode_model ?? 'commandcode/default')
+            : (preferences.selected_model ?? null)
   const resolvedModel = model ?? backendDefaultModel
   if (!resolvedModel && !resolvedBackend) return null
   const modelLabel = resolvedModel ? getMessageModelLabel(resolvedModel) : null

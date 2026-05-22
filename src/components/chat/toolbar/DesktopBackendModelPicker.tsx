@@ -30,14 +30,14 @@ interface DesktopBackendModelPickerProps {
   sessionHasMessages?: boolean
   providerLocked?: boolean
   triggerClassName?: string
-  selectedBackend: 'claude' | 'codex' | 'opencode' | 'cursor'
+  selectedBackend: 'claude' | 'codex' | 'opencode' | 'cursor' | 'commandcode'
   selectedModel: string
   selectedProvider: string | null
-  installedBackends: ('claude' | 'codex' | 'opencode' | 'cursor')[]
+  installedBackends: ('claude' | 'codex' | 'opencode' | 'cursor' | 'commandcode')[]
   customCliProfiles: CustomCliProfile[]
   onModelChange: (model: string) => void
   onBackendModelChange: (
-    backend: 'claude' | 'codex' | 'opencode' | 'cursor',
+    backend: 'claude' | 'codex' | 'opencode' | 'cursor' | 'commandcode',
     model: string
   ) => void
 }

@@ -14,6 +14,7 @@ import { useClaudeCliStatus } from '@/services/claude-cli'
 import { useCodexCliStatus } from '@/services/codex-cli'
 import { useOpencodeCliStatus } from '@/services/opencode-cli'
 import { useCursorCliStatus } from '@/services/cursor-cli'
+import { useCommandCodeCliStatus } from '@/services/commandcode-cli'
 import { useChatStore } from '@/store/chat-store'
 import { useUIStore } from '@/store/ui-store'
 import {
@@ -27,13 +28,20 @@ import {
   type NativeCliSessionKind,
 } from './NativeCliSessionsModal'
 
-const BACKEND_ORDER: CliBackend[] = ['codex', 'claude', 'opencode', 'cursor']
+const BACKEND_ORDER: CliBackend[] = [
+  'codex',
+  'claude',
+  'opencode',
+  'cursor',
+  'commandcode',
+]
 
 const backendCommands: Record<CliBackend, string> = {
   codex: 'codex',
   claude: 'claude',
   opencode: 'opencode',
   cursor: 'cursor-agent',
+  commandcode: 'cmd',
 }
 
 export function NewSessionModeModal() {
@@ -44,6 +52,7 @@ export function NewSessionModeModal() {
   const codexStatus = useCodexCliStatus({ enabled: target !== null })
   const opencodeStatus = useOpencodeCliStatus({ enabled: target !== null })
   const cursorStatus = useCursorCliStatus({ enabled: target !== null })
+  const commandcodeStatus = useCommandCodeCliStatus({ enabled: target !== null })
   const { data: preferences } = usePreferences()
   const [nativePickerKind, setNativePickerKind] =
     useState<NativeCliSessionKind | null>(null)
@@ -60,7 +69,9 @@ export function NewSessionModeModal() {
               ? claudeStatus
               : backend === 'opencode'
                 ? opencodeStatus
-                : cursorStatus
+                : backend === 'cursor'
+                  ? cursorStatus
+                  : commandcodeStatus
         return {
           backend,
           shortcut: String(index + 2),
@@ -75,6 +86,8 @@ export function NewSessionModeModal() {
       codexStatus.data?.path,
       cursorStatus.data?.installed,
       cursorStatus.data?.path,
+      commandcodeStatus.data?.installed,
+      commandcodeStatus.data?.path,
       opencodeStatus.data?.installed,
       opencodeStatus.data?.path,
     ]
@@ -84,7 +97,8 @@ export function NewSessionModeModal() {
     claudeStatus.isLoading ||
     codexStatus.isLoading ||
     opencodeStatus.isLoading ||
-    cursorStatus.isLoading
+    cursorStatus.isLoading ||
+    commandcodeStatus.isLoading
 
   const nativePickerCommand = useMemo(() => {
     if (nativePickerKind === null || nativePickerKind === 'terminal') {

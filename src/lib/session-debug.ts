@@ -76,7 +76,9 @@ export function resolveSessionDebugDetails(params: {
         ? (preferences?.selected_opencode_model ?? 'opencode/gpt-5.3-codex')
         : finalBackend === 'cursor'
           ? (preferences?.selected_cursor_model ?? 'cursor/auto')
-          : (preferences?.selected_model ?? 'claude-opus-4-7[1m]')
+          : resolvedBackend === 'commandcode'
+            ? (preferences?.selected_commandcode_model ?? 'commandcode/default')
+            : (preferences?.selected_model ?? 'claude-opus-4-7[1m]')
 
   return {
     selectedBackend: finalBackend,

@@ -15,6 +15,7 @@ mod claude_cli;
 mod cli_update;
 mod coderabbit_cli;
 mod codex_cli;
+mod commandcode_cli;
 mod cursor_cli;
 mod gh_cli;
 pub mod http_server;
@@ -212,7 +213,7 @@ pub struct AppPreferences {
     #[serde(default = "default_execution_mode")]
     pub default_execution_mode: String, // Default execution mode: "plan", "build", or "yolo"
     #[serde(default = "default_backend")]
-    pub default_backend: String, // Default CLI backend: "claude", "codex", "opencode", or "cursor"
+    pub default_backend: String, // Default CLI backend: "claude", "codex", "opencode", "cursor", or "commandcode"
     #[serde(default = "default_new_session_kind")]
     pub default_new_session_kind: String, // Default new session action: "chat", "terminal", or a CLI backend
     #[serde(default = "default_codex_model")]
@@ -221,6 +222,8 @@ pub struct AppPreferences {
     pub selected_opencode_model: String, // Default OpenCode model (provider/model)
     #[serde(default = "default_cursor_model")]
     pub selected_cursor_model: String, // Default Cursor model
+    #[serde(default = "default_commandcode_model")]
+    pub selected_commandcode_model: String, // Default Command Code model
     #[serde(default = "default_codex_reasoning_effort")]
     pub default_codex_reasoning_effort: String, // Codex reasoning effort: low, medium, high, xhigh
     #[serde(default = "default_codex_goal_execution_mode")]
@@ -259,6 +262,8 @@ pub struct AppPreferences {
     pub opencode_cli_source: String, // OpenCode CLI source: "jean" (managed) or "path" (system PATH)
     #[serde(default = "default_cli_source")]
     pub gh_cli_source: String, // GitHub CLI source: "jean" (managed) or "path" (system PATH)
+    #[serde(default = "default_cli_source")]
+    pub commandcode_cli_source: String, // Command Code CLI source: "jean" (managed) or "path" (system PATH)
     #[serde(default = "default_cli_source")]
     pub coderabbit_cli_source: String, // CodeRabbit CLI source: "jean" (managed) or "path" (system PATH)
     #[serde(default)]
@@ -509,6 +514,10 @@ fn default_opencode_model() -> String {
 
 fn default_cursor_model() -> String {
     "cursor/auto".to_string()
+}
+
+fn default_commandcode_model() -> String {
+    "commandcode/default".to_string()
 }
 
 fn default_codex_reasoning_effort() -> String {
@@ -1638,6 +1647,7 @@ impl Default for AppPreferences {
             selected_codex_model: default_codex_model(),
             selected_opencode_model: default_opencode_model(),
             selected_cursor_model: default_cursor_model(),
+            selected_commandcode_model: default_commandcode_model(),
             default_codex_reasoning_effort: default_codex_reasoning_effort(),
             codex_goal_execution_mode: default_codex_goal_execution_mode(),
             codex_multi_agent_enabled: false,
@@ -1657,6 +1667,7 @@ impl Default for AppPreferences {
             codex_cli_source: default_cli_source(),
             opencode_cli_source: default_cli_source(),
             gh_cli_source: default_cli_source(),
+            commandcode_cli_source: default_cli_source(),
             coderabbit_cli_source: default_cli_source(),
             expand_tool_calls_by_default: false,
             auto_update_ai_backends: default_auto_update_ai_backends(),
@@ -3787,6 +3798,11 @@ pub fn run() {
             coderabbit_cli::install_coderabbit_cli,
             coderabbit_cli::uninstall_coderabbit_cli,
             coderabbit_cli::update_coderabbit_cli,
+            // Command Code CLI management commands
+            commandcode_cli::check_commandcode_cli_installed,
+            commandcode_cli::detect_commandcode_in_path,
+            commandcode_cli::check_commandcode_cli_auth,
+            commandcode_cli::get_commandcode_install_command,
             // Cursor CLI management commands
             cursor_cli::check_cursor_cli_installed,
             cursor_cli::detect_cursor_in_path,

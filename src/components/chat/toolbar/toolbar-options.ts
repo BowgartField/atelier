@@ -20,6 +20,10 @@ export const OPENCODE_MODEL_OPTIONS: { value: string; label: string }[] = [
   { value: 'opencode/gpt-5.3-codex', label: 'GPT-5.3 Codex (OpenCode)' },
 ]
 
+export const COMMANDCODE_MODEL_OPTIONS: { value: string; label: string }[] = [
+  { value: 'commandcode/default', label: 'CLI default (no --model)' },
+]
+
 export const CURSOR_MODEL_OPTIONS: { value: string; label: string }[] = [
   { value: 'cursor/composer-2.5-fast', label: 'Composer 2.5 Fast' },
   { value: 'cursor/composer-2.5', label: 'Composer 2.5' },

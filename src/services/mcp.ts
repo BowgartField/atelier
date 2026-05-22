@@ -295,6 +295,7 @@ export const BACKEND_LABELS: Record<CliBackend, string> = {
   codex: 'Codex',
   opencode: 'OpenCode',
   cursor: 'Cursor',
+  commandcode: 'Command Code',
 }
 
 /** Group servers by their backend field */

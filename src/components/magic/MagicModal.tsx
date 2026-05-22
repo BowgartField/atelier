@@ -481,7 +481,9 @@ export function MagicModal() {
           ? (preferences?.selected_opencode_model ?? 'opencode/gpt-5.3-codex')
           : backend === 'cursor'
             ? (preferences?.selected_cursor_model ?? 'cursor/auto')
-            : (preferences?.selected_model ?? 'sonnet'))
+            : defaultBackend === 'commandcode'
+              ? (preferences?.selected_commandcode_model ?? 'commandcode/default')
+              : (preferences?.selected_model ?? 'sonnet'))
     const provider = resolveMagicPromptProvider(
       preferences?.magic_prompt_providers,
       providerKey,
@@ -507,7 +509,9 @@ export function MagicModal() {
           ? (preferences?.selected_opencode_model ?? 'opencode/gpt-5.3-codex')
           : backend === 'cursor'
             ? (preferences?.selected_cursor_model ?? 'cursor/auto')
-            : (preferences?.selected_model ?? 'sonnet'))
+            : defaultBackend === 'commandcode'
+              ? (preferences?.selected_commandcode_model ?? 'commandcode/default')
+              : (preferences?.selected_model ?? 'sonnet'))
     const provider = resolveMagicPromptProvider(
       preferences?.magic_prompt_providers,
       RESOLVE_CONFLICTS_PROVIDER_KEY,

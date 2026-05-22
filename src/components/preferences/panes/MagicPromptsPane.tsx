@@ -62,6 +62,7 @@ import {
   CODEX_FAST_DEFAULT_MAGIC_PROMPT_MODELS,
   OPENCODE_DEFAULT_MAGIC_PROMPT_MODELS,
   codexModelOptions,
+  isCommandCodeModel,
   isCodexModel,
   isCursorModel,
   type MagicPrompts,
@@ -539,6 +540,15 @@ export const MagicPromptsPane: React.FC<MagicPromptsPaneProps> = ({
       label: option.label || formatCursorModelLabel(option.value),
     }))
   }, [availableCursorModels])
+  const commandCodeModelOptions = useMemo(
+    () => [
+      {
+        value: 'commandcode/default' as MagicPromptModel,
+        label: 'CLI default (no --model)',
+      },
+    ],
+    []
+  )
 
   const currentPrompts = preferences?.magic_prompts ?? DEFAULT_MAGIC_PROMPTS
   const currentModels =
@@ -574,12 +584,16 @@ export const MagicPromptsPane: React.FC<MagicPromptsPaneProps> = ({
   const currentModelIsCursor = currentModel
     ? isCursorModel(currentModel)
     : false
+  const currentModelIsCommandCode = currentModel
+    ? isCommandCodeModel(currentModel)
+    : false
   const filteredClaudeOptions = useMemo(() => {
     if (
       !currentProvider ||
       currentModelIsCodex ||
       currentModelIsOpenCode ||
-      currentModelIsCursor
+      currentModelIsCursor ||
+      currentModelIsCommandCode
     ) {
       return CLAUDE_MODEL_OPTIONS
     }
@@ -611,6 +625,7 @@ export const MagicPromptsPane: React.FC<MagicPromptsPaneProps> = ({
     currentProvider,
     currentModelIsCodex,
     currentModelIsCursor,
+    currentModelIsCommandCode,
     currentModelIsOpenCode,
     profiles,
   ])
@@ -775,6 +790,8 @@ export const MagicPromptsPane: React.FC<MagicPromptsPaneProps> = ({
           defaultModel = opencodeModelOptions[0]?.value
         } else if (backend === 'cursor') {
           defaultModel = cursorModelOptions[0]?.value
+        } else if (backend === 'commandcode') {
+          defaultModel = commandCodeModelOptions[0]?.value
         }
       }
       patchPreferences.mutate({
@@ -801,6 +818,7 @@ export const MagicPromptsPane: React.FC<MagicPromptsPaneProps> = ({
       selectedConfig.modelKey,
       selectedConfig.defaultModel,
       cursorModelOptions,
+      commandCodeModelOptions,
       opencodeModelOptions,
     ]
   )
@@ -985,6 +1003,11 @@ export const MagicPromptsPane: React.FC<MagicPromptsPaneProps> = ({
                         <BackendLabel backend="cursor" />
                       </SelectItem>
                     )}
+                    {installedBackends.includes('commandcode') && (
+                      <SelectItem value="commandcode">
+                        <BackendLabel backend="commandcode" />
+                      </SelectItem>
+                    )}
                     {installedBackends.includes('codex') && (
                       <SelectItem value="codex">Codex</SelectItem>
                     )}
@@ -996,9 +1019,11 @@ export const MagicPromptsPane: React.FC<MagicPromptsPaneProps> = ({
               profiles.length > 0 &&
               !currentModelIsCodex &&
               !currentModelIsCursor &&
+              !currentModelIsCommandCode &&
               !currentModelIsOpenCode &&
               effectiveBackend !== 'opencode' &&
               effectiveBackend !== 'cursor' &&
+              effectiveBackend !== 'commandcode' &&
               effectiveBackend !== 'codex' && (
                 <>
                   <span className="text-xs text-muted-foreground">
@@ -1043,6 +1068,7 @@ export const MagicPromptsPane: React.FC<MagicPromptsPaneProps> = ({
                             ...CODEX_MODEL_OPTIONS,
                             ...opencodeModelOptions,
                             ...cursorModelOptions,
+                            ...commandCodeModelOptions,
                           ]
                           return (
                             allOptions.find(o => o.value === currentModel)
@@ -1051,7 +1077,9 @@ export const MagicPromptsPane: React.FC<MagicPromptsPaneProps> = ({
                               ? formatOpenCodeLabel(currentModel)
                               : isCursorModel(currentModel)
                                 ? formatCursorModelLabel(currentModel)
-                                : currentModel)
+                                : isCommandCodeModel(currentModel)
+                                  ? 'CLI default (no --model)'
+                                  : currentModel)
                           )
                         })()}
                       </span>
@@ -1061,7 +1089,9 @@ export const MagicPromptsPane: React.FC<MagicPromptsPaneProps> = ({
                           ? CODEX_MODEL_OPTIONS
                           : effectiveBackend === 'cursor'
                             ? cursorModelOptions
-                            : opencodeModelOptions
+                            : effectiveBackend === 'commandcode'
+                              ? commandCodeModelOptions
+                              : opencodeModelOptions
                       ).length > 1 && (
                         <ChevronsUpDown className="h-3 w-3 shrink-0 opacity-50" />
                       )}
@@ -1155,6 +1185,32 @@ export const MagicPromptsPane: React.FC<MagicPromptsPaneProps> = ({
                             heading={<BackendLabel backend="cursor" />}
                           >
                             {cursorModelOptions.map(opt => (
+                              <CommandItem
+                                key={opt.value}
+                                value={`${opt.label} ${opt.value}`}
+                                onSelect={() => {
+                                  handleModelChange(opt.value)
+                                  setModelPopoverOpen(false)
+                                }}
+                              >
+                                <span className="text-xs">{opt.label}</span>
+                                <Check
+                                  className={cn(
+                                    'ml-auto h-3 w-3',
+                                    currentModel === opt.value
+                                      ? 'opacity-100'
+                                      : 'opacity-0'
+                                  )}
+                                />
+                              </CommandItem>
+                            ))}
+                          </CommandGroup>
+                        )}
+                        {effectiveBackend === 'commandcode' && (
+                          <CommandGroup
+                            heading={<BackendLabel backend="commandcode" />}
+                          >
+                            {commandCodeModelOptions.map(opt => (
                               <CommandItem
                                 key={opt.value}
                                 value={`${opt.label} ${opt.value}`}

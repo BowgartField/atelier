@@ -58,13 +58,14 @@ function mapCodexReasoningToEffort(
 }
 
 function getDefaultModelForBackend(
-  backend: 'claude' | 'codex' | 'opencode' | 'cursor' | undefined,
+  backend: 'claude' | 'codex' | 'opencode' | 'cursor' | 'commandcode' | undefined,
   preferences:
     | {
         selected_model?: string | null
         selected_codex_model?: string | null
         selected_opencode_model?: string | null
         selected_cursor_model?: string | null
+        selected_commandcode_model?: string | null
       }
     | undefined
 ): string {
@@ -76,6 +77,9 @@ function getDefaultModelForBackend(
   }
   if (backend === 'cursor') {
     return preferences?.selected_cursor_model ?? 'cursor/auto'
+  }
+  if (backend === 'commandcode') {
+    return preferences?.selected_commandcode_model ?? 'commandcode/default'
   }
   return preferences?.selected_model ?? 'claude-opus-4-7[1m]'
 }
@@ -350,7 +354,7 @@ export function useClearContextApproval({
       if (backend) {
         store.setSelectedBackend(
           newSession.id,
-          backend as 'claude' | 'codex' | 'opencode' | 'cursor'
+          backend as 'claude' | 'codex' | 'opencode' | 'cursor' | 'commandcode'
         )
       }
       // Optimistically update TanStack Query cache so UI shows correct backend/model

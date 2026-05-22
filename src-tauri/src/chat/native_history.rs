@@ -118,6 +118,7 @@ fn load_native_sessions_uncached(
         "claude" => list_claude_sessions(worktree_path, None, MAX_NATIVE_HISTORY_CACHE_ROWS),
         "opencode" => list_opencode_sessions(worktree_path, None, MAX_NATIVE_HISTORY_CACHE_ROWS),
         "cursor" => list_cursor_sessions(worktree_path, None, MAX_NATIVE_HISTORY_CACHE_ROWS),
+        "commandcode" => Ok(Vec::new()),
         other => Err(format!("Unsupported native CLI history backend: {other}")),
     }
 }

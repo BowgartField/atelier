@@ -2075,6 +2075,24 @@ pub async fn dispatch_command(
             crate::claude_cli::uninstall_claude_cli(app.clone()).await?;
             Ok(Value::Null)
         }
+
+        "check_commandcode_cli_installed" => {
+            let result =
+                crate::commandcode_cli::check_commandcode_cli_installed(app.clone()).await?;
+            to_value(result)
+        }
+        "detect_commandcode_in_path" => {
+            let result = crate::commandcode_cli::detect_commandcode_in_path(app.clone()).await?;
+            to_value(result)
+        }
+        "check_commandcode_cli_auth" => {
+            let result = crate::commandcode_cli::check_commandcode_cli_auth(app.clone()).await?;
+            to_value(result)
+        }
+        "get_commandcode_install_command" => {
+            let result = crate::commandcode_cli::get_commandcode_install_command().await?;
+            to_value(result)
+        }
         "check_cursor_cli_installed" => {
             let result = crate::cursor_cli::check_cursor_cli_installed(app.clone()).await?;
             to_value(result)

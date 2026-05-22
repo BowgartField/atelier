@@ -14,6 +14,7 @@ pub enum TerminalContextBackend {
     Codex,
     Opencode,
     Cursor,
+    Commandcode,
 }
 
 impl TerminalContextBackend {
@@ -23,6 +24,7 @@ impl TerminalContextBackend {
             "codex" => Some(Self::Codex),
             "opencode" => Some(Self::Opencode),
             "cursor" => Some(Self::Cursor),
+            "commandcode" => Some(Self::Commandcode),
             _ => None,
         }
     }
@@ -364,7 +366,9 @@ pub fn prepare_backend_terminal_context(
                 format!("base_instructions={}", toml_basic_string(&content)),
             ]
         }
-        TerminalContextBackend::Opencode | TerminalContextBackend::Cursor => Vec::new(),
+        TerminalContextBackend::Opencode
+        | TerminalContextBackend::Cursor
+        | TerminalContextBackend::Commandcode => Vec::new(),
     };
 
     Ok(PreparedBackendTerminalContext { command_args })

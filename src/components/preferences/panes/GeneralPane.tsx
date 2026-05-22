@@ -76,12 +76,20 @@ import {
   useAvailableCursorModels,
   cursorCliQueryKeys,
 } from '@/services/cursor-cli'
+import {
+  getCommandCodeInstallCommand,
+  useCommandCodeCliStatus,
+  useCommandCodeCliAuth,
+  useCommandCodePathDetection,
+  commandcodeCliQueryKeys,
+} from '@/services/commandcode-cli'
 import type { ClaudeAuthStatus } from '@/types/claude-cli'
 import type { GhAuthStatus } from '@/types/gh-cli'
 import type { CodexAuthStatus } from '@/types/codex-cli'
 import type { CodeRabbitAuthStatus } from '@/types/coderabbit-cli'
 import type { OpenCodeAuthStatus } from '@/types/opencode-cli'
 import type { CursorAuthStatus } from '@/types/cursor-cli'
+import type { CommandCodeAuthStatus } from '@/types/commandcode-cli'
 import {
   Select,
   SelectContent,
@@ -185,6 +193,7 @@ type PreferencesPaneScope =
   | 'codex'
   | 'opencode'
   | 'cursor'
+  | 'commandcode'
   | 'github'
   | 'coderabbit'
 
@@ -212,6 +221,7 @@ export const GeneralPane: React.FC<{ scope?: PreferencesPaneScope }> = ({
   const { data: ghPathDetection } = useGhPathDetection()
   const { data: coderabbitPathDetection } = useCodeRabbitPathDetection()
   const { data: cursorPathDetection } = useCursorPathDetection()
+  const { data: commandcodePathDetection } = useCommandCodePathDetection()
 
   // CLI status hooks
   const { data: cliStatus, isLoading: isCliLoading } = useClaudeCliStatus()
@@ -226,6 +236,8 @@ export const GeneralPane: React.FC<{ scope?: PreferencesPaneScope }> = ({
   const { data: ghStatus, isLoading: isGhLoading } = useGhCliStatus()
   const { data: cursorStatus, isLoading: isCursorLoading } =
     useCursorCliStatus()
+  const { data: commandcodeStatus, isLoading: isCommandCodeLoading } =
+    useCommandCodeCliStatus()
   const isGhPathSource = preferences?.gh_cli_source === 'path'
   const { data: ghVersions, isLoading: isGhVersionsLoading } =
     useAvailableGhVersions({ enabled: isGhPathSource && !!ghStatus?.installed })
@@ -297,6 +309,10 @@ export const GeneralPane: React.FC<{ scope?: PreferencesPaneScope }> = ({
       enabled: !!cursorStatus?.installed,
     }
   )
+  const { data: commandcodeAuth, isLoading: isCommandCodeAuthLoading } =
+    useCommandCodeCliAuth({
+      enabled: !!commandcodeStatus?.installed,
+    })
   const { data: availableOpencodeModels } = useAvailableOpencodeModels({
     enabled: !!opencodeStatus?.installed,
   })
@@ -312,6 +328,7 @@ export const GeneralPane: React.FC<{ scope?: PreferencesPaneScope }> = ({
     codex: preferences?.codex_cli_source,
     opencode: preferences?.opencode_cli_source,
     coderabbit: preferences?.coderabbit_cli_source,
+    commandcode: preferences?.commandcode_cli_source,
   })
   useEffect(() => {
     const cur = {
@@ -320,6 +337,7 @@ export const GeneralPane: React.FC<{ scope?: PreferencesPaneScope }> = ({
       codex: preferences?.codex_cli_source,
       opencode: preferences?.opencode_cli_source,
       coderabbit: preferences?.coderabbit_cli_source,
+      commandcode: preferences?.commandcode_cli_source,
     }
     if (cur.claude !== prevSources.current.claude) {
       queryClient.invalidateQueries({ queryKey: claudeCliQueryKeys.status() })
@@ -338,6 +356,11 @@ export const GeneralPane: React.FC<{ scope?: PreferencesPaneScope }> = ({
         queryKey: coderabbitCliQueryKeys.status(),
       })
     }
+    if (cur.commandcode !== prevSources.current.commandcode) {
+      queryClient.invalidateQueries({
+        queryKey: commandcodeCliQueryKeys.status(),
+      })
+    }
     prevSources.current = cur
   }, [
     preferences?.claude_cli_source,
@@ -345,6 +368,7 @@ export const GeneralPane: React.FC<{ scope?: PreferencesPaneScope }> = ({
     preferences?.codex_cli_source,
     preferences?.opencode_cli_source,
     preferences?.coderabbit_cli_source,
+    preferences?.commandcode_cli_source,
     queryClient,
   ])
 
@@ -367,6 +391,8 @@ export const GeneralPane: React.FC<{ scope?: PreferencesPaneScope }> = ({
   const [checkingCodeRabbitAuth, setCheckingCodeRabbitAuth] = useState(false)
   const [checkingOpenCodeAuth, setCheckingOpenCodeAuth] = useState(false)
   const [checkingCursorAuth, setCheckingCursorAuth] = useState(false)
+  const [checkingCommandCodeAuth, setCheckingCommandCodeAuth] =
+    useState(false)
   const [openCodeModelPopoverOpen, setOpenCodeModelPopoverOpen] =
     useState(false)
   const [cursorModelPopoverOpen, setCursorModelPopoverOpen] = useState(false)
@@ -559,6 +585,21 @@ export const GeneralPane: React.FC<{ scope?: PreferencesPaneScope }> = ({
     }
   }
 
+  const handleCommandCodeSourceChange = (value: 'path') => {
+    if (preferences) {
+      patchPreferences.mutate(
+        { commandcode_cli_source: value },
+        {
+          onSuccess: () => {
+            queryClient.invalidateQueries({
+              queryKey: commandcodeCliQueryKeys.all,
+            })
+          },
+        }
+      )
+    }
+  }
+
   const handleConfirmDeleteCli = async () => {
     if (!deleteCliTarget) return
     const target = deleteCliTarget
@@ -663,6 +704,7 @@ export const GeneralPane: React.FC<{ scope?: PreferencesPaneScope }> = ({
   const codexInstalled = codexStatus?.installed
   const opencodeInstalled = opencodeStatus?.installed
   const cursorInstalled = cursorStatus?.installed
+  const commandcodeInstalled = commandcodeStatus?.installed
   const installedBackendOptions = useMemo(
     () =>
       backendOptions.filter(option =>
@@ -672,13 +714,16 @@ export const GeneralPane: React.FC<{ scope?: PreferencesPaneScope }> = ({
             ? codexStatus?.installed
             : option.value === 'opencode'
               ? opencodeStatus?.installed
-              : cursorStatus?.installed
+              : option.value === 'cursor'
+                ? cursorStatus?.installed
+                : commandcodeStatus?.installed
       ),
     [
       cliStatus?.installed,
       codexStatus?.installed,
       opencodeStatus?.installed,
       cursorStatus?.installed,
+      commandcodeStatus?.installed,
     ]
   )
 
@@ -688,6 +733,7 @@ export const GeneralPane: React.FC<{ scope?: PreferencesPaneScope }> = ({
       codex: codexInstalled,
       opencode: opencodeInstalled,
       cursor: cursorInstalled,
+      commandcode: commandcodeInstalled,
     }
     if (installed[stored]) return stored
     const first = installedBackendOptions[0]
@@ -698,6 +744,7 @@ export const GeneralPane: React.FC<{ scope?: PreferencesPaneScope }> = ({
     codexInstalled,
     opencodeInstalled,
     cursorInstalled,
+    commandcodeInstalled,
     installedBackendOptions,
   ])
 
@@ -734,6 +781,12 @@ export const GeneralPane: React.FC<{ scope?: PreferencesPaneScope }> = ({
   const handleCursorModelChange = (value: CursorModel) => {
     if (preferences) {
       patchPreferences.mutate({ selected_cursor_model: value })
+    }
+  }
+
+  const handleCommandCodeModelChange = (value: string) => {
+    if (preferences) {
+      patchPreferences.mutate({ selected_commandcode_model: value })
     }
   }
 
@@ -777,6 +830,11 @@ export const GeneralPane: React.FC<{ scope?: PreferencesPaneScope }> = ({
     effectiveBackend) as CliBackend
   const effectiveYoloBackend = (preferences?.yolo_backend ??
     effectiveBackend) as CliBackend
+  const selectedCommandCodeModel =
+    preferences?.selected_commandcode_model ?? 'commandcode/default'
+  const commandCodeModelOptions = [
+    { value: 'commandcode/default', label: 'CLI default (no --model)' },
+  ]
   const cursorAuthMessage = cursorAuth?.timed_out
     ? 'Auth check timed out. Try again or run login manually.'
     : cursorAuth?.error
@@ -1083,6 +1141,45 @@ export const GeneralPane: React.FC<{ scope?: PreferencesPaneScope }> = ({
       )
     } catch (error) {
       toast.error('Failed to prepare Cursor Agent install command', {
+        description: error instanceof Error ? error.message : String(error),
+      })
+    }
+  }, [openCliLoginModal])
+
+  const handleCommandCodeLogin = useCallback(async () => {
+    if (!commandcodeStatus?.path) return
+    setCheckingCommandCodeAuth(true)
+    try {
+      await queryClient.invalidateQueries({ queryKey: commandcodeCliQueryKeys.auth() })
+      const result = await queryClient.fetchQuery<CommandCodeAuthStatus>({
+        queryKey: commandcodeCliQueryKeys.auth(),
+      })
+      if (result?.authenticated) {
+        toast.success('Command Code CLI is already authenticated')
+        return
+      }
+    } finally {
+      setCheckingCommandCodeAuth(false)
+    }
+    openCliLoginModal('commandcode', commandcodeStatus.path, ['login'])
+  }, [commandcodeStatus?.path, openCliLoginModal, queryClient])
+
+  const handleCommandCodeRelogin = useCallback(() => {
+    if (!commandcodeStatus?.path) return
+    openCliLoginModal('commandcode', commandcodeStatus.path, ['login'])
+  }, [commandcodeStatus?.path, openCliLoginModal])
+
+  const handleCommandCodeInstall = useCallback(async () => {
+    try {
+      const installCommand = await getCommandCodeInstallCommand()
+      openCliLoginModal(
+        'commandcode',
+        installCommand.command,
+        installCommand.args,
+        'install'
+      )
+    } catch (error) {
+      toast.error('Failed to prepare Command Code install command', {
         description: error instanceof Error ? error.message : String(error),
       })
     }
@@ -2044,6 +2141,125 @@ export const GeneralPane: React.FC<{ scope?: PreferencesPaneScope }> = ({
         </SettingsSection>
       )}
 
+      {hasBackend() && scope === 'commandcode' && (
+        <SettingsSection
+          title={
+            <span className="inline-flex items-center gap-2">
+              <BackendLabel backend="commandcode" />
+              <span>CLI</span>
+            </span>
+          }
+          anchorId="pref-commandcode-section-cli"
+          actions={
+            commandcodeStatus?.installed ? (
+              checkingCommandCodeAuth || isCommandCodeAuthLoading ? (
+                <span className="text-sm text-muted-foreground flex items-center gap-2">
+                  <Loader2 className="size-3 animate-spin" />
+                  Checking...
+                </span>
+              ) : commandcodeAuth?.authenticated ? (
+                <span className="text-sm text-muted-foreground flex items-center gap-2">
+                  Logged in
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={handleCommandCodeRelogin}
+                  >
+                    Relogin
+                  </Button>
+                </span>
+              ) : (
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={handleCommandCodeLogin}
+                >
+                  Login
+                </Button>
+              )
+            ) : (
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={handleCommandCodeInstall}
+              >
+                Install
+              </Button>
+            )
+          }
+        >
+          <div className="space-y-4">
+            <InlineField
+              label={commandcodeStatus?.installed ? 'Version' : 'Status'}
+              description={
+                commandcodeStatus?.installed
+                  ? 'Enables Command Code AI sessions through the cmd CLI.'
+                  : 'Command Code is discovered from your system PATH.'
+              }
+            >
+              {isCommandCodeLoading ? (
+                <Loader2 className="size-4 animate-spin text-muted-foreground" />
+              ) : commandcodeStatus?.installed ? (
+                <span className="text-sm">
+                  {commandcodeStatus.version ?? 'Installed'}
+                </span>
+              ) : (
+                <div className="flex items-center gap-2">
+                  <span className="text-sm text-muted-foreground">
+                    Not found in PATH
+                  </span>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={handleCommandCodeInstall}
+                  >
+                    Install now
+                  </Button>
+                </div>
+              )}
+            </InlineField>
+            {(commandcodeStatus?.installed ||
+              commandcodePathDetection?.found) && (
+              <InlineField
+                label="Source"
+                description={
+                  <Tooltip>
+                    <TooltipTrigger asChild>
+                      <button
+                        onClick={() =>
+                          handleCopyPath(
+                            commandcodePathDetection?.path ??
+                              commandcodeStatus?.path
+                          )
+                        }
+                        className="text-left hover:underline cursor-pointer"
+                      >
+                        {commandcodePathDetection?.path ??
+                          commandcodeStatus?.path ??
+                          'System PATH'}
+                      </button>
+                    </TooltipTrigger>
+                    <TooltipContent>Click to copy path</TooltipContent>
+                  </Tooltip>
+                }
+              >
+                <Select
+                  value={preferences?.commandcode_cli_source ?? 'path'}
+                  onValueChange={handleCommandCodeSourceChange}
+                >
+                  <SelectTrigger className="w-96" hideIcon>
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="path">System PATH</SelectItem>
+                  </SelectContent>
+                </Select>
+              </InlineField>
+            )}
+          </div>
+        </SettingsSection>
+      )}
+
       {scope === 'claude' && (
         <SettingsSection
           title="Claude Settings"
@@ -2369,6 +2585,41 @@ export const GeneralPane: React.FC<{ scope?: PreferencesPaneScope }> = ({
                   </Command>
                 </PopoverContent>
               </Popover>
+            </InlineField>
+          </div>
+        </SettingsSection>
+      )}
+
+      {scope === 'commandcode' && (
+        <SettingsSection
+          title={
+            <span className="inline-flex items-center gap-2">
+              <BackendLabel backend="commandcode" />
+              <span>Settings</span>
+            </span>
+          }
+          anchorId="pref-commandcode-section-settings"
+        >
+          <div className="space-y-4">
+            <InlineField
+              label="Model"
+              description="Command Code CLI model selection"
+            >
+              <Select
+                value={selectedCommandCodeModel}
+                onValueChange={handleCommandCodeModelChange}
+              >
+                <SelectTrigger className="w-full sm:min-w-96">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  {commandCodeModelOptions.map(option => (
+                    <SelectItem key={option.value} value={option.value}>
+                      {option.label}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
             </InlineField>
           </div>
         </SettingsSection>

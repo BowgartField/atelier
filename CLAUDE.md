@@ -365,6 +365,15 @@ No Rust changes needed — model is stored as `String` in `AppPreferences` and p
 
 When adding a backend like Claude, Codex, OpenCode, Cursor, or a future CLI/API backend, verify the integration is complete across Rust, TypeScript, UI, persistence, and web access.
 
+**Backend capability classification:**
+
+- [ ] Classify transport shape: persistent server/API, streaming CLI, final-output CLI, or non-chat helper
+- [ ] Document capability flags: streaming, structured tool calls, resume/session id, cancellation, interactive approvals, MCP, model listing, usage, images/files
+- [ ] Define MVP fallback behavior for unsupported capabilities before wiring UI affordances
+- [ ] If backend is final-output-only, emit one synthetic final `chat:chunk` and persist Jean-managed transcript/context
+- [ ] If backend has no resume/session id, do not fake resume support; store Jean session id only
+- [ ] If backend has no structured tool events, skip tool-call UI or synthesize only safe high-level placeholders
+
 **Backend identity and preferences:**
 
 - [ ] Add backend enum/type in Rust (`src-tauri/src/chat/types.rs`) and TypeScript (`src/types/chat.ts`, `src/types/preferences.ts`)
@@ -376,6 +385,8 @@ When adding a backend like Claude, Codex, OpenCode, Cursor, or a future CLI/API 
 **Install, status, auth, and login:**
 
 - [ ] Add CLI module (`src-tauri/src/<backend>_cli/`) with config/status/auth/install/update commands as needed
+- [ ] Avoid binary-name ambiguity; support canonical binary and documented aliases when applicable (e.g. `cmd`, `command-code`)
+- [ ] For npm-distributed CLIs, decide PATH-only vs Jean-managed npm install/update/uninstall before adding Settings controls
 - [ ] Detect whether backend is installed before checking auth
 - [ ] Add auth status command and frontend hook/types (e.g. `check_<backend>_auth`, `use<Backend>CliAuth`, `src/types/<backend>-cli.ts`)
 - [ ] Auth result distinguishes installed+authenticated, installed+unauthenticated, not installed, command failed, and unknown/error
@@ -415,6 +426,7 @@ When adding a backend like Claude, Codex, OpenCode, Cursor, or a future CLI/API 
 - [ ] Add permission/user-input approval structs, events, UI, persistence, and approve/deny commands if backend supports them
 - [ ] Add one-shot execution support for all magic prompt operations (session naming, context summary, PR content, commit message, code review, resolve conflicts, release notes, investigations, review comments)
 - [ ] Add robust structured JSON extraction for one-shot outputs
+- [ ] For non-JSON-capable backends, wrap prompts with strict JSON instructions and implement tolerant extraction/failure messages
 - [ ] Update Magic Prompts UI backend/model/default presets and per-prompt backend/provider/model/effort resolution
 - [ ] Add provider/profile support if backend supports custom routing; respect project/global/per-prompt provider precedence
 - [ ] Add MCP discovery/health/toggle support if backend supports MCP

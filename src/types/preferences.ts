@@ -984,11 +984,12 @@ export interface AppPreferences {
 
   confirm_session_close: boolean // Show confirmation dialog before closing sessions/worktrees
   default_execution_mode: ExecutionMode // Default execution mode for new sessions: 'plan', 'build', or 'yolo'
-  default_backend: CliBackend // Default CLI backend for new sessions: 'claude', 'codex', 'opencode', or 'cursor'
+  default_backend: CliBackend // Default CLI backend for new sessions: 'claude', 'codex', 'opencode', 'cursor', or 'commandcode'
   default_new_session_kind: NewSessionKind // Default action for CMD+T: 'chat', 'terminal', or a CLI backend
   selected_codex_model: CodexModel // Default Codex model
   selected_opencode_model: string // Default OpenCode model (provider/model)
   selected_cursor_model: CursorModel // Default Cursor model
+  selected_commandcode_model?: string // Default Command Code model (CLI default)
   default_codex_reasoning_effort: CodexReasoningEffort // Default reasoning effort for Codex: 'low' | 'medium' | 'high' | 'xhigh'
   codex_goal_execution_mode: CodexGoalExecutionMode // Execution mode used when starting a Codex /goal
   codex_multi_agent_enabled: boolean // Enable Codex multi-agent collaboration (experimental)
@@ -1009,6 +1010,7 @@ export interface AppPreferences {
   codex_cli_source: 'jean' | 'path' // Codex CLI source: 'jean' (managed) or 'path' (system PATH)
   opencode_cli_source: 'jean' | 'path' // OpenCode CLI source: 'jean' (managed) or 'path' (system PATH)
   gh_cli_source: 'jean' | 'path' // GitHub CLI source: 'jean' (managed) or 'path' (system PATH)
+  commandcode_cli_source?: 'jean' | 'path' // Command Code CLI source: 'jean' (managed) or 'path' (system PATH)
   coderabbit_cli_source?: 'jean' | 'path' // CodeRabbit CLI source: 'jean' (managed) or 'path' (system PATH)
   expand_tool_calls_by_default: boolean // Expand all tool call collapsibles by default
   auto_update_ai_backends: boolean // Auto-install CLI updates in background when a new version is detected
@@ -1345,11 +1347,13 @@ export type MagicPromptReasoningEffort =
 
 export type OpenCodeModel = `opencode/${string}`
 export type CursorModel = `cursor/${string}`
+export type CommandCodeModel = `commandcode/${string}`
 export type MagicPromptModel =
   | ClaudeModel
   | CodexModel
   | OpenCodeModel
   | CursorModel
+  | CommandCodeModel
 
 /** Check if a model string identifies an OpenCode model */
 export function isOpenCodeModel(model: string): model is OpenCodeModel {
@@ -1359,6 +1363,13 @@ export function isOpenCodeModel(model: string): model is OpenCodeModel {
 /** Check if a model string identifies a Cursor model */
 export function isCursorModel(model: string): model is CursorModel {
   return model.startsWith('cursor/')
+}
+
+/** Check if a model string identifies a Command Code model */
+export function isCommandCodeModel(
+  model: string
+): model is CommandCodeModel {
+  return model.startsWith('commandcode/')
 }
 
 /** Check if a model string identifies a Codex model */
@@ -1382,13 +1393,14 @@ export const codexReasoningOptions: {
 // CLI Backend
 // =============================================================================
 
-export type CliBackend = 'claude' | 'codex' | 'opencode' | 'cursor'
+export type CliBackend = 'claude' | 'codex' | 'opencode' | 'cursor' | 'commandcode'
 
 export const backendOptions: { value: CliBackend; label: string }[] = [
   { value: 'claude', label: 'Claude' },
   { value: 'codex', label: 'Codex' },
   { value: 'opencode', label: 'OpenCode' },
   { value: 'cursor', label: 'Cursor' },
+  { value: 'commandcode', label: 'Command Code' },
 ]
 
 export type TerminalApp =
@@ -1761,6 +1773,7 @@ export const defaultPreferences: AppPreferences = {
   selected_codex_model: 'gpt-5.5', // Default: latest Codex model
   selected_opencode_model: 'opencode/gpt-5.3-codex', // Default OpenCode model
   selected_cursor_model: 'cursor/auto', // Default Cursor model
+  selected_commandcode_model: 'commandcode/default', // Default Command Code model
   default_codex_reasoning_effort: 'high', // Default: high reasoning
   codex_goal_execution_mode: 'build', // Default: build mode for goals
   codex_multi_agent_enabled: false, // Default: disabled
@@ -1781,6 +1794,7 @@ export const defaultPreferences: AppPreferences = {
   codex_cli_source: 'jean', // Default: Jean-managed
   opencode_cli_source: 'jean', // Default: Jean-managed
   gh_cli_source: 'jean', // Default: Jean-managed
+  commandcode_cli_source: 'path', // Default: system PATH (npm-distributed CLI)
   coderabbit_cli_source: 'jean', // Default: Jean-managed
   expand_tool_calls_by_default: false, // Default: collapsed
   auto_update_ai_backends: true, // Default: auto-update AI backends in the background

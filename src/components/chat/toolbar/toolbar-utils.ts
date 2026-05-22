@@ -37,6 +37,7 @@ export function getSessionProviderDisplayName(
   if (selectedBackend === 'codex') return 'OpenAI'
   if (selectedBackend === 'opencode') return 'OpenCode'
   if (selectedBackend === 'cursor') return 'Cursor'
+  if (selectedBackend === 'commandcode') return 'Command Code'
   return getProviderDisplayName(selectedProvider ?? null)
 }
 

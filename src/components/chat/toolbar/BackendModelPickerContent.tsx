@@ -203,7 +203,23 @@ export function BackendModelPickerContent({
       if (favoriteSet.has(favKey(activeBackend, opt.value))) favs.push(opt)
       else rest.push(opt)
     }
-    return [...favs, ...rest]
+    const result = [...favs, ...rest]
+    if (activeBackend === 'commandcode') {
+      const rawQuery = search.trim()
+      if (rawQuery) {
+        const customValue = rawQuery.startsWith('commandcode/')
+          ? rawQuery
+          : `commandcode/${rawQuery}`
+        const customExists = result.some(option => option.value === customValue)
+        if (!customExists) {
+          result.unshift({
+            value: customValue,
+            label: `Use Command Code model "${rawQuery}"`,
+          })
+        }
+      }
+    }
+    return result
   }, [activeBackend, activeSection, favKey, favoriteSet, search])
 
   const getOptionCommandValue = useCallback(

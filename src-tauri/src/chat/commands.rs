@@ -106,6 +106,7 @@ pub(crate) fn resolve_default_backend(app: &AppHandle, worktree_id: Option<&str>
         "codex" => Backend::Codex,
         "opencode" => Backend::Opencode,
         "cursor" => Backend::Cursor,
+        "commandcode" => Backend::Commandcode,
         _ => Backend::Claude,
     };
 
@@ -124,6 +125,7 @@ pub(crate) fn resolve_default_backend(app: &AppHandle, worktree_id: Option<&str>
                         "codex" => Backend::Codex,
                         "opencode" => Backend::Opencode,
                         "cursor" => Backend::Cursor,
+                        "commandcode" => Backend::Commandcode,
                         "claude" => Backend::Claude,
                         _ => resolved,
                     };
@@ -146,6 +148,7 @@ pub(crate) fn resolve_magic_prompt_backend(
         match b {
             "opencode" => return Backend::Opencode,
             "cursor" => return Backend::Cursor,
+            "commandcode" => return Backend::Commandcode,
             "codex" => return Backend::Codex,
             "claude" => return Backend::Claude,
             _ => {}
@@ -529,6 +532,7 @@ pub async fn create_session(
         Some("codex") => Backend::Codex,
         Some("opencode") => Backend::Opencode,
         Some("cursor") => Backend::Cursor,
+        Some("commandcode") => Backend::Commandcode,
         Some("claude") => Backend::Claude,
         _ => {
             // No explicit backend — check project default, then global preference
@@ -540,6 +544,8 @@ pub async fn create_session(
                     resolved = Backend::Opencode;
                 } else if prefs.default_backend == "cursor" {
                     resolved = Backend::Cursor;
+                } else if prefs.default_backend == "commandcode" {
+                    resolved = Backend::Commandcode;
                 }
             }
             // Check project-level override
@@ -558,6 +564,7 @@ pub async fn create_session(
                             "codex" => Backend::Codex,
                             "opencode" => Backend::Opencode,
                             "cursor" => Backend::Cursor,
+                            "commandcode" => Backend::Commandcode,
                             "claude" => Backend::Claude,
                             _ => resolved,
                         };
@@ -2097,6 +2104,7 @@ pub async fn send_chat_message(
         Some("codex") => Backend::Codex,
         Some("opencode") => Backend::Opencode,
         Some("cursor") => Backend::Cursor,
+        Some("commandcode") => Backend::Commandcode,
         Some("claude") => Backend::Claude,
         _ => session_backend.clone(),
     };
@@ -2154,16 +2162,20 @@ pub async fn send_chat_message(
     let cursor_chat_id = sessions
         .find_session(&session_id)
         .and_then(|s| s.cursor_chat_id.clone());
+    let commandcode_session_id = sessions
+        .find_session(&session_id)
+        .and_then(|s| s.commandcode_session_id.clone());
 
     // Cursor CLI doesn't support thinking/effort levels
-    let run_thinking_level = if effective_backend == Backend::Cursor {
+    let run_thinking_level = if matches!(effective_backend, Backend::Cursor | Backend::Commandcode)
+    {
         None
     } else {
         thinking_level
             .as_ref()
             .map(|t| format!("{t:?}").to_lowercase())
     };
-    let run_effort_level = if effective_backend == Backend::Cursor {
+    let run_effort_level = if matches!(effective_backend, Backend::Cursor | Backend::Commandcode) {
         None
     } else {
         effort_level.as_ref().and_then(|e| e.effort_value())
@@ -2219,6 +2231,7 @@ pub async fn send_chat_message(
                     }
                     Backend::Opencode => {}
                     Backend::Cursor => {}
+                    Backend::Commandcode => {}
                 }
             }
         }
@@ -2266,6 +2279,7 @@ pub async fn send_chat_message(
     let thread_run_id = run_id.clone();
     let thread_opencode_session_id = opencode_session_id.clone();
     let thread_cursor_chat_id = cursor_chat_id.clone();
+    let _thread_commandcode_session_id = commandcode_session_id.clone();
     let thread_model = model.clone();
     let thread_execution_mode = execution_mode.clone();
     let thread_thinking_level = thinking_level.clone();
@@ -3416,6 +3430,43 @@ pub async fn send_chat_message(
                     }
                 }
             }
+            Backend::Commandcode => {
+                let system_context =
+                    super::context_instructions::build_combined_terminal_context_content(
+                        &thread_app,
+                        &thread_session_id,
+                        &thread_worktree_id,
+                    );
+                match super::commandcode::execute_commandcode_headless(
+                    &thread_app,
+                    &thread_session_id,
+                    &thread_worktree_id,
+                    std::path::Path::new(&thread_working_dir),
+                    thread_execution_mode.as_deref(),
+                    thread_model.as_deref(),
+                    &thread_message,
+                    Some(&system_context),
+                    Some(make_pid_callback()),
+                ) {
+                    Ok((_pid, response)) => Ok((
+                        0,
+                        UnifiedResponse {
+                            content: response.content,
+                            resume_id: response.session_id,
+                            tool_calls: response.tool_calls,
+                            content_blocks: response.content_blocks,
+                            cancelled: response.cancelled,
+                            error_emitted: false,
+                            usage: response.usage,
+                            backend: Backend::Commandcode,
+                        },
+                    )),
+                    Err(e) => {
+                        log::error!("execute_commandcode_headless FAILED: {e}");
+                        Err(e)
+                    }
+                }
+            }
         };
         let _ = tx.send(result);
     });
@@ -3547,7 +3598,7 @@ pub async fn send_chat_message(
     // cancelled content to the same JSONL file, and writing here would duplicate it.
     if matches!(
         unified_response.backend,
-        Backend::Opencode | Backend::Cursor
+        Backend::Opencode | Backend::Cursor | Backend::Commandcode
     ) && !unified_response.cancelled
     {
         if let Ok(mut file) = std::fs::OpenOptions::new().append(true).open(&output_file) {
@@ -3704,6 +3755,9 @@ pub async fn send_chat_message(
                         Backend::Cursor => {
                             session.cursor_chat_id = Some(resume_id_for_log.clone());
                         }
+                        Backend::Commandcode => {
+                            session.commandcode_session_id = Some(resume_id_for_log.clone());
+                        }
                     }
                 }
                 // Remove user message (undo send) - allows frontend to restore to input field
@@ -3764,7 +3818,7 @@ pub async fn send_chat_message(
         .iter()
         .any(|tc| tc.name == "ExitPlanMode" || tc.name == "CodexPlan");
     let is_plan_mode_with_content = match response_backend {
-        Backend::Opencode => {
+        Backend::Opencode | Backend::Commandcode => {
             execution_mode.as_deref() == Some("plan") && has_content && !has_plan_tool
         }
         Backend::Cursor => false, // Plan approval only on real createPlanToolCall / interaction_query
@@ -3840,6 +3894,9 @@ pub async fn send_chat_message(
                     }
                     Backend::Cursor => {
                         session.cursor_chat_id = Some(resume_id_for_log.clone());
+                    }
+                    Backend::Commandcode => {
+                        session.commandcode_session_id = Some(resume_id_for_log.clone());
                     }
                 }
             }
@@ -3928,6 +3985,7 @@ pub async fn clear_session_history(
             session.codex_thread_id = None;
             session.opencode_session_id = None;
             session.cursor_chat_id = None;
+            session.commandcode_session_id = None;
             session.selected_model = selected_model;
             session.selected_thinking_level = selected_thinking_level;
             session.selected_provider = selected_provider;
@@ -4025,6 +4083,7 @@ pub async fn set_session_backend(
                 "codex" => super::types::Backend::Codex,
                 "opencode" => super::types::Backend::Opencode,
                 "cursor" => super::types::Backend::Cursor,
+                "commandcode" => super::types::Backend::Commandcode,
                 _ => super::types::Backend::Claude,
             };
             log::trace!("Backend selection saved");
@@ -6022,6 +6081,7 @@ pub async fn get_session_debug_info(
         manifest_file,
         claude_session_id,
         cursor_chat_id,
+        commandcode_session_id: None,
         claude_jsonl_file,
         run_log_files,
         total_usage,

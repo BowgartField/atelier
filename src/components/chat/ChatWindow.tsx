@@ -1160,7 +1160,9 @@ export function ChatWindow({
             ? (preferences?.selected_opencode_model ?? 'opencode/gpt-5.3-codex')
             : yoloBackend === 'cursor'
               ? (preferences?.selected_cursor_model ?? 'cursor/auto')
-              : selectedModelRef.current)
+              : yoloBackend === 'commandcode'
+                ? (preferences?.selected_commandcode_model ?? 'commandcode/default')
+                : selectedModelRef.current)
       const yoloOverride =
         yoloModelRef.current || yoloBackend
           ? [yoloBackend, yoloModel].filter(Boolean).join(' / ')
@@ -1177,7 +1179,7 @@ export function ChatWindow({
       if (yoloBackend) {
         store.setSelectedBackend(
           newSession.id,
-          yoloBackend as 'claude' | 'codex' | 'opencode' | 'cursor'
+          yoloBackend as 'claude' | 'codex' | 'opencode' | 'cursor' | 'commandcode'
         )
       }
       // Optimistically update TanStack Query cache so UI shows correct backend/model immediately.
@@ -1329,7 +1331,9 @@ export function ChatWindow({
             ? (preferences?.selected_opencode_model ?? 'opencode/gpt-5.3-codex')
             : buildBackend === 'cursor'
               ? (preferences?.selected_cursor_model ?? 'cursor/auto')
-              : selectedModelRef.current)
+              : buildBackend === 'commandcode'
+                ? (preferences?.selected_commandcode_model ?? 'commandcode/default')
+                : selectedModelRef.current)
       const buildOverride =
         buildModelRef.current || buildBackend
           ? [buildBackend, buildModel].filter(Boolean).join(' / ')
@@ -1346,7 +1350,7 @@ export function ChatWindow({
       if (buildBackend) {
         store.setSelectedBackend(
           newSession.id,
-          buildBackend as 'claude' | 'codex' | 'opencode' | 'cursor'
+          buildBackend as 'claude' | 'codex' | 'opencode' | 'cursor' | 'commandcode'
         )
       }
       // Optimistically update TanStack Query cache so UI shows correct backend/model immediately.
@@ -1577,7 +1581,9 @@ export function ChatWindow({
             ? (preferences?.selected_opencode_model ?? 'opencode/gpt-5.3-codex')
             : modeBackend === 'cursor'
               ? (preferences?.selected_cursor_model ?? 'cursor/auto')
-              : selectedModelRef.current)
+              : modeBackend === 'commandcode'
+                ? (preferences?.selected_commandcode_model ?? 'commandcode/default')
+                : selectedModelRef.current)
       const modeOverride =
         modeModelRef.current || modeBackend
           ? [modeBackend, modeModel].filter(Boolean).join(' / ')
@@ -1594,7 +1600,7 @@ export function ChatWindow({
       if (modeBackend) {
         store.setSelectedBackend(
           newSession.id,
-          modeBackend as 'claude' | 'codex' | 'opencode' | 'cursor'
+          modeBackend as 'claude' | 'codex' | 'opencode' | 'cursor' | 'commandcode'
         )
       }
       queryClient.setQueryData<Session>(

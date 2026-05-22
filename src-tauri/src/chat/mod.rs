@@ -1,6 +1,7 @@
 pub(crate) mod claude;
 pub(crate) mod codex;
 pub(crate) mod codex_server;
+pub(crate) mod commandcode;
 mod commands;
 pub(crate) mod context_instructions;
 pub(crate) mod cursor;

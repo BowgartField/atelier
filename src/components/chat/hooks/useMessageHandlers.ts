@@ -95,7 +95,7 @@ interface UseMessageHandlersParams {
   yoloBackendRef: RefObject<string | null>
   yoloThinkingLevelRef: RefObject<string | null>
   yoloEffortLevelRef: RefObject<string | null>
-  selectedBackendRef: RefObject<'claude' | 'codex' | 'opencode' | 'cursor'>
+  selectedBackendRef: RefObject<'claude' | 'codex' | 'opencode' | 'cursor' | 'commandcode'>
   getCustomProfileName: () => string | undefined
   executionModeRef: RefObject<ExecutionMode>
   selectedThinkingLevelRef: RefObject<ThinkingLevel>
@@ -226,6 +226,9 @@ function getDefaultModelForBackend(
   }
   if (backend === 'cursor') {
     return preferences?.selected_cursor_model ?? 'cursor/auto'
+  }
+  if (backend === 'commandcode') {
+    return preferences?.selected_commandcode_model ?? 'commandcode/default'
   }
   return preferences?.selected_model ?? 'claude-opus-4-7[1m]'
 }
@@ -1250,7 +1253,7 @@ export function useMessageHandlers({
       if (resolvedBackend) {
         store.setSelectedBackend(
           newSession.id,
-          resolvedBackend as 'claude' | 'codex' | 'opencode' | 'cursor'
+          resolvedBackend as 'claude' | 'codex' | 'opencode' | 'cursor' | 'commandcode'
         )
       }
       // Optimistically update TanStack Query cache so UI shows correct backend/model
@@ -1491,7 +1494,7 @@ export function useMessageHandlers({
       if (resolvedBackend) {
         store.setSelectedBackend(
           newSession.id,
-          resolvedBackend as 'claude' | 'codex' | 'opencode' | 'cursor'
+          resolvedBackend as 'claude' | 'codex' | 'opencode' | 'cursor' | 'commandcode'
         )
       }
       // Optimistically update TanStack Query cache so UI shows correct backend/model immediately.
@@ -1837,7 +1840,7 @@ export function useMessageHandlers({
       if (resolvedBackend) {
         store.setSelectedBackend(
           newSession.id,
-          resolvedBackend as 'claude' | 'codex' | 'opencode' | 'cursor'
+          resolvedBackend as 'claude' | 'codex' | 'opencode' | 'cursor' | 'commandcode'
         )
       }
       queryClient.setQueryData<Session>(
@@ -2144,7 +2147,7 @@ export function useMessageHandlers({
       if (resolvedBackend) {
         store.setSelectedBackend(
           newSession.id,
-          resolvedBackend as 'claude' | 'codex' | 'opencode' | 'cursor'
+          resolvedBackend as 'claude' | 'codex' | 'opencode' | 'cursor' | 'commandcode'
         )
       }
       queryClient.setQueryData<Session>(
