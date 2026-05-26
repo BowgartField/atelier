@@ -68,6 +68,7 @@ interface PersistentTerminal {
   pendingOutput: string[]
   lastAppearance: TerminalAppearance | null
   appearanceResizeTimer: ReturnType<typeof setTimeout> | null
+  touchScrollCleanup: (() => void) | null
   onStopped?: (exitCode: number | null, signal: string | null) => void
 }
 
@@ -199,6 +200,78 @@ function disableGhosttyScrollbar(instance: PersistentTerminal): void {
 
   if (renderer?.renderScrollbar) {
     renderer.renderScrollbar = () => undefined
+  }
+}
+
+/** Translate vertical touch drags into terminal scrollback movement.
+ *  xterm.js v6 has no touch handling — the `.xterm-screen` layer paints over
+ *  the scrollable `.xterm-viewport`, so native touch-drag never scrolls it.
+ *  Returns a cleanup fn that removes the listeners (null if unsupported). */
+function attachTouchScroll(instance: PersistentTerminal): (() => void) | null {
+  const terminal = instance.terminal
+  const host = instance.hostElement
+  if (!terminal || !host) return null
+
+  const scrollLines = (terminal as { scrollLines?: (amount: number) => void })
+    .scrollLines
+  if (typeof scrollLines !== 'function') return null
+
+  let lastY: number | null = null
+  let remainder = 0
+
+  const cellHeight = (): number => {
+    const rows = terminal.rows
+    const height = host.clientHeight
+    if (rows >= 1 && Number.isFinite(height) && height > 0) {
+      return height / rows
+    }
+    // Fallback: font size with typical line-height when dimensions are absent.
+    return Math.max(8, getTerminalFontSize() * 1.2)
+  }
+
+  const onTouchStart = (event: TouchEvent): void => {
+    if (event.touches.length !== 1) {
+      lastY = null
+      return
+    }
+    lastY = event.touches[0]?.clientY ?? null
+    remainder = 0
+  }
+
+  const onTouchMove = (event: TouchEvent): void => {
+    if (lastY === null || event.touches.length !== 1) return
+    const y = event.touches[0]?.clientY
+    if (y === undefined) return
+
+    // Finger moving down (y increases) reveals older scrollback → scroll up.
+    remainder += lastY - y
+    lastY = y
+
+    const unit = cellHeight()
+    const lines = Math.trunc(remainder / unit)
+    if (lines !== 0) {
+      remainder -= lines * unit
+      scrollLines.call(terminal, lines)
+    }
+    // Suppress page scroll / pull-to-refresh while dragging in the terminal.
+    event.preventDefault()
+  }
+
+  const onTouchEnd = (): void => {
+    lastY = null
+    remainder = 0
+  }
+
+  host.addEventListener('touchstart', onTouchStart, { passive: true })
+  host.addEventListener('touchmove', onTouchMove, { passive: false })
+  host.addEventListener('touchend', onTouchEnd, { passive: true })
+  host.addEventListener('touchcancel', onTouchEnd, { passive: true })
+
+  return () => {
+    host.removeEventListener('touchstart', onTouchStart)
+    host.removeEventListener('touchmove', onTouchMove)
+    host.removeEventListener('touchend', onTouchEnd)
+    host.removeEventListener('touchcancel', onTouchEnd)
   }
 }
 
@@ -839,6 +912,7 @@ export function getOrCreateTerminal(
     pendingOutput: [],
     lastAppearance: null,
     appearanceResizeTimer: null,
+    touchScrollCleanup: null,
   }
 
   // Apply any pending onStopped callback registered before creation
@@ -907,6 +981,7 @@ export async function attachToContainer(
   if (!wasOpened) {
     terminal.open(hostElement)
     disableGhosttyScrollbar(instance)
+    instance.touchScrollCleanup = attachTouchScroll(instance)
     if (!instance.initialized) {
       // A brand-new visible terminal should never show stale renderer/DOM
       // contents from a previously attached terminal. Do not clear when a PTY
@@ -1071,6 +1146,8 @@ export async function disposeTerminal(terminalId: string): Promise<void> {
     clearTimeout(instance.appearanceResizeTimer)
     instance.appearanceResizeTimer = null
   }
+  instance.touchScrollCleanup?.()
+  instance.touchScrollCleanup = null
 
   // Dispose terminal renderer (clears buffer, removes DOM)
   instance.terminal?.dispose()

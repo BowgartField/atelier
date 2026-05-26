@@ -1123,6 +1123,7 @@ export type ClaudeModel =
   | 'claude-opus-4-6'
   | 'claude-opus-4-5-20251101'
   | 'claude-opus-4-6[1m]'
+  | 'claude-opus-4-7[1m]-fast'
   | 'claude-opus-4-6-fast'
   | 'claude-opus-4-6[1m]-fast'
   | 'opus' // Legacy/provider-alias: resolved by CLI via ANTHROPIC_DEFAULT_OPUS_MODEL env
@@ -1147,6 +1148,7 @@ const legacyClaudeDefaultModelMap = {
 
 const knownClaudeModels = new Set<string>([
   ...modelOptions.map(option => option.value),
+  'claude-opus-4-7[1m]-fast',
   'claude-opus-4-6[1m]-fast',
   'opus',
 ])
@@ -1166,6 +1168,7 @@ export function normalizeClaudeModel(model: string): ClaudeModel {
 // Claude models that support fast service tier. Fast mode is exposed via a
 // separate UI toggle, not as standalone dropdown entries.
 export const CLAUDE_FAST_MODEL_MAP = {
+  'claude-opus-4-7[1m]': 'claude-opus-4-7[1m]-fast',
   'claude-opus-4-6[1m]': 'claude-opus-4-6[1m]-fast',
 } as const
 

@@ -1628,6 +1628,14 @@ pub async fn dispatch_command(
             let result = crate::projects::list_codex_skills().await?;
             to_value(result)
         }
+        "list_opencode_skills" => {
+            let result = crate::projects::list_opencode_skills().await?;
+            to_value(result)
+        }
+        "list_cursor_skills" => {
+            let result = crate::projects::list_cursor_skills().await?;
+            to_value(result)
+        }
         "list_plugin_skills" => {
             let result = crate::projects::list_plugin_skills().await?;
             to_value(result)
@@ -2841,7 +2849,9 @@ pub async fn dispatch_command(
         // =====================================================================
         "check_opinionated_plugin_status" => {
             let plugin_name: String = from_field(&args, "pluginName")?;
-            let result = crate::opinionated::check_opinionated_plugin_status(plugin_name).await?;
+            let result =
+                crate::opinionated::check_opinionated_plugin_status(app.clone(), plugin_name)
+                    .await?;
             to_value(result)
         }
         "install_opinionated_plugin" => {

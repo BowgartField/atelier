@@ -3598,6 +3598,8 @@ pub fn run() {
             projects::list_claude_commands,
             projects::resolve_claude_command,
             projects::list_codex_skills,
+            projects::list_opencode_skills,
+            projects::list_cursor_skills,
             projects::list_plugin_skills,
             // GitHub issues commands
             projects::list_github_issues,

@@ -5509,6 +5509,8 @@ pub async fn clear_worktree_pr(app: AppHandle, worktree_id: String) -> Result<()
     worktree.pr_url = None;
     worktree.pr_push_remote = None;
     worktree.pr_push_branch = None;
+    worktree.cached_pr_status = None;
+    worktree.cached_check_status = None;
 
     save_projects_data(&app, &data)?;
 
@@ -10329,6 +10331,59 @@ pub async fn list_codex_skills() -> Result<Vec<ClaudeSkill>, String> {
     skills.sort_by(|a, b| a.name.cmp(&b.name));
     log::trace!("Found {} Codex CLI skills", skills.len());
     Ok(skills)
+}
+
+/// List OpenCode skills from the OpenCode config directory.
+#[tauri::command]
+pub async fn list_opencode_skills() -> Result<Vec<ClaudeSkill>, String> {
+    log::trace!("Listing OpenCode skills");
+
+    let mut skills_map = std::collections::HashMap::new();
+
+    if let Some(home) = get_home_dir() {
+        collect_skills_from_dir(&opencode_config_dir(&home).join("skills"), &mut skills_map);
+    }
+
+    let mut skills: Vec<ClaudeSkill> = skills_map.into_values().collect();
+    skills.sort_by(|a, b| a.name.cmp(&b.name));
+    log::trace!("Found {} OpenCode skills", skills.len());
+    Ok(skills)
+}
+
+/// List Cursor skills from ~/.cursor/skills-cursor/.
+#[tauri::command]
+pub async fn list_cursor_skills() -> Result<Vec<ClaudeSkill>, String> {
+    log::trace!("Listing Cursor skills");
+
+    let mut skills_map = std::collections::HashMap::new();
+
+    if let Some(home) = get_home_dir() {
+        collect_skills_from_dir(&home.join(".cursor").join("skills-cursor"), &mut skills_map);
+    }
+
+    let mut skills: Vec<ClaudeSkill> = skills_map.into_values().collect();
+    skills.sort_by(|a, b| a.name.cmp(&b.name));
+    log::trace!("Found {} Cursor skills", skills.len());
+    Ok(skills)
+}
+
+fn opencode_config_dir(home: &std::path::Path) -> std::path::PathBuf {
+    if let Ok(xdg_config_home) = std::env::var("XDG_CONFIG_HOME") {
+        return std::path::PathBuf::from(xdg_config_home).join("opencode");
+    }
+
+    #[cfg(windows)]
+    {
+        if let Ok(app_data) = std::env::var("APPDATA") {
+            return std::path::PathBuf::from(app_data).join("opencode");
+        }
+        return home.join("AppData").join("Roaming").join("opencode");
+    }
+
+    #[cfg(not(windows))]
+    {
+        home.join(".config").join("opencode")
+    }
 }
 
 /// A group of skills from an installed Claude plugin
