@@ -8,7 +8,6 @@ import {
   AlertCircle,
   AlertTriangle,
   Lightbulb,
-  ThumbsUp,
   CheckCircle2,
   MessageSquare,
   FileCode,
@@ -58,13 +57,6 @@ function getSeverityConfig(severity: string) {
         bgColor: 'bg-blue-500/10',
         label: 'Suggestion',
       }
-    case 'praise':
-      return {
-        icon: ThumbsUp,
-        color: 'text-green-500',
-        bgColor: 'bg-green-500/10',
-        label: 'Good',
-      }
     default:
       return {
         icon: MessageSquare,
@@ -80,10 +72,13 @@ const SEVERITY_ORDER: Record<ReviewFinding['severity'], number> = {
   critical: 0,
   warning: 1,
   suggestion: 2,
-  praise: 3,
 }
 
-/** Sort findings by severity (critical first, praise last), preserving original indices */
+function getSeverityRank(severity: string): number {
+  return SEVERITY_ORDER[severity as ReviewFinding['severity']] ?? 99
+}
+
+/** Sort findings by severity (critical first), preserving original indices */
 function sortFindingsBySeverity(
   findings: ReviewFinding[]
 ): { finding: ReviewFinding; originalIndex: number }[] {
@@ -91,8 +86,28 @@ function sortFindingsBySeverity(
     .map((finding, originalIndex) => ({ finding, originalIndex }))
     .sort(
       (a, b) =>
-        SEVERITY_ORDER[a.finding.severity] - SEVERITY_ORDER[b.finding.severity]
+        getSeverityRank(a.finding.severity) -
+        getSeverityRank(b.finding.severity)
     )
+}
+
+function formatReviewMetadata(value: string): string {
+  return value
+    .split('_')
+    .map(word => word.charAt(0).toUpperCase() + word.slice(1))
+    .join(' ')
+}
+
+function isFixAllCandidate(finding: ReviewFinding): boolean {
+  const severity = finding.severity as string
+  return (
+    severity !== 'praise' &&
+    (finding.blocking === true || severity !== 'suggestion')
+  )
+}
+
+function isFixableFinding(finding: ReviewFinding): boolean {
+  return (finding.severity as string) !== 'praise'
 }
 
 /** Get approval status config */
@@ -236,7 +251,7 @@ Please apply this fix to the file.`
           .map((finding, index) => ({ finding, index }))
           .filter(
             ({ finding, index }) =>
-              finding.severity !== 'praise' && !isFindingFixed(finding, index)
+              isFixAllCandidate(finding) && !isFindingFixed(finding, index)
           )
 
         if (unfixedFindings.length === 0) return
@@ -291,14 +306,14 @@ Please apply all these fixes to the codebase.`
   )
 
   const unfixedCount = reviewResults.findings.filter(
-    (f, i) => f.severity !== 'praise' && !isFindingFixed(f, i)
+    (f, i) => isFixAllCandidate(f) && !isFindingFixed(f, i)
   ).length
-  const fixedCount = reviewResults.findings.filter(
-    (f, i) => f.severity !== 'praise' && isFindingFixed(f, i)
+  const fixedCount = reviewResults.findings.filter((f, i) =>
+    isFindingFixed(f, i)
   ).length
 
   const canFix =
-    effectiveFinding && effectiveFinding.finding.severity !== 'praise'
+    !!effectiveFinding && isFixableFinding(effectiveFinding.finding)
   const isCurrentFixed = effectiveFinding
     ? isFindingFixed(effectiveFinding.finding, effectiveFinding.originalIndex)
     : false
@@ -343,14 +358,6 @@ Please apply all these fixes to the codebase.`
                 className="text-blue-500 text-[10px] px-1.5 py-0"
               >
                 {counts.suggestion} suggestion
-              </Badge>
-            )}
-            {(counts.praise ?? 0) > 0 && (
-              <Badge
-                variant="outline"
-                className="text-green-500 text-[10px] px-1.5 py-0"
-              >
-                {counts.praise} praise
               </Badge>
             )}
           </div>
@@ -507,6 +514,43 @@ Please apply all these fixes to the codebase.`
                           Fixed
                         </Badge>
                       )}
+                      {effectiveFinding.finding.category && (
+                        <Badge
+                          variant="outline"
+                          className="text-[10px] px-1.5 py-0"
+                        >
+                          {formatReviewMetadata(
+                            effectiveFinding.finding.category
+                          )}
+                        </Badge>
+                      )}
+                      {effectiveFinding.finding.confidence && (
+                        <Badge
+                          variant="outline"
+                          className="text-[10px] px-1.5 py-0"
+                        >
+                          {formatReviewMetadata(
+                            effectiveFinding.finding.confidence
+                          )}{' '}
+                          confidence
+                        </Badge>
+                      )}
+                      {effectiveFinding.finding.blocking === true && (
+                        <Badge
+                          variant="outline"
+                          className="text-[10px] px-1.5 py-0 text-red-500 border-red-500"
+                        >
+                          Blocking
+                        </Badge>
+                      )}
+                      {effectiveFinding.finding.introduced_by_diff === true && (
+                        <Badge
+                          variant="outline"
+                          className="text-[10px] px-1.5 py-0"
+                        >
+                          Introduced by diff
+                        </Badge>
+                      )}
                     </div>
                     <p className="mt-1 text-xs font-mono text-muted-foreground select-text cursor-text">
                       {effectiveFinding.finding.file}
@@ -530,6 +574,18 @@ Please apply all these fixes to the codebase.`
                       {effectiveFinding.finding.description}
                     </p>
                   </div>
+
+                  {/* Failure scenario */}
+                  {effectiveFinding.finding.failure_scenario && (
+                    <div>
+                      <h4 className="text-xs font-medium text-muted-foreground uppercase tracking-wider mb-2">
+                        Failure Scenario
+                      </h4>
+                      <p className="text-sm leading-relaxed text-foreground/90 select-text cursor-text">
+                        {effectiveFinding.finding.failure_scenario}
+                      </p>
+                    </div>
+                  )}
 
                   {/* Suggested fix */}
                   {effectiveFinding.finding.suggestion && (

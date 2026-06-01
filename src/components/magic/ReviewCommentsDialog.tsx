@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState, type ReactNode } from 'react'
+import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
 import { invoke } from '@/lib/transport'
 import {
   Loader2,
@@ -21,6 +21,7 @@ import {
 } from '@/components/ui/dialog'
 import { Button } from '@/components/ui/button'
 import { Checkbox } from '@/components/ui/checkbox'
+import { Kbd, KbdGroup } from '@/components/ui/kbd'
 import { ScrollArea } from '@/components/ui/scroll-area'
 import { useUIStore } from '@/store/ui-store'
 import { useProjectsStore } from '@/store/projects-store'
@@ -29,6 +30,7 @@ import { useWorktrees } from '@/services/projects'
 import { usePreferences } from '@/services/preferences'
 import { DEFAULT_REVIEW_COMMENTS_PROMPT } from '@/types/preferences'
 import { Markdown } from '@/components/ui/markdown'
+import { cn } from '@/lib/utils'
 import type {
   GitHubReviewComment,
   GitHubComment,
@@ -43,6 +45,17 @@ type CommentTab = 'inline' | 'conversation'
 type ConversationItem =
   | { kind: 'comment'; data: GitHubComment }
   | { kind: 'review'; data: GitHubReview }
+
+function isEditableTarget(target: EventTarget | null): boolean {
+  if (!(target instanceof HTMLElement)) return false
+  const tagName = target.tagName.toLowerCase()
+  return (
+    tagName === 'input' ||
+    tagName === 'textarea' ||
+    tagName === 'select' ||
+    target.isContentEditable
+  )
+}
 
 function getCreatedAt(
   obj: { created_at?: string; createdAt?: string } & Record<string, unknown>
@@ -223,6 +236,8 @@ export function ReviewCommentsDialog() {
   const [error, setError] = useState<string | null>(null)
   const [isSending, setIsSending] = useState(false)
   const [tab, setTab] = useState<CommentTab>('inline')
+  const [activeIndex, setActiveIndex] = useState(0)
+  const activeRowRefs = useRef<Record<string, HTMLDivElement | null>>({})
 
   // Inline code comments state
   const [comments, setComments] = useState<GitHubReviewComment[]>([])
@@ -249,6 +264,7 @@ export function ReviewCommentsDialog() {
     setSelected(new Set())
     setExpanded(new Set())
     setDiffExpanded(new Set())
+    setActiveIndex(0)
     setConversationItems([])
     setConversationSelected(new Set())
     setConversationExpanded(new Set())
@@ -302,6 +318,7 @@ export function ReviewCommentsDialog() {
       } else {
         setTab('inline')
       }
+      setActiveIndex(0)
 
       setPhase('select')
     } catch (err) {
@@ -322,6 +339,7 @@ export function ReviewCommentsDialog() {
       if (!open) {
         resetTransientState()
         setTab('inline')
+        setActiveIndex(0)
       }
       setReviewCommentsModalOpen(open)
     },
@@ -380,6 +398,26 @@ export function ReviewCommentsDialog() {
   const activeSelected = tab === 'inline' ? selected : conversationSelected
   const allSelected =
     activeItems.length > 0 && activeSelected.size === activeItems.length
+
+  useEffect(() => {
+    setActiveIndex(0)
+  }, [tab])
+
+  useEffect(() => {
+    if (activeItems.length === 0) {
+      if (activeIndex !== 0) setActiveIndex(0)
+      return
+    }
+    if (activeIndex >= activeItems.length) {
+      setActiveIndex(activeItems.length - 1)
+    }
+  }, [activeIndex, activeItems.length])
+
+  useEffect(() => {
+    const row = activeRowRefs.current[`${tab}-${activeIndex}`]
+    row?.focus({ preventScroll: true })
+    row?.scrollIntoView?.({ block: 'nearest' })
+  }, [tab, activeIndex])
 
   const toggleAll = useCallback(() => {
     if (tab === 'inline') {
@@ -499,11 +537,72 @@ export function ReviewCommentsDialog() {
     buildPrompt,
   ])
 
+  const handleDialogKeyDown = useCallback(
+    (event: React.KeyboardEvent) => {
+      if (isEditableTarget(event.target) || phase !== 'select' || error) return
+
+      const sendShortcut =
+        event.key === 'Enter' && (event.metaKey || event.ctrlKey)
+      if (sendShortcut) {
+        event.preventDefault()
+        if (event.shiftKey) {
+          handleSendSeparately()
+        } else {
+          handleSendToChat()
+        }
+        return
+      }
+
+      if (activeItems.length === 0) return
+
+      if (event.key === 'ArrowDown') {
+        event.preventDefault()
+        setActiveIndex(index => Math.min(index + 1, activeItems.length - 1))
+        return
+      }
+
+      if (event.key === 'ArrowUp') {
+        event.preventDefault()
+        setActiveIndex(index => Math.max(index - 1, 0))
+        return
+      }
+
+      if (event.key === 'Enter') {
+        event.preventDefault()
+        if (tab === 'inline') toggleExpand(activeIndex)
+        else toggleConversationExpand(activeIndex)
+        return
+      }
+
+      if (event.key === ' ') {
+        event.preventDefault()
+        if (tab === 'inline') toggleSelect(activeIndex)
+        else toggleConversationSelect(activeIndex)
+      }
+    },
+    [
+      activeIndex,
+      activeItems.length,
+      error,
+      handleSendSeparately,
+      handleSendToChat,
+      phase,
+      tab,
+      toggleConversationExpand,
+      toggleConversationSelect,
+      toggleExpand,
+      toggleSelect,
+    ]
+  )
+
   const hasAnyComments = comments.length > 0 || conversationItems.length > 0
 
   return (
     <Dialog open={reviewCommentsModalOpen} onOpenChange={handleOpenChange}>
-      <DialogContent className="!fixed !inset-0 !translate-x-0 !translate-y-0 !w-screen !h-dvh !max-w-screen !max-h-none !rounded-none flex flex-col overflow-hidden sm:!inset-auto sm:!top-[50%] sm:!left-[50%] sm:!translate-x-[-50%] sm:!translate-y-[-50%] sm:!w-[95vw] sm:!h-[90vh] sm:!max-w-none sm:!rounded-lg">
+      <DialogContent
+        onKeyDown={handleDialogKeyDown}
+        className="!fixed !inset-0 !translate-x-0 !translate-y-0 !w-screen !h-dvh !max-w-screen !max-h-none !rounded-none flex flex-col overflow-hidden sm:!inset-auto sm:!top-[50%] sm:!left-[50%] sm:!translate-x-[-50%] sm:!translate-y-[-50%] sm:!w-[95vw] sm:!h-[90vh] sm:!max-w-none sm:!rounded-lg"
+      >
         <DialogHeader className="pr-10 sm:pr-0">
           <DialogTitle className="flex items-center gap-2">
             <MessageSquare className="size-4" />
@@ -547,7 +646,10 @@ export function ReviewCommentsDialog() {
                 variant={tab === 'inline' ? 'default' : 'outline'}
                 size="sm"
                 className="h-7 text-xs gap-1.5"
-                onClick={() => setTab('inline')}
+                onClick={() => {
+                  setTab('inline')
+                  setActiveIndex(0)
+                }}
               >
                 <Code className="size-3" />
                 Code Comments ({comments.length})
@@ -556,7 +658,10 @@ export function ReviewCommentsDialog() {
                 variant={tab === 'conversation' ? 'default' : 'outline'}
                 size="sm"
                 className="h-7 text-xs gap-1.5"
-                onClick={() => setTab('conversation')}
+                onClick={() => {
+                  setTab('conversation')
+                  setActiveIndex(0)
+                }}
               >
                 <MessagesSquare className="size-3" />
                 Conversation ({conversationItems.length})
@@ -564,14 +669,28 @@ export function ReviewCommentsDialog() {
             </div>
 
             {/* Selection controls */}
-            <div className="flex items-center justify-between px-1 pb-2">
-              <span className="text-xs text-muted-foreground">
-                {activeSelected.size} of {activeItems.length} selected
-              </span>
+            <div className="flex items-center justify-between gap-3 px-1 pb-2">
+              <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-muted-foreground">
+                <span>
+                  {activeSelected.size} of {activeItems.length} selected
+                </span>
+                <span className="hidden items-center gap-1 sm:inline-flex">
+                  <Kbd className="h-4 min-w-0 px-1 text-[10px]">↑/↓</Kbd>
+                  move
+                </span>
+                <span className="hidden items-center gap-1 sm:inline-flex">
+                  <Kbd className="h-4 min-w-0 px-1 text-[10px]">↵</Kbd>
+                  expand
+                </span>
+                <span className="hidden items-center gap-1 sm:inline-flex">
+                  <Kbd className="h-4 min-w-0 px-1 text-[10px]">Space</Kbd>
+                  select
+                </span>
+              </div>
               <Button
                 variant="ghost"
                 size="sm"
-                className="h-6 text-xs"
+                className="h-6 shrink-0 text-xs"
                 onClick={toggleAll}
               >
                 {allSelected ? 'Deselect All' : 'Select All'}
@@ -589,8 +708,23 @@ export function ReviewCommentsDialog() {
                     const date = formatCommentDate(comment.createdAt)
                     const preview = previewLine(comment.body)
 
+                    const isActive = activeIndex === index
+
                     return (
-                      <div key={index} className="px-3 py-2.5">
+                      <div
+                        key={index}
+                        ref={node => {
+                          activeRowRefs.current[`inline-${index}`] = node
+                        }}
+                        data-active={isActive}
+                        tabIndex={isActive ? 0 : -1}
+                        data-testid={`review-comment-row-inline-${index}`}
+                        className={cn(
+                          'px-3 py-2.5 outline-none transition-colors',
+                          isActive && 'bg-accent/40 ring-1 ring-ring/50'
+                        )}
+                        onClick={() => setActiveIndex(index)}
+                      >
                         <div className="flex items-start gap-2">
                           <Checkbox
                             checked={selected.has(index)}
@@ -687,8 +821,23 @@ export function ReviewCommentsDialog() {
                       getConversationItemDate(item)
                     )
 
+                    const isActive = activeIndex === index
+
                     return (
-                      <div key={index} className="px-3 py-2.5">
+                      <div
+                        key={index}
+                        ref={node => {
+                          activeRowRefs.current[`conversation-${index}`] = node
+                        }}
+                        data-active={isActive}
+                        tabIndex={isActive ? 0 : -1}
+                        data-testid={`review-comment-row-conversation-${index}`}
+                        className={cn(
+                          'px-3 py-2.5 outline-none transition-colors',
+                          isActive && 'bg-accent/40 ring-1 ring-ring/50'
+                        )}
+                        onClick={() => setActiveIndex(index)}
+                      >
                         <div className="flex items-start gap-2">
                           <Checkbox
                             checked={conversationSelected.has(index)}
@@ -762,13 +911,6 @@ export function ReviewCommentsDialog() {
               <Button
                 variant="outline"
                 size="sm"
-                onClick={() => handleOpenChange(false)}
-              >
-                Cancel
-              </Button>
-              <Button
-                variant="outline"
-                size="sm"
                 disabled={activeSelected.size === 0 || isSending}
                 onClick={handleSendSeparately}
               >
@@ -778,6 +920,10 @@ export function ReviewCommentsDialog() {
                   <MessagesSquare className="size-3.5 mr-1.5" />
                 )}
                 Send Separately ({activeSelected.size})
+                <KbdGroup className="ml-1.5 hidden sm:inline-flex">
+                  <Kbd className="h-4 min-w-4 px-1 text-[10px]">⇧</Kbd>
+                  <Kbd className="h-4 min-w-4 px-1 text-[10px]">⌘↵</Kbd>
+                </KbdGroup>
               </Button>
               <Button
                 size="sm"
@@ -790,6 +936,10 @@ export function ReviewCommentsDialog() {
                   <MessageSquare className="size-3.5 mr-1.5" />
                 )}
                 Send to Chat ({activeSelected.size})
+                <KbdGroup className="ml-1.5 hidden sm:inline-flex">
+                  <Kbd className="h-4 min-w-4 px-1 text-[10px]">⌘</Kbd>
+                  <Kbd className="h-4 min-w-4 px-1 text-[10px]">↵</Kbd>
+                </KbdGroup>
               </Button>
             </div>
           </>

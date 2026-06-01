@@ -17,6 +17,7 @@ import {
   FitAddon as GhosttyWebFitAddon,
 } from 'ghostty-web'
 import { openExternal } from '@/lib/platform'
+import { LocalTerminalLinkProvider } from '@/lib/terminal-local-links'
 import {
   invoke,
   isTransportConnected,
@@ -632,7 +633,10 @@ function queueTerminalOutput(instance: PersistentTerminal, data: string): void {
   })
 }
 
-async function createTerminalForRenderer(renderer: TerminalRenderer): Promise<{
+async function createTerminalForRenderer(
+  renderer: TerminalRenderer,
+  worktreePath: string
+): Promise<{
   terminal: EmbeddedTerminal
   fitAddon: EmbeddedFitAddon
   appearance: TerminalAppearance
@@ -675,6 +679,14 @@ async function createTerminalForRenderer(renderer: TerminalRenderer): Promise<{
       openExternal(uri)
     })
   )
+  terminal.registerLinkProvider(
+    new LocalTerminalLinkProvider(terminal, worktreePath, () => {
+      const preferences = queryClient.getQueryData<AppPreferences>(
+        preferencesQueryKeys.preferences()
+      )
+      return preferences?.editor
+    })
+  )
   return { terminal, fitAddon, appearance }
 }
 
@@ -689,7 +701,8 @@ async function ensureTerminalCreated(
 
   try {
     const { terminal, fitAddon, appearance } = await createTerminalForRenderer(
-      instance.renderer
+      instance.renderer,
+      instance.worktreePath
     )
 
     if (!isCurrentInstance(terminalId, instance)) {

@@ -414,7 +414,26 @@ export interface GitPushResponse {
 /** A single finding from an AI code review */
 export interface ReviewFinding {
   /** Severity level of the finding */
-  severity: 'critical' | 'warning' | 'suggestion' | 'praise'
+  severity: 'critical' | 'warning' | 'suggestion'
+  /** Primary category for the issue */
+  category?:
+    | 'security'
+    | 'correctness'
+    | 'data_loss'
+    | 'race_condition'
+    | 'api_contract'
+    | 'serialization'
+    | 'migration'
+    | 'testing'
+    | 'performance'
+    | 'maintainability'
+    | 'repo_standard'
+  /** Model confidence in the finding */
+  confidence?: 'high' | 'medium'
+  /** Whether this finding should block approval */
+  blocking?: boolean
+  /** Whether the issue was introduced or materially worsened by the diff */
+  introduced_by_diff?: boolean
   /** File path where the finding applies */
   file: string
   /** Line number if applicable */
@@ -423,6 +442,8 @@ export interface ReviewFinding {
   title: string
   /** Detailed explanation of the finding */
   description: string
+  /** Concrete scenario where the issue manifests */
+  failure_scenario?: string
   /** Optional code suggestion or fix */
   suggestion?: string
 }
