@@ -205,15 +205,16 @@ describe('TerminalView tab middle-click', () => {
     })
   })
 
-  it('does not close on right-click (button 2)', async () => {
+  it('does not close on right-click (button 2)', () => {
     renderTabBar()
 
+    // button 2 returns synchronously before any async work, so the assertion
+    // can run immediately after dispatching the event.
     fireEvent(
       getTab('Terminal 1'),
       new MouseEvent('auxclick', { bubbles: true, cancelable: true, button: 2 })
     )
 
-    await Promise.resolve()
     expect(invoke).not.toHaveBeenCalledWith('stop_terminal', {
       terminalId: 'terminal-1',
     })

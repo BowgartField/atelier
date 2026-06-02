@@ -308,6 +308,11 @@ export function TerminalView({
                 key={terminal.id}
                 type="button"
                 onClick={() => handleSelectTerminal(terminal.id)}
+                onMouseDown={e => {
+                  // Suppress middle-click autoscroll (fires on mousedown,
+                  // before auxclick) — relevant in web-access/browser mode.
+                  if (e.button === 1) e.preventDefault()
+                }}
                 onAuxClick={e => handleTabAuxClick(e, terminal.id)}
                 className={cn(
                   'group flex shrink-0 items-center gap-1.5 border-r border-border px-3 py-1.5 text-xs transition-colors',

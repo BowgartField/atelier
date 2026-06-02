@@ -19,7 +19,7 @@ import { CloseWorktreeDialog } from '@/components/chat/CloseWorktreeDialog'
 import { useSessionArchive } from '@/components/chat/hooks/useSessionArchive'
 import { useRenameWorktree } from '@/services/projects'
 import { useSessions } from '@/services/chat'
-import { isAskUserQuestion, isPlanToolCall } from '@/types/chat'
+import { isAskUserQuestion, isPlanToolCall, type Session } from '@/types/chat'
 import {
   computeSessionCardData,
   groupCardsByStatus,
@@ -119,11 +119,12 @@ export function WorktreeItem({
   })
 
   // Confirmation dialog shared by middle-click close of a worktree or a
-  // conversation — mirrors the canvas/session-tab "validation" flow.
+  // conversation — mirrors the canvas/session-tab "validation" flow. Stores the
+  // intent (not a callback) so the action is derived in onConfirm.
   const [closeConfirm, setCloseConfirm] = useState<{
     mode: 'worktree' | 'session'
     branchName?: string
-    action: () => void
+    sessionId?: string
   } | null>(null)
 
   // Check if any session has streaming AskUserQuestion waiting (blinks)
@@ -447,6 +448,12 @@ export function WorktreeItem({
     selectWorktree,
   ])
 
+  // Suppress the browser's middle-click autoscroll, which is triggered on
+  // mousedown (before auxclick fires) — relevant in web-access/browser mode.
+  const handleMiddleMouseDown = useCallback((e: React.MouseEvent) => {
+    if (e.button === 1) e.preventDefault()
+  }, [])
+
   // Middle-click closes the worktree, mirroring the canvas/session-tab close —
   // including the confirmation dialog when `confirm_session_close` is enabled.
   const handleAuxClick = useCallback(
@@ -455,11 +462,7 @@ export function WorktreeItem({
       e.preventDefault()
       e.stopPropagation()
       if (preferences?.confirm_session_close !== false) {
-        setCloseConfirm({
-          mode: 'worktree',
-          branchName: worktree.branch,
-          action: handleArchiveOrClose,
-        })
+        setCloseConfirm({ mode: 'worktree', branchName: worktree.branch })
       } else {
         handleArchiveOrClose()
       }
@@ -470,17 +473,15 @@ export function WorktreeItem({
   // Middle-click on a conversation row deletes it, mirroring the session-tab
   // middle-click: validate only when removing the last session of the worktree.
   const handleSessionAuxClick = useCallback(
-    (e: React.MouseEvent, sessionId: string) => {
+    (e: React.MouseEvent, session: Session) => {
       if (e.button !== 1) return
       e.preventDefault()
       e.stopPropagation()
-      const activeSessions = (sessionsData?.sessions ?? []).filter(
+      // The row is rendered from sessionsData, so the count is reliable here.
+      const activeCount = (sessionsData?.sessions ?? []).filter(
         s => !s.archived_at
-      )
-      const session = activeSessions.find(s => s.id === sessionId)
-      if (!session) return
-      const removeSession = () => handleDeleteSession(sessionId)
-      const isLastSession = activeSessions.length <= 1
+      ).length
+      const isLastSession = activeCount <= 1
       const sessionIsEmpty = !session.message_count
       if (
         isLastSession &&
@@ -490,10 +491,10 @@ export function WorktreeItem({
         setCloseConfirm({
           mode: 'session',
           branchName: worktree.branch,
-          action: removeSession,
+          sessionId: session.id,
         })
       } else {
-        removeSession()
+        handleDeleteSession(session.id)
       }
     },
     [
@@ -616,6 +617,7 @@ export function WorktreeItem({
               : 'text-muted-foreground hover:text-foreground hover:bg-accent/50'
           )}
           onClick={handleClick}
+          onMouseDown={handleMiddleMouseDown}
           onAuxClick={handleAuxClick}
           onDoubleClick={handleDoubleClick}
         >
@@ -760,7 +762,8 @@ export function WorktreeItem({
                       e.stopPropagation()
                       handleSessionSelect(card.session.id)
                     }}
-                    onAuxClick={e => handleSessionAuxClick(e, card.session.id)}
+                    onMouseDown={handleMiddleMouseDown}
+                    onAuxClick={e => handleSessionAuxClick(e, card.session)}
                   >
                     <StatusIndicator
                       status={config.indicatorStatus}
@@ -784,9 +787,14 @@ export function WorktreeItem({
           if (!open) setCloseConfirm(null)
         }}
         onConfirm={() => {
-          const action = closeConfirm?.action
+          const intent = closeConfirm
           setCloseConfirm(null)
-          action?.()
+          if (!intent) return
+          if (intent.mode === 'session' && intent.sessionId) {
+            handleDeleteSession(intent.sessionId)
+          } else {
+            handleArchiveOrClose()
+          }
         }}
         branchName={closeConfirm?.branchName}
         mode={closeConfirm?.mode ?? 'worktree'}
