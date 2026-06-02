@@ -590,6 +590,7 @@ export const DEFAULT_GLOBAL_SYSTEM_PROMPT = `### 1. Plan Mode Default
 ## Core Principles
 - **Simplicity First**: Make every change as simple as possible. Impact minimal code.
 - **VERY IMPORTANT: Keep Code Simple**: Do not over-engineer. Always implement the simplest maintainable solution. Avoid extra abstractions, frameworks, configuration, or future-proofing unless clearly required.
+- **Clickable References**: When output mentions issues, PRs, security advisories/alerts, Linear issues, or other external resources, include clickable links when available so users can open them directly.
 - **No Laziness**: Find root causes. No temporary fixes. Senior developer standards.
 - **Minimal Impact**: Changes should only touch what's necessary. Avoid introducing bugs.
 

@@ -307,6 +307,8 @@ export function UnreadBell({ title, hideTitle }: UnreadBellProps) {
           }
           break
         case 'Backspace':
+        case 'r':
+        case 'R':
           e.preventDefault()
           if (focusedIndex >= 0 && displayItems[focusedIndex]) {
             handleMarkOneRead(displayItems[focusedIndex])
@@ -429,6 +431,14 @@ export function UnreadBell({ title, hideTitle }: UnreadBellProps) {
                       <span className="text-[11px] text-muted-foreground/40 shrink-0 ml-auto">
                         {formatRelativeTime(item.session.updated_at)}
                       </span>
+                      {focusedIndex === idx && (
+                        <Kbd
+                          className="h-4 min-w-4 px-1 text-[10px] opacity-70"
+                          title="Press R to mark read"
+                        >
+                          R
+                        </Kbd>
+                      )}
                     </div>
                     <span className="text-[13px] truncate block">
                       {item.session.name}

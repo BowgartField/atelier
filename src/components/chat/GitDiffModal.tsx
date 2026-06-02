@@ -91,6 +91,7 @@ import {
   type DiffComment,
 } from './MemoizedFileDiff'
 import type { GitDiff, DiffRequest } from '@/types/git-diff'
+import { DEFAULT_KEYBINDINGS, eventMatchesShortcut } from '@/types/keybindings'
 
 // PERFORMANCE: Stable empty array reference for files without comments
 // This prevents unnecessary re-renders since the reference never changes
@@ -289,6 +290,19 @@ export function GitDiffModal({
     fileStatus: string
   } | null>(null)
   const [isReverting, setIsReverting] = useState(false)
+
+  const scrollDiffViewer = useCallback((direction: 'up' | 'down') => {
+    const container = scrollContainerRef.current
+    if (!container) return
+
+    const delta = container.clientHeight * 0.5
+    const top =
+      direction === 'up'
+        ? Math.max(0, container.scrollTop - delta)
+        : container.scrollTop + delta
+
+    container.scrollTo({ top, behavior: 'smooth' })
+  }, [])
 
   // Resolve theme to actual dark/light value
   const resolvedThemeType = useMemo((): 'dark' | 'light' => {
@@ -759,6 +773,45 @@ export function GitDiffModal({
     document.addEventListener('keydown', handleKeyDown, true)
     return () => document.removeEventListener('keydown', handleKeyDown, true)
   }, [diffRequest, canCommitFromDiff, handleCommitFromDiff])
+
+  // Scroll the active file diff while the full-screen diff modal owns focus.
+  // The global chat-scroll shortcuts are blocked by open dialogs, so handle
+  // the same bindings locally for the diff viewer.
+  useEffect(() => {
+    if (!diffRequest) return
+
+    const scrollUpShortcut =
+      preferences?.keybindings?.scroll_chat_up ??
+      DEFAULT_KEYBINDINGS.scroll_chat_up ??
+      'mod+arrowup'
+    const scrollDownShortcut =
+      preferences?.keybindings?.scroll_chat_down ??
+      DEFAULT_KEYBINDINGS.scroll_chat_down ??
+      'mod+arrowdown'
+
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (isEditableKeyboardTarget(e.target) || hasSelectedText()) return
+
+      const direction = eventMatchesShortcut(e, scrollUpShortcut)
+        ? 'up'
+        : eventMatchesShortcut(e, scrollDownShortcut)
+          ? 'down'
+          : null
+      if (!direction) return
+
+      e.preventDefault()
+      e.stopPropagation()
+      scrollDiffViewer(direction)
+    }
+
+    document.addEventListener('keydown', handleKeyDown, true)
+    return () => document.removeEventListener('keydown', handleKeyDown, true)
+  }, [
+    diffRequest,
+    preferences?.keybindings?.scroll_chat_down,
+    preferences?.keybindings?.scroll_chat_up,
+    scrollDiffViewer,
+  ])
 
   // Handle file selection from sidebar
   // Use transition to keep sidebar responsive while diff renders

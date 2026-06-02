@@ -5,6 +5,7 @@ import {
   Toaster as Sonner,
   toast,
   useSonner,
+  type Action,
   type ToasterProps,
   type ToastT,
 } from 'sonner'
@@ -16,6 +17,17 @@ const TOASTER_Z_INDEX = 2147483647
 
 function isInteractiveTarget(target: EventTarget | null): boolean {
   return target instanceof Element && Boolean(target.closest('button, a'))
+}
+
+function isEditableTarget(target: EventTarget | null): boolean {
+  return (
+    target instanceof HTMLElement &&
+    Boolean(
+      target.closest(
+        'input, textarea, [contenteditable="true"], [contenteditable=""]'
+      )
+    )
+  )
 }
 
 function getToastElement(target: EventTarget | null): Element | null {
@@ -157,6 +169,64 @@ function ToastGestureDismiss({ position }: Pick<ToasterProps, 'position'>) {
   return null
 }
 
+function isToastAction(action: ToastT['action']): action is Action {
+  return (
+    typeof action === 'object' &&
+    action !== null &&
+    'onClick' in action &&
+    typeof action.onClick === 'function'
+  )
+}
+
+export function triggerLatestToastAction(toasts: ToastT[]): boolean {
+  for (let index = toasts.length - 1; index >= 0; index -= 1) {
+    const action = toasts[index]?.action
+    if (!isToastAction(action)) continue
+
+    action.onClick(
+      new MouseEvent('click') as unknown as React.MouseEvent<
+        HTMLButtonElement,
+        MouseEvent
+      >
+    )
+    return true
+  }
+
+  return false
+}
+
+function ToastActionHotkey() {
+  const { toasts } = useSonner()
+  const toastsRef = useRef(toasts)
+
+  useEffect(() => {
+    toastsRef.current = toasts
+  }, [toasts])
+
+  useEffect(() => {
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (
+        event.altKey &&
+        !event.metaKey &&
+        !event.ctrlKey &&
+        !event.shiftKey &&
+        event.code === 'Enter' &&
+        !isEditableTarget(event.target)
+      ) {
+        if (triggerLatestToastAction(toastsRef.current)) {
+          event.preventDefault()
+          event.stopPropagation()
+        }
+      }
+    }
+
+    document.addEventListener('keydown', handleKeyDown)
+    return () => document.removeEventListener('keydown', handleKeyDown)
+  }, [])
+
+  return null
+}
+
 const Toaster = ({ position, style, ...props }: ToasterProps) => {
   const { theme = 'system' } = useTheme()
   const resolvedPosition = position ?? 'bottom-right'
@@ -179,6 +249,7 @@ const Toaster = ({ position, style, ...props }: ToasterProps) => {
         {...props}
       />
       <ToastGestureDismiss position={resolvedPosition} />
+      <ToastActionHotkey />
     </>
   )
 

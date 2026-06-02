@@ -184,6 +184,7 @@ import {
   type WorktreeDropSnapshot,
   type WorktreeReorderDragState,
 } from '@/lib/drag-and-drop/worktree-reorder-ux'
+import { openCanvasConflictResolution } from './conflict-resolution-navigation'
 
 interface ProjectCanvasViewProps {
   projectId: string
@@ -452,6 +453,7 @@ function WorktreeSectionHeader({
   onRowClick,
   onDiffClick,
   onSetLabels,
+  onResolveConflicts,
   disableTextSelection = false,
 }: {
   worktree: Worktree
@@ -469,6 +471,7 @@ function WorktreeSectionHeader({
     type: 'uncommitted' | 'branch'
   ) => void
   onSetLabels?: () => void
+  onResolveConflicts?: (worktree: Worktree) => void
   disableTextSelection?: boolean
 }) {
   const stackedOnPR =
@@ -509,9 +512,17 @@ function WorktreeSectionHeader({
         worktreePath: worktree.path,
         baseBranch: defaultBranch,
         projectId,
+        onMergeConflict: () => onResolveConflicts?.(worktree),
       })
     },
-    [worktree.id, worktree.path, defaultBranch, projectId]
+    [
+      worktree,
+      worktree.id,
+      worktree.path,
+      defaultBranch,
+      projectId,
+      onResolveConflicts,
+    ]
   )
 
   const handlePush = useCallback(
@@ -1042,6 +1053,17 @@ export function ProjectCanvasView({ projectId }: ProjectCanvasViewProps) {
       setSelectedWorktreeModal({ worktreeId, worktreePath })
     },
     [markWorktreeLastUsed]
+  )
+
+  const handleCanvasResolveConflicts = useCallback(
+    (worktree: Worktree) => {
+      openCanvasConflictResolution(worktree, {
+        setPendingMagicCommand: cmd =>
+          useChatStore.getState().setPendingMagicCommand(cmd),
+        openWorktreeModal,
+      })
+    },
+    [openWorktreeModal]
   )
 
   // Build worktree sections with computed card data
@@ -3104,6 +3126,7 @@ export function ProjectCanvasView({ projectId }: ProjectCanvasViewProps) {
                               ? () => openWorktreeLabelModal(section.worktree)
                               : undefined
                           }
+                          onResolveConflicts={handleCanvasResolveConflicts}
                           disableTextSelection={disableWorktreeTextSelection}
                         />
                       </div>

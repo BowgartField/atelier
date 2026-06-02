@@ -602,6 +602,8 @@ mod tests {
         assert!(prompt.contains("Jean MCP/tools"));
         assert!(prompt.contains("VERY IMPORTANT: Keep Code Simple"));
         assert!(prompt.contains("Always implement the simplest maintainable solution"));
+        assert!(prompt.contains("Clickable References"));
+        assert!(prompt.contains("include clickable links when available"));
     }
 
     #[test]
@@ -1337,6 +1339,7 @@ fn default_global_system_prompt() -> String {
 ## Core Principles
 - **Simplicity First**: Make every change as simple as possible. Impact minimal code.
 - **VERY IMPORTANT: Keep Code Simple**: Do not over-engineer. Always implement the simplest maintainable solution. Avoid extra abstractions, frameworks, configuration, or future-proofing unless clearly required.
+- **Clickable References**: When output mentions issues, PRs, security advisories/alerts, Linear issues, or other external resources, include clickable links when available so users can open them directly.
 - **No Laziness**: Find root causes. No temporary fixes. Senior developer standards.
 - **Minimal Impact**: Changes should only touch what's necessary. Avoid introducing bugs.
 

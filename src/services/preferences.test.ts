@@ -141,6 +141,10 @@ describe('model option helpers', () => {
     expect(DEFAULT_GLOBAL_SYSTEM_PROMPT).toContain(
       'Always implement the simplest maintainable solution'
     )
+    expect(DEFAULT_GLOBAL_SYSTEM_PROMPT).toContain('Clickable References')
+    expect(DEFAULT_GLOBAL_SYSTEM_PROMPT).toContain(
+      'include clickable links when available'
+    )
   })
 })
 
@@ -157,9 +161,9 @@ describe('preferences service', () => {
     })
     Object.defineProperty(globalThis, 'ResizeObserver', {
       value: class ResizeObserver {
-        observe() {}
-        unobserve() {}
-        disconnect() {}
+        observe = vi.fn()
+        unobserve = vi.fn()
+        disconnect = vi.fn()
       },
       configurable: true,
     })

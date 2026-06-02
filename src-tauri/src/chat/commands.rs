@@ -47,6 +47,7 @@ const CODEX_DEFAULT_NOT_PLAN_MODE_PROMPT: &str = "\
 ## Not Plan Mode
 
 - **VERY IMPORTANT: Keep Code Simple**: Do not over-engineer. Always implement the simplest maintainable solution. Avoid extra abstractions, frameworks, configuration, or future-proofing unless clearly required.
+- **Clickable References**: When output mentions issues, PRs, security advisories/alerts, Linear issues, or other external resources, include clickable links when available so users can open them directly.
 - After each finished task, please write a few bullet points on how to test the changes.
 - When multiple independent operations are needed, batch them into parallel tool calls. Launch independent Task subagents simultaneously rather than sequentially.
 - When specifying subagent_type for Task tool calls, always use the fully qualified name exactly as listed in the system prompt (e.g., \"code-simplifier:code-simplifier\", not just \"code-simplifier\"). If the agent type contains a colon, include the full namespace:name string.
@@ -7060,6 +7061,8 @@ mod tests {
         assert!(build_prompt.contains("Jean MCP/tools"));
         assert!(build_prompt.contains("VERY IMPORTANT: Keep Code Simple"));
         assert!(build_prompt.contains("Always implement the simplest maintainable solution"));
+        assert!(build_prompt.contains("Clickable References"));
+        assert!(build_prompt.contains("include clickable links when available"));
 
         let yolo_prompt = codex_default_global_system_prompt(Some("yolo"));
         assert!(!yolo_prompt.contains("## Plan Mode"));
@@ -7067,6 +7070,7 @@ mod tests {
         assert!(!yolo_prompt.contains("CodexPlan"));
         assert!(yolo_prompt.contains("## Not Plan Mode"));
         assert!(yolo_prompt.contains("VERY IMPORTANT: Keep Code Simple"));
+        assert!(yolo_prompt.contains("Clickable References"));
     }
 
     #[test]

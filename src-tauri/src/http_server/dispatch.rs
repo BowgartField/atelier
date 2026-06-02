@@ -821,11 +821,13 @@ pub async fn dispatch_command(
             let session_id: String = field(&args, "sessionId", "session_id")?;
             let ghsa_id: String = field(&args, "ghsaId", "ghsa_id")?;
             let project_path: String = field(&args, "projectPath", "project_path")?;
+            let worktree_id: Option<String> = field_opt(&args, "worktreeId", "worktree_id")?;
             let result = crate::projects::get_advisory_context_content(
                 app.clone(),
                 session_id,
                 ghsa_id,
                 project_path,
+                worktree_id,
             )
             .await?;
             to_value(result)
