@@ -80,6 +80,28 @@ fn greet(name: &str) -> String {
     format!("Hello, {name}! You've been greeted from Rust!")
 }
 
+// ── WSL commands ────────────────────────────────────────────────────────
+
+#[tauri::command]
+fn list_wsl_distros() -> Vec<String> {
+    platform::list_wsl_distros()
+}
+
+#[tauri::command]
+fn check_wsl_tool(distro: String, tool: String) -> bool {
+    platform::check_wsl_tool(&distro, &tool)
+}
+
+#[tauri::command]
+fn get_wsl_home_dir(distro: String) -> Result<String, String> {
+    platform::get_wsl_home_dir(&distro)
+}
+
+#[tauri::command]
+fn is_wsl_available() -> bool {
+    platform::is_wsl_available()
+}
+
 // Preferences data structure
 // Only contains settings that should be persisted to disk
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -259,6 +281,12 @@ pub struct AppPreferences {
     pub opencode_cli_source: String, // OpenCode CLI source: "jean" (managed) or "path" (system PATH)
     #[serde(default = "default_cli_source")]
     pub gh_cli_source: String, // GitHub CLI source: "jean" (managed) or "path" (system PATH)
+    #[serde(default)]
+    pub wsl_mode_chosen: bool, // Whether WSL mode selection has been made (prevents re-asking)
+    #[serde(default)]
+    pub wsl_enabled: bool, // Route commands through WSL
+    #[serde(default)]
+    pub wsl_distro: String, // WSL distro name, e.g. "Ubuntu"
     #[serde(default = "default_cli_source")]
     pub coderabbit_cli_source: String, // CodeRabbit CLI source: "jean" (managed) or "path" (system PATH)
     #[serde(default)]
@@ -1706,6 +1734,9 @@ impl Default for AppPreferences {
             codex_cli_source: default_cli_source(),
             opencode_cli_source: default_cli_source(),
             gh_cli_source: default_cli_source(),
+            wsl_mode_chosen: false,
+            wsl_enabled: false,
+            wsl_distro: String::new(),
             coderabbit_cli_source: default_cli_source(),
             expand_tool_calls_by_default: false,
             window_vibrancy: false,
@@ -2112,6 +2143,12 @@ async fn save_preferences(app: AppHandle, preferences: AppPreferences) -> Result
     })?;
 
     log::trace!("Successfully saved preferences to {prefs_path:?}");
+
+    // Keep WSL config cache in sync with saved preferences
+    platform::update_wsl_config(
+        prefs_for_disk.wsl_enabled,
+        prefs_for_disk.wsl_distro.clone(),
+    );
 
     schedule_jean_mcp_socket_sync(app.clone());
 
@@ -3386,6 +3423,34 @@ pub fn run() {
 
             log::info!("Startup: projects loaded + asset scopes registered at {:?}", setup_start.elapsed());
 
+            // Initialize WSL config from preferences (Windows only — no-op on other platforms)
+            {
+                let prefs_handle = app.handle().clone();
+                match load_preferences_sync(&prefs_handle) {
+                    Ok(prefs) => {
+                        let distro = prefs.wsl_distro.trim().to_string();
+                        let wsl_enabled = prefs.wsl_enabled && !distro.is_empty();
+
+                        if prefs.wsl_enabled && distro.is_empty() {
+                            log::warn!(
+                                "WSL was enabled in preferences without a distro; disabling WSL routing until configured"
+                            );
+                        }
+
+                        platform::init_wsl_config(wsl_enabled, distro.clone());
+                        if wsl_enabled {
+                            log::info!("WSL mode enabled with distro: {distro}");
+                        }
+                    }
+                    Err(e) => {
+                        log::warn!("Failed to load preferences for WSL config init: {e}");
+                        platform::init_wsl_config(false, String::new());
+                    }
+                }
+            }
+
+            log::info!("Startup: WSL config initialized at {:?}", setup_start.elapsed());
+
             // Apply window vibrancy / opacity from saved preferences (macOS only).
             // The bundled tauri.conf.json sets `transparent: true` so vibrancy is
             // possible at runtime, but the default preference is opaque. Without
@@ -4001,6 +4066,11 @@ pub fn run() {
             background_tasks::commands::set_remote_poll_interval,
             background_tasks::commands::get_remote_poll_interval,
             background_tasks::commands::trigger_immediate_remote_poll,
+            // WSL commands
+            list_wsl_distros,
+            check_wsl_tool,
+            get_wsl_home_dir,
+            is_wsl_available,
             // HTTP server commands
             start_http_server,
             stop_http_server,

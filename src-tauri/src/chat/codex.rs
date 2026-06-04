@@ -2405,8 +2405,11 @@ fn handle_approval_request(
             let session_id = session_id.to_string();
             let worktree_id = worktree_id.to_string();
             tauri::async_runtime::spawn(async move {
-                match crate::codex_cli::refresh_codex_app_server_auth_tokens(previous_account_id)
-                    .await
+                match crate::codex_cli::refresh_codex_app_server_auth_tokens(
+                    app.clone(),
+                    previous_account_id,
+                )
+                .await
                 {
                     Ok(tokens) => {
                         let payload = match serde_json::to_value(tokens) {
@@ -3755,7 +3758,7 @@ pub fn execute_one_shot_codex(
     working_dir: Option<&std::path::Path>,
     reasoning_effort: Option<&str>,
 ) -> Result<String, String> {
-    let cli_path = crate::codex_cli::resolve_cli_binary(app);
+    let cli_path = crate::codex_cli::resolve_cli_binary(app)?;
 
     if !cli_path.exists() {
         return Err("Codex CLI not installed".to_string());

@@ -6674,7 +6674,7 @@ fn check_mcp_health_claude(app: &AppHandle) -> Result<McpHealthResult, String> {
 }
 
 fn check_mcp_health_codex(app: &AppHandle) -> Result<McpHealthResult, String> {
-    let cli_path = crate::codex_cli::resolve_cli_binary(app);
+    let cli_path = crate::codex_cli::resolve_cli_binary(app)?;
     if !cli_path.exists() {
         return Err("Codex CLI not installed".to_string());
     }

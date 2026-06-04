@@ -1037,6 +1037,9 @@ export interface AppPreferences {
   codex_cli_source: 'jean' | 'path' // Codex CLI source: 'jean' (managed) or 'path' (system PATH)
   opencode_cli_source: 'jean' | 'path' // OpenCode CLI source: 'jean' (managed) or 'path' (system PATH)
   gh_cli_source: 'jean' | 'path' // GitHub CLI source: 'jean' (managed) or 'path' (system PATH)
+  wsl_mode_chosen: boolean // Whether WSL mode selection has been made (prevents re-asking on Windows)
+  wsl_enabled: boolean // Route commands through WSL
+  wsl_distro: string // WSL distro name, e.g. "Ubuntu"
   coderabbit_cli_source?: 'jean' | 'path' // CodeRabbit CLI source: 'jean' (managed) or 'path' (system PATH)
   expand_tool_calls_by_default: boolean // Expand all tool call collapsibles by default
   window_vibrancy: boolean // macOS window vibrancy effect (high GPU cost, default false)
@@ -1836,6 +1839,9 @@ export const defaultPreferences: AppPreferences = {
   codex_cli_source: 'jean', // Default: Jean-managed
   opencode_cli_source: 'jean', // Default: Jean-managed
   gh_cli_source: 'jean', // Default: Jean-managed
+  wsl_mode_chosen: false, // Default: not yet chosen
+  wsl_enabled: false, // Default: native Windows
+  wsl_distro: '', // Default: empty
   coderabbit_cli_source: 'jean', // Default: Jean-managed
   expand_tool_calls_by_default: false, // Default: collapsed
   window_vibrancy: false, // Default: disabled (high GPU cost)
