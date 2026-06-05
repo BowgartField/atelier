@@ -1252,6 +1252,18 @@ fn delete_pasted_file(path: &str) {
     }
 }
 
+fn plan_mode_content_waits_for_approval(
+    backend: &Backend,
+    execution_mode: Option<&str>,
+    has_content: bool,
+    has_plan_tool: bool,
+) -> bool {
+    matches!(backend, Backend::Codex | Backend::Opencode)
+        && execution_mode == Some("plan")
+        && has_content
+        && !has_plan_tool
+}
+
 /// Close/delete a session tab
 /// Returns the new active session ID (if any)
 /// Also cleans up any pasted images and text files associated with the session
@@ -3870,13 +3882,15 @@ pub async fn send_chat_message(
         .tool_calls
         .iter()
         .any(|tc| tc.name == "ExitPlanMode" || tc.name == "CodexPlan");
-    let is_plan_mode_with_content = match response_backend {
-        Backend::Opencode => {
-            execution_mode.as_deref() == Some("plan") && has_content && !has_plan_tool
-        }
-        Backend::Commandcode => unified_response.waiting_for_plan,
-        Backend::Cursor => false, // Plan approval only on real createPlanToolCall / interaction_query
-        _ => false,
+    let is_plan_mode_with_content = if response_backend == Backend::Commandcode {
+        unified_response.waiting_for_plan
+    } else {
+        plan_mode_content_waits_for_approval(
+            &response_backend,
+            execution_mode.as_deref(),
+            has_content,
+            has_plan_tool,
+        )
     };
 
     // Create assistant message with tool calls and content blocks
@@ -7211,6 +7225,50 @@ mod tests {
         assert!(yolo.contains("Start implementing immediately"));
         assert!(yolo.contains("Do NOT call update_plan/emit CodexPlan"));
         assert!(yolo.contains("Do not ask for confirmation"));
+    }
+
+    #[test]
+    fn test_codex_plan_mode_content_waits_for_approval_without_plan_tool() {
+        assert!(plan_mode_content_waits_for_approval(
+            &Backend::Codex,
+            Some("plan"),
+            true,
+            false
+        ));
+    }
+
+    #[test]
+    fn test_plan_mode_content_waiting_does_not_override_existing_plan_tools_or_non_plan_modes() {
+        assert!(!plan_mode_content_waits_for_approval(
+            &Backend::Codex,
+            Some("plan"),
+            true,
+            true
+        ));
+        assert!(!plan_mode_content_waits_for_approval(
+            &Backend::Codex,
+            Some("build"),
+            true,
+            false
+        ));
+        assert!(!plan_mode_content_waits_for_approval(
+            &Backend::Claude,
+            Some("plan"),
+            true,
+            false
+        ));
+        assert!(!plan_mode_content_waits_for_approval(
+            &Backend::Cursor,
+            Some("plan"),
+            true,
+            false
+        ));
+        assert!(!plan_mode_content_waits_for_approval(
+            &Backend::Commandcode,
+            Some("plan"),
+            true,
+            false
+        ));
     }
 
     #[test]

@@ -132,6 +132,20 @@ export function sessionCanBeWaiting(session: Session): boolean {
   )
 }
 
+function hasLegacyPendingPlanWaiting(session: Session): boolean {
+  if (
+    session.last_run_status !== 'completed' ||
+    session.waiting_for_input_type !== 'plan' ||
+    !session.pending_plan_message_id
+  ) {
+    return false
+  }
+
+  return !new Set(session.approved_plan_message_ids ?? []).has(
+    session.pending_plan_message_id
+  )
+}
+
 export function getEffectiveSessionWaiting(
   session: Session,
   storeState: Pick<
@@ -142,6 +156,7 @@ export function getEffectiveSessionWaiting(
   const canBeWaiting = sessionCanBeWaiting(session)
   if (!canBeWaiting) return false
   if (session.waiting_for_input ?? false) return true
+  if (hasLegacyPendingPlanWaiting(session)) return true
   const isInReviewState =
     storeState.reviewingSessions[session.id] || !!session.review_results
   if (isInReviewState) return false
@@ -207,7 +222,9 @@ export function computeSessionCardData(
 
   // Use persisted waiting_for_input flag from session metadata
   const persistedWaitingForInput =
-    runCanBeWaiting && (session.waiting_for_input ?? false)
+    runCanBeWaiting &&
+    ((session.waiting_for_input ?? false) ||
+      hasLegacyPendingPlanWaiting(session))
 
   // Check if there are approved plan message IDs
   const approvedPlanIds = new Set(session.approved_plan_message_ids ?? [])

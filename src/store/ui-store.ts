@@ -312,7 +312,10 @@ export const useUIStore = create<UIState>()(
 
       setLeftSidebarVisible: visible =>
         set(
-          { leftSidebarVisible: visible },
+          state =>
+            state.leftSidebarVisible === visible
+              ? state
+              : { leftSidebarVisible: visible },
           undefined,
           'setLeftSidebarVisible'
         ),
@@ -325,11 +328,19 @@ export const useUIStore = create<UIState>()(
         ),
 
       setLeftSidebarSize: size =>
-        set({ leftSidebarSize: size }, undefined, 'setLeftSidebarSize'),
+        set(
+          state =>
+            state.leftSidebarSize === size ? state : { leftSidebarSize: size },
+          undefined,
+          'setLeftSidebarSize'
+        ),
 
       setRightSidebarVisible: visible =>
         set(
-          { rightSidebarVisible: visible },
+          state =>
+            state.rightSidebarVisible === visible
+              ? state
+              : { rightSidebarVisible: visible },
           undefined,
           'setRightSidebarVisible'
         ),
@@ -342,7 +353,14 @@ export const useUIStore = create<UIState>()(
         ),
 
       setCommandPaletteOpen: open =>
-        set({ commandPaletteOpen: open }, undefined, 'setCommandPaletteOpen'),
+        set(
+          state =>
+            state.commandPaletteOpen === open
+              ? state
+              : { commandPaletteOpen: open },
+          undefined,
+          'setCommandPaletteOpen'
+        ),
 
       togglePreferences: () =>
         set(
@@ -353,36 +371,67 @@ export const useUIStore = create<UIState>()(
 
       setPreferencesOpen: open =>
         set(
-          { preferencesOpen: open, preferencesPane: open ? null : null },
+          state =>
+            state.preferencesOpen === open && state.preferencesPane === null
+              ? state
+              : { preferencesOpen: open, preferencesPane: null },
           undefined,
           'setPreferencesOpen'
         ),
 
       openPreferencesPane: pane =>
         set(
-          { preferencesOpen: true, preferencesPane: pane },
+          state =>
+            state.preferencesOpen && state.preferencesPane === pane
+              ? state
+              : { preferencesOpen: true, preferencesPane: pane },
           undefined,
           'openPreferencesPane'
         ),
 
       setCommitModalOpen: open =>
-        set({ commitModalOpen: open }, undefined, 'setCommitModalOpen'),
+        set(
+          state =>
+            state.commitModalOpen === open ? state : { commitModalOpen: open },
+          undefined,
+          'setCommitModalOpen'
+        ),
 
       setOnboardingOpen: open =>
-        set({ onboardingOpen: open }, undefined, 'setOnboardingOpen'),
+        set(
+          state =>
+            state.onboardingOpen === open ? state : { onboardingOpen: open },
+          undefined,
+          'setOnboardingOpen'
+        ),
 
       setOnboardingManuallyTriggered: triggered =>
         set(
-          { onboardingManuallyTriggered: triggered },
+          state =>
+            state.onboardingManuallyTriggered === triggered
+              ? state
+              : { onboardingManuallyTriggered: triggered },
           undefined,
           'setOnboardingManuallyTriggered'
         ),
 
       setOnboardingStartStep: step =>
-        set({ onboardingStartStep: step }, undefined, 'setOnboardingStartStep'),
+        set(
+          state =>
+            state.onboardingStartStep === step
+              ? state
+              : { onboardingStartStep: step },
+          undefined,
+          'setOnboardingStartStep'
+        ),
 
       setOpenInModalOpen: open =>
-        set({ openInModalOpen: open }, undefined, 'setOpenInModalOpen'),
+        set(
+          state =>
+            state.openInModalOpen === open ? state : { openInModalOpen: open },
+          undefined,
+          'setOpenInModalOpen'
+        ),
 
       openRemotePicker: (repoPath, callback) => {
         _remotePickerCallback = callback
@@ -410,19 +459,30 @@ export const useUIStore = create<UIState>()(
 
       setLoadContextModalOpen: open =>
         set(
-          { loadContextModalOpen: open },
+          state =>
+            state.loadContextModalOpen === open
+              ? state
+              : { loadContextModalOpen: open },
           undefined,
           'setLoadContextModalOpen'
         ),
       setLinkedProjectsModalOpen: open =>
         set(
-          { linkedProjectsModalOpen: open },
+          state =>
+            state.linkedProjectsModalOpen === open
+              ? state
+              : { linkedProjectsModalOpen: open },
           undefined,
           'setLinkedProjectsModalOpen'
         ),
 
       setMagicModalOpen: open =>
-        set({ magicModalOpen: open }, undefined, 'setMagicModalOpen'),
+        set(
+          state =>
+            state.magicModalOpen === open ? state : { magicModalOpen: open },
+          undefined,
+          'setMagicModalOpen'
+        ),
 
       setResolveConflictsDialogOpen: open =>
         set(
@@ -456,7 +516,14 @@ export const useUIStore = create<UIState>()(
         ),
 
       setUpdatePrModalOpen: open =>
-        set({ updatePrModalOpen: open }, undefined, 'setUpdatePrModalOpen'),
+        set(
+          state =>
+            state.updatePrModalOpen === open
+              ? state
+              : { updatePrModalOpen: open },
+          undefined,
+          'setUpdatePrModalOpen'
+        ),
       setReviewCommentsModalOpen: open =>
         set(
           { reviewCommentsModalOpen: open },
@@ -838,7 +905,14 @@ export const useUIStore = create<UIState>()(
         ),
 
       setGitDiffModalOpen: (open: boolean) =>
-        set({ gitDiffModalOpen: open }, undefined, 'setGitDiffModalOpen'),
+        set(
+          state =>
+            state.gitDiffModalOpen === open
+              ? state
+              : { gitDiffModalOpen: open },
+          undefined,
+          'setGitDiffModalOpen'
+        ),
 
       toggleGitDiffSelectedFile: (filePath: string) =>
         set(
@@ -863,34 +937,67 @@ export const useUIStore = create<UIState>()(
         ),
 
       setPlanDialogOpen: (open: boolean) =>
-        set({ planDialogOpen: open }, undefined, 'setPlanDialogOpen'),
+        set(
+          state =>
+            state.planDialogOpen === open ? state : { planDialogOpen: open },
+          undefined,
+          'setPlanDialogOpen'
+        ),
 
       setContextViewerOpen: (open: boolean) =>
-        set({ contextViewerOpen: open }, undefined, 'setContextViewerOpen'),
+        set(
+          state =>
+            state.contextViewerOpen === open
+              ? state
+              : { contextViewerOpen: open },
+          undefined,
+          'setContextViewerOpen'
+        ),
 
       setFeatureTourOpen: (open: boolean) =>
-        set({ featureTourOpen: open }, undefined, 'setFeatureTourOpen'),
+        set(
+          state =>
+            state.featureTourOpen === open ? state : { featureTourOpen: open },
+          undefined,
+          'setFeatureTourOpen'
+        ),
 
       setJeanMcpIntroOpen: (open: boolean) =>
-        set({ jeanMcpIntroOpen: open }, undefined, 'setJeanMcpIntroOpen'),
+        set(
+          state =>
+            state.jeanMcpIntroOpen === open
+              ? state
+              : { jeanMcpIntroOpen: open },
+          undefined,
+          'setJeanMcpIntroOpen'
+        ),
 
       setUIStateInitialized: (initialized: boolean) =>
         set(
-          { uiStateInitialized: initialized },
+          state =>
+            state.uiStateInitialized === initialized
+              ? state
+              : { uiStateInitialized: initialized },
           undefined,
           'setUIStateInitialized'
         ),
 
       setPendingUpdateVersion: (version: string | null) =>
         set(
-          { pendingUpdateVersion: version },
+          state =>
+            state.pendingUpdateVersion === version
+              ? state
+              : { pendingUpdateVersion: version },
           undefined,
           'setPendingUpdateVersion'
         ),
 
       setUpdateModalVersion: (version: string | null) =>
         set(
-          { updateModalVersion: version },
+          state =>
+            state.updateModalVersion === version
+              ? state
+              : { updateModalVersion: version },
           undefined,
           'setUpdateModalVersion'
         ),
@@ -906,7 +1013,14 @@ export const useUIStore = create<UIState>()(
         ),
 
       setGitHubDashboardOpen: (open: boolean) =>
-        set({ githubDashboardOpen: open }, undefined, 'setGitHubDashboardOpen'),
+        set(
+          state =>
+            state.githubDashboardOpen === open
+              ? state
+              : { githubDashboardOpen: open },
+          undefined,
+          'setGitHubDashboardOpen'
+        ),
     }),
     {
       name: 'ui-store',

@@ -937,6 +937,20 @@ impl SessionMetadata {
             last_run.map(|r| &r.status),
             last_run.and_then(|r| r.execution_mode.as_ref())
         );
+        let is_pending_plan_waiting =
+            self.pending_plan_message_id
+                .as_ref()
+                .is_some_and(|message_id| {
+                    self.waiting_for_input_type.as_deref() == Some("plan")
+                        && !self.approved_plan_message_ids.contains(message_id)
+                        && last_run.is_some_and(|run| {
+                            run.status == RunStatus::Completed
+                                && run.execution_mode.as_deref() == Some("plan")
+                        })
+                });
+        let waiting_for_input = self.waiting_for_input || is_pending_plan_waiting;
+        let is_reviewing = self.is_reviewing && !is_pending_plan_waiting;
+
         let updated_at = self
             .runs
             .last()
@@ -989,8 +1003,8 @@ impl SessionMetadata {
                 .pending_codex_dynamic_tool_call_requests
                 .clone(),
             denied_message_context: self.denied_message_context.clone(),
-            is_reviewing: self.is_reviewing,
-            waiting_for_input: self.waiting_for_input,
+            is_reviewing,
+            waiting_for_input,
             waiting_for_input_type: self.waiting_for_input_type.clone(),
             approved_plan_message_ids: self.approved_plan_message_ids.clone(),
             plan_file_path: self.plan_file_path.clone(),
@@ -1933,6 +1947,48 @@ mod tests {
             session.terminal_command_args
         );
         assert_eq!(restored.terminal_label.as_deref(), Some("Codex"));
+    }
+
+    #[test]
+    fn test_session_metadata_to_session_recovers_pending_plan_waiting_state() {
+        let mut metadata = SessionMetadata::new(
+            "sess-plan".to_string(),
+            "wt-456".to_string(),
+            "Codex Plan".to_string(),
+            0,
+        );
+        metadata.backend = Backend::Codex;
+        metadata.is_reviewing = true;
+        metadata.waiting_for_input = false;
+        metadata.waiting_for_input_type = Some("plan".to_string());
+        metadata.pending_plan_message_id = Some("plan-message-1".to_string());
+        metadata.runs.push(RunEntry {
+            run_id: "run-1".to_string(),
+            user_message_id: "msg-1".to_string(),
+            user_message: "make a plan".to_string(),
+            model: None,
+            execution_mode: Some("plan".to_string()),
+            thinking_level: None,
+            effort_level: None,
+            started_at: 1,
+            ended_at: Some(2),
+            status: RunStatus::Completed,
+            assistant_message_id: Some("assistant-1".to_string()),
+            cancelled: false,
+            recovered: false,
+            claude_session_id: None,
+            pid: None,
+            usage: None,
+            codex_thread_id: Some("thread-1".to_string()),
+            codex_turn_id: None,
+            cursor_chat_id: None,
+        });
+
+        let restored = metadata.to_session();
+
+        assert!(restored.waiting_for_input);
+        assert_eq!(restored.waiting_for_input_type.as_deref(), Some("plan"));
+        assert!(!restored.is_reviewing);
     }
 
     #[test]
