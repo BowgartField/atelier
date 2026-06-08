@@ -841,8 +841,12 @@ fn clone_superpowers_skills_dir() -> Result<PathBuf, String> {
 }
 
 fn download_superpowers_skills_dir(temp: &Path) -> Result<PathBuf, String> {
+    use std::time::Duration;
+
     let response = reqwest::blocking::Client::builder()
         .user_agent("jean-superpowers-installer")
+        .timeout(Duration::from_secs(60))
+        .connect_timeout(Duration::from_secs(10))
         .build()
         .map_err(|e| format!("Failed to build HTTP client: {e}"))?
         .get(SUPERPOWERS_ARCHIVE_URL)
