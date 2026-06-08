@@ -2,8 +2,10 @@ import { describe, expect, it } from 'vitest'
 import type { LabelData } from '@/types/chat'
 import type { Worktree } from '@/types/projects'
 import {
+  mergePinnedLabels,
   getPinnedWorktreeLabelTabs,
   getWorktreeLabels,
+  setLabelPinned,
   updateWorktreeLabelsByName,
 } from './worktree-labels'
 
@@ -51,6 +53,23 @@ describe('updateWorktreeLabelsByName', () => {
 })
 
 describe('getPinnedWorktreeLabelTabs', () => {
+  it('shows project-pinned labels even when no worktree currently has that label', () => {
+    const tabs = getPinnedWorktreeLabelTabs(
+      [worktree('one', [{ name: 'Bug', color: '#eab308' }])],
+      [{ name: 'Feature', color: '#22c55e', pinned: true }]
+    )
+
+    expect(tabs).toEqual([
+      {
+        value: 'label:feature',
+        label: 'Feature',
+        color: '#22c55e',
+        count: 0,
+        labelName: 'Feature',
+      },
+    ])
+  })
+
   it('counts every worktree with a pinned label name, even when only one instance is pinned', () => {
     const tabs = getPinnedWorktreeLabelTabs([
       worktree('one', [{ name: 'v4.2', color: '#84cc16', pinned: true }]),
@@ -112,5 +131,34 @@ describe('getPinnedWorktreeLabelTabs', () => {
         labelName: 'Blocked',
       },
     ])
+  })
+})
+
+describe('mergePinnedLabels', () => {
+  it('applies project pinned metadata without requiring the label to be selected', () => {
+    expect(
+      mergePinnedLabels(
+        [{ name: 'Bug', color: '#eab308' }],
+        [{ name: 'Bug', color: '#22c55e', pinned: true }]
+      )
+    ).toEqual([{ name: 'Bug', color: '#eab308', pinned: true }])
+  })
+})
+
+describe('setLabelPinned', () => {
+  it('adds an unassigned label to the project pinned registry', () => {
+    expect(
+      setLabelPinned([], { name: 'Feature', color: '#22c55e' }, true)
+    ).toEqual([{ name: 'Feature', color: '#22c55e', pinned: true }])
+  })
+
+  it('removes a label from the project pinned registry when unpinned', () => {
+    expect(
+      setLabelPinned(
+        [{ name: 'Feature', color: '#22c55e', pinned: true }],
+        { name: 'Feature', color: '#22c55e', pinned: true },
+        false
+      )
+    ).toEqual([])
   })
 })

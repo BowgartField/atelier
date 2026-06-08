@@ -111,6 +111,8 @@ import { getLabelTextColor } from '@/lib/label-colors'
 import {
   getWorktreeLabels,
   getPinnedWorktreeLabelTabs,
+  mergePinnedLabels,
+  setLabelPinned,
   type PinnedWorktreeLabelTab,
   updateWorktreeLabelsByName,
 } from '@/lib/worktree-labels'
@@ -877,6 +879,9 @@ export function ProjectCanvasView({ projectId }: ProjectCanvasViewProps) {
     state =>
       state.projectCanvasSettings[projectId]?.worktreeSortMode ?? 'created'
   )
+  const projectPinnedLabels = useProjectsStore(
+    state => state.projectCanvasSettings[projectId]?.pinnedLabels ?? []
+  )
 
   // Project action mutations
   const createBaseSession = useCreateBaseSession()
@@ -979,8 +984,8 @@ export function ProjectCanvasView({ projectId }: ProjectCanvasViewProps) {
   }, [visibleWorktrees])
 
   const pinnedLabelTabs = useMemo(
-    () => getPinnedWorktreeLabelTabs(visibleWorktrees),
-    [visibleWorktrees]
+    () => getPinnedWorktreeLabelTabs(visibleWorktrees, projectPinnedLabels),
+    [visibleWorktrees, projectPinnedLabels]
   )
 
   const canvasFilterTabs = useMemo<CanvasFilterTabItem[]>(
@@ -1003,6 +1008,7 @@ export function ProjectCanvasView({ projectId }: ProjectCanvasViewProps) {
   // All worktree labels (unfiltered by search) for the label modal
   const allWorktreeLabels = useMemo(() => {
     const labels: LabelData[] = []
+    labels.push(...projectPinnedLabels)
     for (const wt of readyWorktrees) {
       labels.push(...getWorktreeLabels(wt))
     }
@@ -1010,7 +1016,7 @@ export function ProjectCanvasView({ projectId }: ProjectCanvasViewProps) {
       labels.push(...getWorktreeLabels(wt))
     }
     return labels
-  }, [readyWorktrees, pendingWorktrees])
+  }, [projectPinnedLabels, readyWorktrees, pendingWorktrees])
 
   // Load sessions for all worktrees dynamically using useQueries
   const sessionQueries = useQueries({
@@ -2248,13 +2254,19 @@ export function ProjectCanvasView({ projectId }: ProjectCanvasViewProps) {
     currentLabels: LabelData[]
   } | null>(null)
 
-  const openWorktreeLabelModal = useCallback((worktree: Worktree) => {
-    setWorktreeLabelTarget({
-      worktreeId: worktree.id,
-      currentLabels: getWorktreeLabels(worktree),
-    })
-    setWorktreeLabelModalOpen(true)
-  }, [])
+  const openWorktreeLabelModal = useCallback(
+    (worktree: Worktree) => {
+      setWorktreeLabelTarget({
+        worktreeId: worktree.id,
+        currentLabels: mergePinnedLabels(
+          getWorktreeLabels(worktree),
+          projectPinnedLabels
+        ),
+      })
+      setWorktreeLabelModalOpen(true)
+    },
+    [projectPinnedLabels]
+  )
 
   // Listen for toggle-session-label event — open label modal for worktree
   useEffect(() => {
@@ -2366,8 +2378,88 @@ export function ProjectCanvasView({ projectId }: ProjectCanvasViewProps) {
     [worktreeLabelTarget, queryClient, projectId]
   )
 
+  const handleLabelPinnedChange = useCallback(
+    async (label: LabelData, pinned: boolean) => {
+      const nextPinnedLabels = setLabelPinned(
+        projectPinnedLabels,
+        label,
+        pinned
+      )
+
+      useProjectsStore
+        .getState()
+        .setProjectCanvasPinnedLabels(projectId, nextPinnedLabels)
+
+      const worktreesToUpdate = worktreeSections
+        .map(s => s.worktree)
+        .filter(wt =>
+          getWorktreeLabels(wt).some(
+            existing => existing.name.toLowerCase() === label.name.toLowerCase()
+          )
+        )
+
+      if (worktreesToUpdate.length > 0) {
+        const results = await Promise.allSettled(
+          worktreesToUpdate.map(wt =>
+            invoke('update_worktree_labels', {
+              worktreeId: wt.id,
+              labels: getWorktreeLabels(wt).map(existing =>
+                existing.name.toLowerCase() === label.name.toLowerCase()
+                  ? { ...existing, pinned }
+                  : existing
+              ),
+            })
+          )
+        )
+
+        const failures = results.filter(r => r.status === 'rejected')
+        if (failures.length > 0) {
+          toast.error(
+            `Failed to update pinned state for ${failures.length} worktree(s)`
+          )
+        }
+
+        queryClient.invalidateQueries({
+          queryKey: projectsQueryKeys.worktrees(projectId),
+        })
+      }
+
+      setWorktreeLabelTarget(target =>
+        target
+          ? {
+              ...target,
+              currentLabels: mergePinnedLabels(
+                target.currentLabels.map(existing =>
+                  existing.name.toLowerCase() === label.name.toLowerCase()
+                    ? { ...existing, pinned }
+                    : existing
+                ),
+                nextPinnedLabels
+              ),
+            }
+          : target
+      )
+    },
+    [projectId, projectPinnedLabels, queryClient, worktreeSections]
+  )
+
   const handleLabelColorChange = useCallback(
     async (labelName: string, newColor: string) => {
+      if (
+        projectPinnedLabels.some(
+          label => label.name.toLowerCase() === labelName.toLowerCase()
+        )
+      ) {
+        useProjectsStore.getState().setProjectCanvasPinnedLabels(
+          projectId,
+          projectPinnedLabels.map(label =>
+            label.name.toLowerCase() === labelName.toLowerCase()
+              ? { ...label, color: newColor }
+              : label
+          )
+        )
+      }
+
       const worktreesToUpdate = worktreeSections
         .map(s => s.worktree)
         .filter(wt =>
@@ -2398,7 +2490,7 @@ export function ProjectCanvasView({ projectId }: ProjectCanvasViewProps) {
         queryKey: projectsQueryKeys.worktrees(projectId),
       })
     },
-    [worktreeSections, queryClient, projectId]
+    [projectId, projectPinnedLabels, worktreeSections, queryClient]
   )
 
   // Keyboard navigation - disable when any modal/dialog is open
@@ -3267,6 +3359,7 @@ export function ProjectCanvasView({ projectId }: ProjectCanvasViewProps) {
         mode="multi"
         onApplyLabels={handleWorktreeLabelApply}
         onColorChange={handleLabelColorChange}
+        onPinnedChange={handleLabelPinnedChange}
         extraLabels={allWorktreeLabels}
       />
 

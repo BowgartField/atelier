@@ -1,9 +1,11 @@
 import { create } from 'zustand'
 import { devtools } from 'zustand/middleware'
+import type { LabelData } from '@/types/chat'
 import type { WorktreeSortMode } from '@/types/projects'
 
 export interface ProjectCanvasSettings {
   worktreeSortMode?: WorktreeSortMode
+  pinnedLabels?: LabelData[]
 }
 
 interface ProjectsUIState {
@@ -103,6 +105,10 @@ interface ProjectsUIState {
   setProjectCanvasWorktreeSortMode: (
     projectId: string,
     sortMode: WorktreeSortMode
+  ) => void
+  setProjectCanvasPinnedLabels: (
+    projectId: string,
+    pinnedLabels: LabelData[]
   ) => void
 }
 
@@ -282,6 +288,32 @@ export const useProjectsStore = create<ProjectsUIState>()(
           },
           undefined,
           'setProjectCanvasWorktreeSortMode'
+        ),
+
+      setProjectCanvasPinnedLabels: (projectId, pinnedLabels) =>
+        set(
+          state => {
+            const currentPinnedLabels =
+              state.projectCanvasSettings[projectId]?.pinnedLabels ?? []
+            if (
+              JSON.stringify(currentPinnedLabels) ===
+              JSON.stringify(pinnedLabels)
+            ) {
+              return state
+            }
+
+            return {
+              projectCanvasSettings: {
+                ...state.projectCanvasSettings,
+                [projectId]: {
+                  ...state.projectCanvasSettings[projectId],
+                  pinnedLabels,
+                },
+              },
+            }
+          },
+          undefined,
+          'setProjectCanvasPinnedLabels'
         ),
 
       // Folder expansion actions

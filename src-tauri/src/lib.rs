@@ -1901,6 +1901,8 @@ pub struct BrowserTabPersisted {
 pub struct ProjectCanvasSettings {
     #[serde(default)]
     pub worktree_sort_mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pinned_labels: Vec<crate::chat::types::LabelData>,
 }
 
 impl Default for UIState {
