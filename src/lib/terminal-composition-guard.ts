@@ -18,18 +18,23 @@
  * sequences (real IME input: CJK preedit, etc.) pass through untouched, which
  * also makes the guard a no-op on platforms that don't have this quirk.
  *
+ * Balance is tracked per source element: a `compositionend` is only "balanced"
+ * (and forwarded) when it targets the same element that opened the composition.
+ * This keeps the guard correct even if several composition-capable descendants
+ * ever live under `root`.
+ *
  * Returns a cleanup function removing the listeners.
  */
 export function attachOrphanCompositionEndGuard(root: HTMLElement): () => void {
-  let sawCompositionStart = false
+  let compositionTarget: EventTarget | null = null
 
-  const onCompositionStart = (): void => {
-    sawCompositionStart = true
+  const onCompositionStart = (event: Event): void => {
+    compositionTarget = event.target
   }
 
   const onCompositionEnd = (event: Event): void => {
-    if (sawCompositionStart) {
-      sawCompositionStart = false
+    if (compositionTarget !== null && event.target === compositionTarget) {
+      compositionTarget = null
       return
     }
     event.stopPropagation()

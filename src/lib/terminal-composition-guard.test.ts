@@ -72,6 +72,19 @@ describe('attachOrphanCompositionEndGuard', () => {
     expect(received).toEqual([])
   })
 
+  it('swallows an end whose target differs from the open composition', () => {
+    // A compositionstart on a sibling element must not "balance" a
+    // compositionend fired by xterm's textarea (the orphan path).
+    const sibling = document.createElement('input')
+    root.appendChild(sibling)
+    attachOrphanCompositionEndGuard(root)
+
+    sibling.dispatchEvent(new Event('compositionstart', { bubbles: true }))
+    dispatch('compositionend') // fired by textarea, not the sibling
+
+    expect(received).toEqual([])
+  })
+
   it('stops guarding after cleanup', () => {
     const cleanup = attachOrphanCompositionEndGuard(root)
     cleanup()

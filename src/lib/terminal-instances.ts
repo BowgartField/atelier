@@ -998,6 +998,10 @@ export async function attachToContainer(
     terminal.open(hostElement)
     disableGhosttyScrollbar(instance)
     instance.touchScrollCleanup = attachTouchScroll(instance)
+    // Re-run-safe: drop any prior guard before (re)attaching so a reattach
+    // can never leak listeners on a stale host or register duplicates.
+    instance.compositionGuardCleanup?.()
+    instance.compositionGuardCleanup = null
     if (instance.renderer === 'xterm') {
       // WebKitGTK+ibus fires compositionend without compositionstart for
       // composed chars (é, ç…), which makes xterm.js re-send accumulated
