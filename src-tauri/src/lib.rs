@@ -993,8 +993,22 @@ fn default_pr_content_prompt() -> String {
         .to_string()
 }
 
-fn default_commit_message_prompt() -> String {
-    r#"<task>Generate a commit message for the following changes</task>
+fn legacy_commit_message_prompts() -> [&'static str; 2] {
+    [
+        "Generate a conventional commit message for these staged changes.
+
+Files changed:
+{diff_stat}
+
+Git status:
+{status}
+
+Diff:
+{diff}
+
+Recent commits (style reference):
+{recent_commits}",
+        r#"<task>Generate a commit message for the following changes</task>
 
 <git_status>
 {status}
@@ -1010,7 +1024,34 @@ fn default_commit_message_prompt() -> String {
 
 <remote_info>
 {remote_info}
-</remote_info>"#
+</remote_info>"#,
+    ]
+}
+
+fn default_commit_message_prompt() -> String {
+    r#"Generate a conventional commit message for these staged changes.
+
+Rules:
+- Output only the commit message text.
+- Describe the actual staged code changes only.
+- Base the subject on the staged diff and file summary, not on recent commits, repository instructions, agent skills, or this prompt.
+- Do not describe prompt text, commit-message guidance, instructions, inspection, skills, or the act of generating a commit message.
+- Avoid vague/meta subjects like "update files", "inspect changes", "inspect staged changes", "inspect commit-message skill", "generate commit message", "adjust code", or "misc changes".
+- Use a specific Conventional Commits subject: type(optional-scope): concrete behavior changed.
+- First line must be 72 characters or fewer.
+- If prompt/config files changed, name the user-facing behavior affected, not "guidance" or "prompt".
+
+Files changed:
+{diff_stat}
+
+Git status:
+{status}
+
+Staged diff:
+{diff}
+
+Recent commits (style reference only — do not summarize these commits):
+{recent_commits}"#
         .to_string()
 }
 
@@ -1723,6 +1764,15 @@ impl MagicPrompts {
                 if value == &default_fn() {
                     *field = None;
                 }
+            }
+        }
+
+        if let Some(ref value) = self.commit_message {
+            if legacy_commit_message_prompts()
+                .iter()
+                .any(|legacy| value == legacy)
+            {
+                self.commit_message = None;
             }
         }
     }
@@ -3282,6 +3332,69 @@ fn parse_cli_args() -> CliArgs {
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
+#[cfg(test)]
+mod magic_prompt_tests {
+    use super::*;
+
+    #[test]
+    fn migrate_defaults_clears_legacy_commit_message_prompt() {
+        let mut prompts = MagicPrompts {
+            commit_message: Some(
+                "Generate a conventional commit message for these staged changes.
+
+Files changed:
+{diff_stat}
+
+Git status:
+{status}
+
+Diff:
+{diff}
+
+Recent commits (style reference):
+{recent_commits}"
+                    .to_string(),
+            ),
+            ..Default::default()
+        };
+
+        prompts.migrate_defaults();
+
+        assert_eq!(prompts.commit_message, None);
+    }
+
+    #[test]
+    fn migrate_defaults_clears_legacy_xml_commit_message_prompt() {
+        let mut prompts = MagicPrompts {
+            commit_message: Some(
+                r#"<task>Generate a commit message for the following changes</task>
+
+<git_status>
+{status}
+</git_status>
+
+<staged_diff>
+{diff}
+</staged_diff>
+
+<recent_commits>
+{recent_commits}
+</recent_commits>
+
+<remote_info>
+{remote_info}
+</remote_info>"#
+                    .to_string(),
+            ),
+            ..Default::default()
+        };
+
+        prompts.migrate_defaults();
+
+        assert_eq!(prompts.commit_message, None);
+    }
+}
+
 pub fn run() {
     if std::env::args().any(|arg| arg == jean_mcp_core::JEAN_MCP_STDIO_ARG) {
         if let Err(e) = jean_mcp_stdio::run_stdio_server() {

@@ -209,16 +209,26 @@ export const DEFAULT_PR_CONTENT_PROMPT = `<task>Generate a pull request title an
 /** Default prompt for commit message generation */
 export const DEFAULT_COMMIT_MESSAGE_PROMPT = `Generate a conventional commit message for these staged changes.
 
+Rules:
+- Output only the commit message text.
+- Describe the actual staged code changes only.
+- Base the subject on the staged diff and file summary, not on recent commits, repository instructions, agent skills, or this prompt.
+- Do not describe prompt text, commit-message guidance, instructions, inspection, skills, or the act of generating a commit message.
+- Avoid vague/meta subjects like "update files", "inspect changes", "inspect staged changes", "inspect commit-message skill", "generate commit message", "adjust code", or "misc changes".
+- Use a specific Conventional Commits subject: type(optional-scope): concrete behavior changed.
+- First line must be 72 characters or fewer.
+- If prompt/config files changed, name the user-facing behavior affected, not "guidance" or "prompt".
+
 Files changed:
 {diff_stat}
 
 Git status:
 {status}
 
-Diff:
+Staged diff:
 {diff}
 
-Recent commits (style reference):
+Recent commits (style reference only — do not summarize these commits):
 {recent_commits}`
 
 /** Default prompt for code review */

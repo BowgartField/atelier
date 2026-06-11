@@ -6891,12 +6891,14 @@ const COMMIT_MESSAGE_SCHEMA: &str = r#"{"type":"object","properties":{"message":
 const COMMIT_MESSAGE_PROMPT: &str = r#"Generate a conventional commit message for these staged changes.
 
 Rules:
-- Output a commit message about the actual staged code changes only.
-- Do not describe this prompt, commit-message guidance, instructions, inspection, or the act of generating a commit message.
-- Avoid vague subjects like "update files", "inspect changes", "adjust code", or "misc changes".
+- Output only the commit message text.
+- Describe the actual staged code changes only.
+- Base the subject on the staged diff and file summary, not on recent commits, repository instructions, agent skills, or this prompt.
+- Do not describe prompt text, commit-message guidance, instructions, inspection, skills, or the act of generating a commit message.
+- Avoid vague/meta subjects like "update files", "inspect changes", "inspect staged changes", "inspect commit-message skill", "generate commit message", "adjust code", or "misc changes".
 - Use a specific Conventional Commits subject: type(optional-scope): concrete behavior changed.
 - First line must be 72 characters or fewer.
-- If prompt/config files changed, name the product behavior affected, not "guidance".
+- If prompt/config files changed, name the user-facing behavior affected, not "guidance" or "prompt".
 
 Files changed:
 {diff_stat}
@@ -6904,10 +6906,10 @@ Files changed:
 Git status:
 {status}
 
-Diff:
+Staged diff:
 {diff}
 
-Recent commits (style reference):
+Recent commits (style reference only — do not summarize these commits):
 {recent_commits}"#;
 
 /// Structured response from commit message generation
@@ -6918,6 +6920,17 @@ struct CommitMessageResponse {
 
 fn commit_message_subject(message: &str) -> &str {
     message.lines().next().unwrap_or("").trim()
+}
+
+fn normalize_commit_subject_for_meta_checks(subject: &str) -> String {
+    subject
+        .to_lowercase()
+        .chars()
+        .map(|c| if c == '-' || c == '_' { ' ' } else { c })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn validate_commit_message(message: &str, _diff_stat: &str, _status: &str) -> Result<(), String> {
@@ -6939,15 +6952,27 @@ fn validate_commit_message(message: &str, _diff_stat: &str, _status: &str) -> Re
     }
 
     let lower_subject = subject.to_lowercase();
+    let normalized_subject = normalize_commit_subject_for_meta_checks(subject);
+    let normalized_description = normalized_subject
+        .split_once(": ")
+        .map(|(_, description)| description)
+        .unwrap_or(normalized_subject.as_str());
     let meta_terms = [
         "commit message guidance",
         "commit guidance",
         "message guidance",
         "commit message prompt",
+        "commit message skill",
         "prompt instructions",
         "inspect commit message",
+        "inspect staged changes",
+        "staged changes for commit message",
+        "generate commit message",
     ];
-    if meta_terms.iter().any(|term| lower_subject.contains(term)) {
+    if meta_terms
+        .iter()
+        .any(|term| normalized_subject.contains(term))
+    {
         return Err(
             "commit message is meta/generic instead of describing staged changes".to_string(),
         );
@@ -6956,7 +6981,27 @@ fn validate_commit_message(message: &str, _diff_stat: &str, _status: &str) -> Re
     let prompt_like_terms = ["guidance", "prompt", "instructions"];
     if prompt_like_terms
         .iter()
-        .any(|term| lower_subject.contains(term))
+        .any(|term| normalized_subject.contains(term))
+    {
+        return Err(
+            "commit message is meta/generic instead of describing staged changes".to_string(),
+        );
+    }
+
+    let meta_actions = ["inspect", "review", "summarize", "describe", "generate"];
+    let meta_objects = [
+        "commit message",
+        "staged changes",
+        "diff",
+        "prompt",
+        "skill",
+    ];
+    if meta_actions
+        .iter()
+        .any(|action| normalized_description.starts_with(action))
+        && meta_objects
+            .iter()
+            .any(|object| normalized_description.contains(object))
     {
         return Err(
             "commit message is meta/generic instead of describing staged changes".to_string(),
@@ -11521,6 +11566,41 @@ Body
 
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("generic"));
+    }
+
+    #[test]
+    fn validate_commit_message_rejects_scoped_commit_message_skill_subject() {
+        let result = validate_commit_message(
+            "chore(commit): inspect commit-message skill",
+            "src-tauri/src/chat/codex.rs | 10 ++++++++++",
+            "M  src-tauri/src/chat/codex.rs",
+        );
+
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("meta"));
+    }
+
+    #[test]
+    fn validate_commit_message_rejects_staged_changes_inspection_subject() {
+        let result = validate_commit_message(
+            "chore: inspect staged changes for commit message",
+            "src-tauri/src/chat/claude.rs | 10 ++++++++++",
+            "M  src-tauri/src/chat/claude.rs",
+        );
+
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("meta"));
+    }
+
+    #[test]
+    fn validate_commit_message_allows_user_facing_commit_message_feature() {
+        let result = validate_commit_message(
+            "fix(commit): reject generic AI commit subjects",
+            "src-tauri/src/projects/commands.rs | 35 +++++++++++++++++++++++++",
+            "M  src-tauri/src/projects/commands.rs",
+        );
+
+        assert!(result.is_ok());
     }
 
     #[test]
