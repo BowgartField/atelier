@@ -7,6 +7,7 @@ import {
   persistMoveQueuedFront,
   persistRemoveQueued,
   steerCodexTurn,
+  steerPiTurn,
 } from '@/services/chat'
 import type { QueuedMessage } from '@/types/chat'
 
@@ -15,6 +16,7 @@ vi.mock('@/services/chat', () => ({
   persistMoveQueuedFront: vi.fn().mockResolvedValue(true),
   persistRemoveQueued: vi.fn(),
   steerCodexTurn: vi.fn().mockResolvedValue(undefined),
+  steerPiTurn: vi.fn().mockResolvedValue(undefined),
 }))
 
 vi.mock('@/lib/logger', () => ({
@@ -44,6 +46,7 @@ describe('useQueuedPromptActions', () => {
     vi.clearAllMocks()
     vi.mocked(persistMoveQueuedFront).mockResolvedValue(true)
     vi.mocked(steerCodexTurn).mockResolvedValue(undefined)
+    vi.mocked(steerPiTurn).mockResolvedValue(undefined)
     useChatStore.setState({
       messageQueues: {
         'session-1': [
@@ -171,6 +174,69 @@ describe('useQueuedPromptActions', () => {
     })
 
     expect(steerCodexTurn).not.toHaveBeenCalled()
+    expect(cancelChatMessage).toHaveBeenCalledWith('session-1', 'worktree-1')
+  })
+
+  it('busy pi session: steers the running turn and removes the message', async () => {
+    useChatStore.setState({
+      sendingSessionIds: { 'session-1': true },
+      selectedBackends: { 'session-1': 'pi' },
+    })
+    const { result } = renderHook(() => useQueuedPromptActions())
+
+    await act(async () => {
+      await result.current.handleSendQueuedNow('session-1', 'msg-2')
+    })
+
+    expect(steerPiTurn).toHaveBeenCalledWith(
+      'worktree-1',
+      'session-1',
+      'prompt msg-2'
+    )
+    expect(
+      useChatStore.getState().messageQueues['session-1']?.map(m => m.id)
+    ).toEqual(['msg-1', 'msg-3'])
+    expect(cancelChatMessage).not.toHaveBeenCalled()
+  })
+
+  it('busy pi session: falls back to cancel+send when steering fails', async () => {
+    vi.mocked(steerPiTurn).mockRejectedValue(new Error('host unavailable'))
+    useChatStore.setState({
+      sendingSessionIds: { 'session-1': true },
+      selectedBackends: { 'session-1': 'pi' },
+    })
+    const { result } = renderHook(() => useQueuedPromptActions())
+
+    await act(async () => {
+      await result.current.handleSendQueuedNow('session-1', 'msg-2')
+    })
+
+    expect(persistMoveQueuedFront).toHaveBeenCalled()
+    expect(
+      useChatStore.getState().messageQueues['session-1']?.map(m => m.id)
+    ).toEqual(['msg-2', 'msg-1', 'msg-3'])
+    expect(cancelChatMessage).toHaveBeenCalledWith('session-1', 'worktree-1')
+  })
+
+  it('busy pi session with attachments: skips steer, cancels instead', async () => {
+    useChatStore.setState({
+      messageQueues: {
+        'session-1': [
+          createMessage('msg-1', {
+            pendingFiles: [{ id: 'file-1', path: '/tmp/file.txt' }] as never,
+          }),
+        ],
+      },
+      sendingSessionIds: { 'session-1': true },
+      selectedBackends: { 'session-1': 'pi' },
+    })
+    const { result } = renderHook(() => useQueuedPromptActions())
+
+    await act(async () => {
+      await result.current.handleSendQueuedNow('session-1', 'msg-1')
+    })
+
+    expect(steerPiTurn).not.toHaveBeenCalled()
     expect(cancelChatMessage).toHaveBeenCalledWith('session-1', 'worktree-1')
   })
 

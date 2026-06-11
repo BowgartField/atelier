@@ -202,11 +202,14 @@ describe('useStreamingEvents cancellation sanitization', () => {
       messageQueues: {},
       lastSentMessages: {},
       compactingSessions: {},
-      cancellingSessionIds: {},
     })
   })
 
-  it('does not persist Claude compact-summary text when cancelling a partial response', async () => {
+  afterEach(() => {
+    vi.unstubAllGlobals()
+  })
+
+  it('removes optimistic prompt and partial assistant content when cancelling a partial response', async () => {
     const queryClient = createQueryClient()
     const wrapper = createWrapper(queryClient)
     const compactSummary =
@@ -261,16 +264,6 @@ describe('useStreamingEvents cancellation sanitization', () => {
       },
     })
 
-    await waitFor(() =>
-      expect(mockInvoke).toHaveBeenCalledWith(
-        'save_cancelled_message',
-        expect.objectContaining({
-          content: 'Actual partial response.',
-          contentBlocks: [{ type: 'text', text: 'Actual partial response.' }],
-        })
-      )
-    )
-
     const session = queryClient.getQueryData<{
       messages: Array<{
         role: string
@@ -278,14 +271,358 @@ describe('useStreamingEvents cancellation sanitization', () => {
         content_blocks?: unknown
       }>
     }>(['chat', 'session', 'session-1'])
-    const assistant = session?.messages.find(
-      message => message.role === 'assistant'
+    expect(session?.messages).toEqual([])
+    expect(mockInvoke).not.toHaveBeenCalledWith(
+      'save_cancelled_message',
+      expect.anything()
+    )
+    expect(useChatStore.getState().isSessionReviewing('session-1')).toBe(false)
+
+    registeredListeners.get('chat:chunk')?.({
+      payload: {
+        session_id: 'session-1',
+        worktree_id: 'worktree-1',
+        content: 'Late cancelled chunk.',
+      },
+    })
+
+    expect(useChatStore.getState().sendingSessionIds['session-1']).toBe(
+      undefined
+    )
+    expect(useChatStore.getState().streamingContents['session-1']).toBe(
+      undefined
+    )
+  })
+
+  it('keeps prior history when removing a cancelled partial response', async () => {
+    const queryClient = createQueryClient()
+    const wrapper = createWrapper(queryClient)
+
+    queryClient.setQueryData(['chat', 'session', 'session-1'], {
+      id: 'session-1',
+      name: 'Test',
+      order: 0,
+      created_at: 1,
+      updated_at: 1,
+      messages: [
+        {
+          id: 'old-user',
+          session_id: 'session-1',
+          role: 'user',
+          content: 'old prompt',
+          timestamp: 1,
+          tool_calls: [],
+        },
+        {
+          id: 'old-assistant',
+          session_id: 'session-1',
+          role: 'assistant',
+          content: 'old answer',
+          timestamp: 2,
+          tool_calls: [],
+        },
+        {
+          id: 'current-user',
+          session_id: 'session-1',
+          role: 'user',
+          content: 'cancel this',
+          timestamp: 3,
+          tool_calls: [],
+        },
+      ],
+    })
+
+    useChatStore.setState({
+      streamingContents: { 'session-1': 'Partial response.' },
+      streamingContentBlocks: {
+        'session-1': [{ type: 'text', text: 'Partial response.' }],
+      },
+      sendingSessionIds: { 'session-1': true },
+      sendStartedAt: { 'session-1': 1000 },
+      sessionWorktreeMap: { 'session-1': 'worktree-1' },
+      worktreePaths: { 'worktree-1': '/tmp/worktree' },
+    })
+
+    renderHook(() => useStreamingEvents({ queryClient }), { wrapper })
+
+    await waitFor(() =>
+      expect(registeredListeners.has('chat:cancelled')).toBe(true)
     )
 
-    expect(assistant?.content).toBe('Actual partial response.')
-    expect(assistant?.content_blocks).toEqual([
-      { type: 'text', text: 'Actual partial response.' },
+    registeredListeners.get('chat:cancelled')?.({
+      payload: {
+        session_id: 'session-1',
+        worktree_id: 'worktree-1',
+        undo_send: false,
+        emitted_at_ms: 2000,
+      },
+    })
+
+    const session = queryClient.getQueryData<{
+      messages: Array<{ id: string; role: string; content: string }>
+    }>(['chat', 'session', 'session-1'])
+
+    expect(session?.messages.map(message => message.id)).toEqual([
+      'old-user',
+      'old-assistant',
     ])
+    expect(mockInvoke).not.toHaveBeenCalledWith(
+      'save_cancelled_message',
+      expect.anything()
+    )
+    expect(useChatStore.getState().isSessionReviewing('session-1')).toBe(true)
+  })
+
+  it('ignores late chunks from a cancelled run after the same session starts a new run', async () => {
+    vi.stubGlobal('requestAnimationFrame', (callback: FrameRequestCallback) => {
+      callback(0)
+      return 1
+    })
+    vi.stubGlobal('cancelAnimationFrame', vi.fn())
+
+    const queryClient = createQueryClient()
+    const wrapper = createWrapper(queryClient)
+
+    queryClient.setQueryData(['chat', 'session', 'session-1'], {
+      id: 'session-1',
+      name: 'Test',
+      order: 0,
+      created_at: 1,
+      updated_at: 1,
+      messages: [
+        {
+          id: 'cancelled-user',
+          session_id: 'session-1',
+          role: 'user',
+          content: 'cancel this',
+          timestamp: 1,
+          tool_calls: [],
+        },
+      ],
+    })
+
+    useChatStore.setState({
+      streamingContents: { 'session-1': 'Partial response.' },
+      streamingContentBlocks: {
+        'session-1': [{ type: 'text', text: 'Partial response.' }],
+      },
+      sendingSessionIds: { 'session-1': true },
+      sendStartedAt: { 'session-1': 1000 },
+      sessionWorktreeMap: { 'session-1': 'worktree-1' },
+      worktreePaths: { 'worktree-1': '/tmp/worktree' },
+    })
+
+    renderHook(() => useStreamingEvents({ queryClient }), { wrapper })
+
+    await waitFor(() =>
+      expect(registeredListeners.has('chat:cancelled')).toBe(true)
+    )
+
+    registeredListeners.get('chat:cancelled')?.({
+      payload: {
+        session_id: 'session-1',
+        worktree_id: 'worktree-1',
+        undo_send: false,
+        emitted_at_ms: 2000,
+        run_id: 'run-old',
+      },
+    })
+
+    registeredListeners.get('chat:sending')?.({
+      payload: {
+        session_id: 'session-1',
+        worktree_id: 'worktree-1',
+        user_message: 'new prompt',
+      },
+    })
+
+    registeredListeners.get('chat:chunk')?.({
+      payload: {
+        session_id: 'session-1',
+        worktree_id: 'worktree-1',
+        content: 'Late cancelled chunk.',
+        run_id: 'run-old',
+      },
+    })
+
+    expect(useChatStore.getState().streamingContents['session-1']).toBe(
+      undefined
+    )
+
+    registeredListeners.get('chat:chunk')?.({
+      payload: {
+        session_id: 'session-1',
+        worktree_id: 'worktree-1',
+        content: 'New run chunk.',
+        run_id: 'run-new',
+      },
+    })
+
+    expect(useChatStore.getState().streamingContents['session-1']).toBe(
+      'New run chunk.'
+    )
+  })
+
+  it('continues ignoring cancelled run chunks after accepting a new run chunk', async () => {
+    vi.stubGlobal('requestAnimationFrame', (callback: FrameRequestCallback) => {
+      callback(0)
+      return 1
+    })
+    vi.stubGlobal('cancelAnimationFrame', vi.fn())
+
+    const queryClient = createQueryClient()
+    const wrapper = createWrapper(queryClient)
+
+    queryClient.setQueryData(['chat', 'session', 'session-1'], {
+      id: 'session-1',
+      name: 'Test',
+      order: 0,
+      created_at: 1,
+      updated_at: 1,
+      messages: [
+        {
+          id: 'cancelled-user',
+          session_id: 'session-1',
+          role: 'user',
+          content: 'cancel this',
+          timestamp: 1,
+          tool_calls: [],
+        },
+      ],
+    })
+
+    useChatStore.setState({
+      streamingContents: { 'session-1': 'Partial response.' },
+      streamingContentBlocks: {
+        'session-1': [{ type: 'text', text: 'Partial response.' }],
+      },
+      sendingSessionIds: { 'session-1': true },
+      sendStartedAt: { 'session-1': 1000 },
+      sessionWorktreeMap: { 'session-1': 'worktree-1' },
+      worktreePaths: { 'worktree-1': '/tmp/worktree' },
+    })
+
+    renderHook(() => useStreamingEvents({ queryClient }), { wrapper })
+
+    await waitFor(() =>
+      expect(registeredListeners.has('chat:cancelled')).toBe(true)
+    )
+
+    registeredListeners.get('chat:cancelled')?.({
+      payload: {
+        session_id: 'session-1',
+        worktree_id: 'worktree-1',
+        undo_send: false,
+        emitted_at_ms: 2000,
+        run_id: 'run-old',
+      },
+    })
+
+    registeredListeners.get('chat:sending')?.({
+      payload: {
+        session_id: 'session-1',
+        worktree_id: 'worktree-1',
+        user_message: 'new prompt',
+      },
+    })
+
+    registeredListeners.get('chat:chunk')?.({
+      payload: {
+        session_id: 'session-1',
+        worktree_id: 'worktree-1',
+        content: 'New run chunk.',
+        run_id: 'run-new',
+      },
+    })
+
+    registeredListeners.get('chat:chunk')?.({
+      payload: {
+        session_id: 'session-1',
+        worktree_id: 'worktree-1',
+        content: 'Late cancelled chunk.',
+        run_id: 'run-old',
+      },
+    })
+
+    expect(useChatStore.getState().streamingContents['session-1']).toBe(
+      'New run chunk.'
+    )
+  })
+
+  it('accepts untagged new run chunks after a tagged cancellation and restart', async () => {
+    vi.stubGlobal('requestAnimationFrame', (callback: FrameRequestCallback) => {
+      callback(0)
+      return 1
+    })
+    vi.stubGlobal('cancelAnimationFrame', vi.fn())
+
+    const queryClient = createQueryClient()
+    const wrapper = createWrapper(queryClient)
+
+    queryClient.setQueryData(['chat', 'session', 'session-1'], {
+      id: 'session-1',
+      name: 'Test',
+      order: 0,
+      created_at: 1,
+      updated_at: 1,
+      messages: [
+        {
+          id: 'cancelled-user',
+          session_id: 'session-1',
+          role: 'user',
+          content: 'cancel this',
+          timestamp: 1,
+          tool_calls: [],
+        },
+      ],
+    })
+
+    useChatStore.setState({
+      streamingContents: { 'session-1': 'Partial response.' },
+      streamingContentBlocks: {
+        'session-1': [{ type: 'text', text: 'Partial response.' }],
+      },
+      sendingSessionIds: { 'session-1': true },
+      sendStartedAt: { 'session-1': 1000 },
+      sessionWorktreeMap: { 'session-1': 'worktree-1' },
+      worktreePaths: { 'worktree-1': '/tmp/worktree' },
+    })
+
+    renderHook(() => useStreamingEvents({ queryClient }), { wrapper })
+
+    await waitFor(() =>
+      expect(registeredListeners.has('chat:cancelled')).toBe(true)
+    )
+
+    registeredListeners.get('chat:cancelled')?.({
+      payload: {
+        session_id: 'session-1',
+        worktree_id: 'worktree-1',
+        undo_send: false,
+        emitted_at_ms: 2000,
+        run_id: 'run-old',
+      },
+    })
+
+    registeredListeners.get('chat:sending')?.({
+      payload: {
+        session_id: 'session-1',
+        worktree_id: 'worktree-1',
+        user_message: 'new prompt',
+      },
+    })
+
+    registeredListeners.get('chat:chunk')?.({
+      payload: {
+        session_id: 'session-1',
+        worktree_id: 'worktree-1',
+        content: 'Untagged new run chunk.',
+      },
+    })
+
+    expect(useChatStore.getState().streamingContents['session-1']).toBe(
+      'Untagged new run chunk.'
+    )
   })
 })
 

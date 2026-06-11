@@ -10,9 +10,34 @@ interface BackendModelPreferences {
   selected_commandcode_model?: string
 }
 
+export interface ModelOption {
+  value: string
+  label: string
+  is_default?: boolean
+}
+
+export function resolvePiDefaultModel(
+  storedModel: string | null | undefined,
+  availableModels?: ModelOption[]
+): string {
+  const stored = storedModel?.trim()
+  if (availableModels?.length) {
+    if (stored && availableModels.some(model => model.value === stored)) {
+      return stored
+    }
+    return (
+      availableModels.find(model => model.is_default)?.value ??
+      availableModels[0]?.value ??
+      'pi/sonnet'
+    )
+  }
+  return stored || 'pi/sonnet'
+}
+
 export function resolveDefaultModelForBackend(
   backend: CliBackend,
-  preferences: BackendModelPreferences | null | undefined
+  preferences: BackendModelPreferences | null | undefined,
+  availableModels?: ModelOption[]
 ): string {
   if (backend === 'codex') {
     return preferences?.selected_codex_model ?? 'gpt-5.5'
@@ -24,7 +49,10 @@ export function resolveDefaultModelForBackend(
     return preferences?.selected_cursor_model ?? 'cursor/auto'
   }
   if (backend === 'pi') {
-    return preferences?.selected_pi_model ?? 'pi/sonnet'
+    return resolvePiDefaultModel(
+      preferences?.selected_pi_model,
+      availableModels
+    )
   }
   if (backend === 'commandcode') {
     return preferences?.selected_commandcode_model ?? 'commandcode/default'

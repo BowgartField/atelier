@@ -50,6 +50,8 @@ struct ChunkEvent {
     session_id: String,
     worktree_id: String,
     content: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    run_id: Option<String>,
 }
 
 #[derive(serde::Serialize, Clone)]
@@ -1524,6 +1526,7 @@ fn process_turn_events(
                     app,
                     session_id,
                     worktree_id,
+                    run_id,
                     &method,
                     &params,
                     &mut full_content,
@@ -1715,6 +1718,7 @@ fn process_turn_events(
                 worktree_id: worktree_id.to_string(),
                 undo_send: false,
                 emitted_at_ms,
+                run_id: Some(run_id.to_string()),
             },
         );
     }
@@ -1820,6 +1824,7 @@ fn process_server_notification(
     app: &tauri::AppHandle,
     session_id: &str,
     worktree_id: &str,
+    run_id: &str,
     method: &str,
     params: &serde_json::Value,
     full_content: &mut String,
@@ -1859,6 +1864,7 @@ fn process_server_notification(
                             session_id: session_id.to_string(),
                             worktree_id: worktree_id.to_string(),
                             content: delta.to_string(),
+                            run_id: Some(run_id.to_string()),
                         },
                     );
                 }
@@ -1945,6 +1951,7 @@ fn process_server_notification(
                 app,
                 session_id,
                 worktree_id,
+                run_id,
                 &event_msg,
                 event_type,
                 full_content,
@@ -2039,6 +2046,7 @@ fn process_server_notification(
                 app,
                 session_id,
                 worktree_id,
+                run_id,
                 &event_msg,
                 event_type,
                 full_content,
@@ -2615,6 +2623,7 @@ fn process_codex_event(
     app: &tauri::AppHandle,
     session_id: &str,
     worktree_id: &str,
+    run_id: &str,
     msg: &serde_json::Value,
     event_type: &str,
     full_content: &mut String,
@@ -3013,6 +3022,7 @@ fn process_codex_event(
                                         session_id: session_id.to_string(),
                                         worktree_id: worktree_id.to_string(),
                                         content: text.to_string(),
+                                        run_id: Some(run_id.to_string()),
                                     },
                                 );
                             }

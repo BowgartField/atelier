@@ -260,11 +260,6 @@ interface ChatUIState {
   // Sessions marked as "reviewing" (persisted)
   reviewingSessions: Record<string, boolean>
 
-  // Sessions currently being cancelled — suppresses session-level refetches
-  // until the cancel handler's save_cancelled_message resolves and disk is
-  // reconciled with the optimistic message in the TanStack Query cache.
-  cancellingSessionIds: Record<string, boolean>
-
   // Plan file paths per session (persisted)
   planFilePaths: Record<string, string | null>
 
@@ -341,11 +336,6 @@ interface ChatUIState {
   // Actions - Reviewing status management (persisted)
   setSessionReviewing: (sessionId: string, reviewing: boolean) => void
   isSessionReviewing: (sessionId: string) => boolean
-
-  // Actions - Cancelling status management (transient)
-  addCancellingSession: (sessionId: string) => void
-  removeCancellingSession: (sessionId: string) => void
-  isSessionCancelling: (sessionId: string) => boolean
 
   // Actions - Session label management (persisted)
   setSessionLabel: (sessionId: string, label: LabelData | null) => void
@@ -756,7 +746,6 @@ export const useChatStore = create<ChatUIState>()(
       lastCompaction: {},
       compactingSessions: {},
       reviewingSessions: {},
-      cancellingSessionIds: {},
       planFilePaths: {},
       pendingPlanMessageIds: {},
       savingContext: {},
@@ -1016,36 +1005,6 @@ export const useChatStore = create<ChatUIState>()(
 
       isSessionReviewing: sessionId =>
         get().reviewingSessions[sessionId] ?? false,
-
-      // Cancelling status management (transient)
-      addCancellingSession: sessionId =>
-        set(
-          state => {
-            if (state.cancellingSessionIds[sessionId]) return state
-            return {
-              cancellingSessionIds: {
-                ...state.cancellingSessionIds,
-                [sessionId]: true,
-              },
-            }
-          },
-          undefined,
-          'addCancellingSession'
-        ),
-
-      removeCancellingSession: sessionId =>
-        set(
-          state => {
-            if (!(sessionId in state.cancellingSessionIds)) return state
-            const { [sessionId]: _, ...rest } = state.cancellingSessionIds
-            return { cancellingSessionIds: rest }
-          },
-          undefined,
-          'removeCancellingSession'
-        ),
-
-      isSessionCancelling: sessionId =>
-        get().cancellingSessionIds[sessionId] ?? false,
 
       // Session label management (persisted)
       setSessionLabel: (sessionId, label) =>

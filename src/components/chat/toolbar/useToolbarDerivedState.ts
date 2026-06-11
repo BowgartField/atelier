@@ -16,6 +16,7 @@ import {
   getCatalogModelOptions,
   useModelCatalog,
 } from '@/services/model-catalog'
+import { resolvePiDefaultModel } from '@/lib/session-defaults'
 
 interface UseToolbarDerivedStateArgs {
   selectedBackend: CliBackend
@@ -220,12 +221,18 @@ export function useToolbarDerivedState({
 
   // Fast variants share a label with their base model (the Zap indicator
   // distinguishes them visually). Applies to both Codex and Claude.
+  const effectiveSelectedModel = isPi
+    ? resolvePiDefaultModel(selectedModel, resolvedPiModelOptions)
+    : selectedModel
+
   const fastInfo = getCatalogModelFastInfo(
     modelCatalog,
     selectedBackend,
-    selectedModel
+    effectiveSelectedModel
   )
-  const labelLookupKey = fastInfo.isFast ? fastInfo.baseModel : selectedModel
+  const labelLookupKey = fastInfo.isFast
+    ? fastInfo.baseModel
+    : effectiveSelectedModel
 
   const selectedModelLabel =
     filteredModelOptions.find(o => o.value === labelLookupKey)?.label ??

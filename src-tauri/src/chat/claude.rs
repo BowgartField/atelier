@@ -134,6 +134,8 @@ struct ChunkEvent {
     session_id: String,
     worktree_id: String, // Kept for backward compatibility
     content: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    run_id: Option<String>,
 }
 
 /// Payload for tool use events sent to frontend
@@ -173,6 +175,8 @@ pub struct CancelledEvent {
     pub worktree_id: String, // Kept for backward compatibility
     pub undo_send: bool, // True if user message should be restored to input (instant cancellation)
     pub emitted_at_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
 }
 
 /// Payload for tool block position events sent to frontend
@@ -1142,6 +1146,10 @@ pub fn tail_claude_output(
 
     log::trace!("Starting to tail NDJSON output for session: {session_id}");
     log::trace!("Output file: {output_file:?}, PID: {pid}");
+    let run_id = output_file
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .map(|stem| stem.to_string());
 
     // Create tailer starting from beginning (we want all content)
     let mut tailer = NdjsonTailer::new_from_start(output_file)?;
@@ -1340,6 +1348,7 @@ pub fn tail_claude_output(
                                                             session_id: session_id.to_string(),
                                                             worktree_id: worktree_id.to_string(),
                                                             content: chat_buf.clone(),
+                                                            run_id: run_id.clone(),
                                                         };
                                                         if let Err(e) =
                                                             app.emit_all("chat:chunk", &chunk)
@@ -1387,6 +1396,7 @@ pub fn tail_claude_output(
                                                     session_id: session_id.to_string(),
                                                     worktree_id: worktree_id.to_string(),
                                                     content: chat_buf,
+                                                    run_id: run_id.clone(),
                                                 };
                                                 if let Err(e) = app.emit_all("chat:chunk", &chunk) {
                                                     log::error!("Failed to emit chunk: {e}");

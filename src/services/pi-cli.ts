@@ -2,6 +2,7 @@
  * PI CLI management service.
  */
 
+import { useEffect } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { invoke } from '@/lib/transport'
 import { toast } from 'sonner'
@@ -13,6 +14,8 @@ import type {
   PiReleaseInfo,
 } from '@/types/pi-cli'
 import { hasBackend } from '@/lib/environment'
+import { preferencesQueryKeys } from '@/services/preferences'
+import type { AppPreferences } from '@/types/preferences'
 
 const isTauri = hasBackend
 
@@ -115,7 +118,8 @@ export function useAvailablePiVersions(options?: { enabled?: boolean }) {
 }
 
 export function useAvailablePiModels(options?: { enabled?: boolean }) {
-  return useQuery({
+  const queryClient = useQueryClient()
+  const query = useQuery({
     queryKey: piCliQueryKeys.models(),
     queryFn: async (): Promise<PiModelInfo[]> => {
       if (!isTauri()) return []
@@ -125,6 +129,46 @@ export function useAvailablePiModels(options?: { enabled?: boolean }) {
     staleTime: 1000 * 60 * 5,
     gcTime: 1000 * 60 * 10,
   })
+
+  useEffect(() => {
+    if (!isTauri() || !query.data?.length) return
+
+    const models = query.data
+    const availableValues = models.map(model => `pi/${model.id}`)
+    const preferredValue =
+      models.find(model => model.is_default)?.id ?? models[0]?.id
+    if (!preferredValue) return
+    const preferred = `pi/${preferredValue}`
+
+    let cancelled = false
+    async function syncPiDefaultModel() {
+      try {
+        const preferences = await invoke<AppPreferences>('load_preferences')
+        if (cancelled) return
+        const selected = preferences.selected_pi_model
+        if (selected && availableValues.includes(selected)) return
+        await invoke('patch_preferences', {
+          patch: { selected_pi_model: preferred },
+        })
+        if (!cancelled) {
+          queryClient.invalidateQueries({
+            queryKey: preferencesQueryKeys.preferences(),
+          })
+        }
+      } catch (error) {
+        logger.debug('Failed to sync PI default model from available models', {
+          error,
+        })
+      }
+    }
+
+    void syncPiDefaultModel()
+    return () => {
+      cancelled = true
+    }
+  }, [query.data, queryClient])
+
+  return query
 }
 
 export function useInstallPiCli() {

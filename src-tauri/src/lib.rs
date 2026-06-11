@@ -3290,6 +3290,13 @@ pub fn run() {
         }
         return;
     }
+    if std::env::args().any(|arg| arg == chat::pi::PI_RPC_HOST_ARG) {
+        if let Err(e) = chat::pi::run_pi_rpc_host_from_args() {
+            eprintln!("Jean PI RPC host failed: {e}");
+            std::process::exit(1);
+        }
+        return;
+    }
 
     // Raise the open-file-descriptor soft limit to the hard limit. macOS GUI apps
     // start with a low default (often 256); bulk git-status refresh across many
@@ -4075,6 +4082,7 @@ pub fn run() {
             chat::clear_message_queue,
             chat::move_queued_message_front,
             chat::steer_codex_turn,
+            chat::steer_pi_turn,
             chat::answer_opencode_question,
             // Chat commands - ScheduleWakeup support
             chat::cancel_session_wakeup,

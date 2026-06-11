@@ -2573,6 +2573,13 @@ pub async fn dispatch_command(
             crate::chat::steer_codex_turn(app.clone(), worktree_id, session_id, message).await?;
             Ok(Value::Null)
         }
+        "steer_pi_turn" => {
+            let worktree_id: String = field(&args, "worktreeId", "worktree_id")?;
+            let session_id: String = field(&args, "sessionId", "session_id")?;
+            let message: String = from_field(&args, "message")?;
+            crate::chat::steer_pi_turn(app.clone(), worktree_id, session_id, message).await?;
+            Ok(Value::Null)
+        }
         "answer_opencode_question" => {
             let worktree_path: String = field(&args, "worktreePath", "worktree_path")?;
             let tool_call_id: String = field(&args, "toolCallId", "tool_call_id")?;

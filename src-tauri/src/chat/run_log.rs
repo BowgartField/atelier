@@ -634,6 +634,13 @@ pub fn parse_run_to_message(lines: &[String], run: &RunEntry) -> Result<ChatMess
         let msg_type = msg.get("type").and_then(|v| v.as_str()).unwrap_or("");
 
         match msg_type {
+            "steered_user_message" => {
+                if let Some(text) = msg.get("text").and_then(|v| v.as_str()) {
+                    content_blocks.push(ContentBlock::UserInput {
+                        text: text.to_string(),
+                    });
+                }
+            }
             "assistant" => {
                 // Text-routing gate (mirrors live-stream logic): if ANY armed
                 // Monitor has initial_turn_finished=true, this assistant turn
@@ -1093,34 +1100,32 @@ pub fn load_session_messages_window(
     let mut messages = Vec::new();
 
     for run in &metadata.runs[start..end] {
-        // Skip user message for instant-cancelled runs (undo_send)
-        // These have Cancelled status but no assistant_message_id
-        let is_undo_send = run.status == RunStatus::Cancelled && run.assistant_message_id.is_none();
-
-        if !is_undo_send {
-            // Add user message
-            messages.push(ChatMessage {
-                id: run.user_message_id.clone(),
-                session_id: session_id.to_string(),
-                role: MessageRole::User,
-                content: run.user_message.clone(),
-                timestamp: run.started_at,
-                tool_calls: vec![],
-                content_blocks: vec![],
-                cancelled: false,
-                plan_approved: false,
-                model: run.model.clone(),
-                execution_mode: run.execution_mode.clone(),
-                thinking_level: run.thinking_level.clone(),
-                effort_level: run.effort_level.clone(),
-                recovered: false,
-                usage: None, // User messages don't have token usage
-            });
+        if !run.is_renderable_in_chat_history() {
+            continue;
         }
 
-        // Add assistant message for every non-undo run, including Running runs.
+        // Add user message
+        messages.push(ChatMessage {
+            id: run.user_message_id.clone(),
+            session_id: session_id.to_string(),
+            role: MessageRole::User,
+            content: run.user_message.clone(),
+            timestamp: run.started_at,
+            tool_calls: vec![],
+            content_blocks: vec![],
+            cancelled: false,
+            plan_approved: false,
+            model: run.model.clone(),
+            execution_mode: run.execution_mode.clone(),
+            thinking_level: run.thinking_level.clone(),
+            effort_level: run.effort_level.clone(),
+            recovered: false,
+            usage: None, // User messages don't have token usage
+        });
+
+        // Add assistant message for every renderable run, including Running runs.
         // Running logs contain partial JSONL snapshots that we can surface on reload.
-        if !is_undo_send {
+        {
             let lines = read_run_log(app, session_id, &run.run_id)?;
 
             // Parse JSONL content — route by backend.
@@ -1201,17 +1206,6 @@ pub fn load_session_messages_window(
                 );
                 assistant_msg.content =
                     "*Response content was not captured for this completed run.*".to_string();
-            }
-
-            // Skip cancelled runs with no content (instant cancel race window).
-            // During the brief period between mark_running_run_cancelled() setting
-            // a placeholder assistant_message_id and the command handler setting it
-            // to None, the JSONL may be empty. Don't show an empty message.
-            if run.status == RunStatus::Cancelled
-                && assistant_msg.content.is_empty()
-                && assistant_msg.tool_calls.is_empty()
-            {
-                continue;
             }
 
             messages.push(assistant_msg);
@@ -1394,6 +1388,33 @@ mod tests {
         inject_synthetic_enter_plan("run-123", &mut msg);
 
         assert_eq!(msg.tool_calls.len(), before_tool_count);
+    }
+
+    #[test]
+    fn parse_run_preserves_steered_user_messages() {
+        let run = sample_run();
+        let lines = vec![
+            r#"{"_run_meta":true}"#.to_string(),
+            r#"{"type":"steered_user_message","text":"2"}"#.to_string(),
+            r#"{"type":"steered_user_message","text":"3"}"#.to_string(),
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"done"}]}}"#
+                .to_string(),
+        ];
+
+        let message = parse_run_to_message(&lines, &run).unwrap();
+
+        assert!(matches!(
+            &message.content_blocks[0],
+            ContentBlock::UserInput { text } if text == "2"
+        ));
+        assert!(matches!(
+            &message.content_blocks[1],
+            ContentBlock::UserInput { text } if text == "3"
+        ));
+        assert!(matches!(
+            &message.content_blocks[2],
+            ContentBlock::Text { text } if text == "done"
+        ));
     }
 
     #[test]

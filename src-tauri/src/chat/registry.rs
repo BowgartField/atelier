@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use once_cell::sync::Lazy;
-use tauri::AppHandle;
+use tauri::{AppHandle, Manager};
 
 use super::claude::CancelledEvent;
 use super::run_log;
@@ -58,17 +58,53 @@ fn emit_cancelled_event(app: &AppHandle, session_id: &str, worktree_id: &str, un
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis() as u64)
         .unwrap_or(0);
+    let run_id = super::storage::load_metadata(app, session_id)
+        .ok()
+        .flatten()
+        .and_then(|metadata| metadata.runs.last().map(|run| run.run_id.clone()));
 
     let event = CancelledEvent {
         session_id: session_id.to_string(),
         worktree_id: worktree_id.to_string(),
         undo_send,
         emitted_at_ms,
+        run_id,
     };
     if let Err(e) = app.emit_all("chat:cancelled", &event) {
         log::error!("Failed to emit chat:cancelled event: {e}");
     }
 }
+
+#[cfg(unix)]
+fn try_abort_pi_rpc_host(app: &AppHandle, session_id: &str) {
+    let run_id = super::storage::load_metadata(app, session_id)
+        .ok()
+        .flatten()
+        .and_then(|metadata| {
+            metadata
+                .runs
+                .iter()
+                .rev()
+                .find(|run| {
+                    run.status == super::types::RunStatus::Running
+                        && run.backend == Some(super::types::Backend::Pi)
+                })
+                .map(|run| run.run_id.clone())
+        });
+    let Some(run_id) = run_id else { return };
+    let Ok(app_data) = app.path().app_data_dir() else {
+        log::warn!("Failed to resolve app data dir for Pi RPC abort");
+        return;
+    };
+    let socket_path = super::pi::pi_rpc_socket_path(&app_data, session_id, &run_id);
+    let line = super::pi::serialize_pi_rpc_command("abort", None, Some(&format!("abort-{run_id}")));
+    if let Err(e) = super::pi::send_pi_rpc_host_command(&socket_path, &line) {
+        log::warn!("Failed to send Pi RPC abort before kill for session {session_id}: {e}");
+    }
+}
+
+#[cfg(not(unix))]
+fn try_abort_pi_rpc_host(_app: &AppHandle, _session_id: &str) {}
 
 /// Register a running Claude process PID for a session.
 /// Returns `false` if the session was cancelled before registration (process is killed immediately).
@@ -418,6 +454,7 @@ pub fn cancel_process(
             return Err(format!("Invalid PID: {pid}"));
         }
 
+        try_abort_pi_rpc_host(app, session_id);
         log::trace!("Cancelling Claude process group {pid} for session: {session_id}");
 
         // Kill the entire process tree to ensure child processes are also terminated
@@ -551,6 +588,7 @@ pub fn cancel_process_if_running(
             return Err(format!("Invalid PID: {pid}"));
         }
 
+        try_abort_pi_rpc_host(app, session_id);
         log::trace!("Cancelling Claude process group {pid} for session: {session_id}");
 
         use crate::platform::{is_process_alive, kill_process, kill_process_tree};

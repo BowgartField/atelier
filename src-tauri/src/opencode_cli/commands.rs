@@ -91,8 +91,28 @@ pub async fn list_opencode_models(app: AppHandle) -> Result<Vec<String>, String>
         }
     }
 
-    let output = crate::platform::wsl_aware_command(&binary_str, None)
-        .args(["models", "--refresh", "--verbose"])
+    match run_opencode_models_command(&binary_str, true) {
+        Ok(models) => Ok(models),
+        Err(refresh_error) => run_opencode_models_command(&binary_str, false).map_err(|cached_error| {
+            format!(
+                "OpenCode models refresh failed: {refresh_error}; cached model listing failed: {cached_error}"
+            )
+        }),
+    }
+}
+
+fn opencode_models_args(refresh: bool) -> Vec<&'static str> {
+    if refresh {
+        vec!["models", "--refresh"]
+    } else {
+        vec!["models"]
+    }
+}
+
+fn run_opencode_models_command(binary_str: &str, refresh: bool) -> Result<Vec<String>, String> {
+    let args = opencode_models_args(refresh);
+    let output = crate::platform::wsl_aware_command(binary_str, None)
+        .args(&args)
         .output()
         .map_err(|e| format!("Failed to execute OpenCode CLI models command: {e}"))?;
 
@@ -106,8 +126,11 @@ pub async fn list_opencode_models(app: AppHandle) -> Result<Vec<String>, String>
     }
 
     let stdout_raw = String::from_utf8_lossy(&output.stdout).to_string();
-    let stdout = strip_ansi(&stdout_raw);
+    Ok(parse_opencode_models_output(&stdout_raw))
+}
 
+fn parse_opencode_models_output(output: &str) -> Vec<String> {
+    let stdout = strip_ansi(output);
     let mut models = Vec::new();
     for line in stdout.lines() {
         let candidate = line.trim();
@@ -118,7 +141,7 @@ pub async fn list_opencode_models(app: AppHandle) -> Result<Vec<String>, String>
 
     models.sort();
     models.dedup();
-    Ok(models)
+    models
 }
 
 fn emit_progress(app: &AppHandle, stage: &str, message: &str, percent: u8) {
@@ -824,7 +847,7 @@ async fn fetch_latest_version(app: &AppHandle) -> Result<String, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::is_model_identifier;
+    use super::{is_model_identifier, opencode_models_args, parse_opencode_models_output};
 
     #[test]
     fn accepts_valid_model_identifiers() {
@@ -842,6 +865,55 @@ mod tests {
             "\"url\": \"https://opencode.ai/zen/v1\","
         ));
         assert!(!is_model_identifier("https://opencode.ai/zen/v1"));
+    }
+
+    #[test]
+    fn parses_model_lines_from_plain_output() {
+        let output = "\u{1b}[1mModels cache refreshed\u{1b}[0m\nopencode/gpt-5.3-codex\nanthropic/claude-sonnet-4-6\nopenrouter/anthropic/claude-3.5-haiku:free\n";
+
+        let models = parse_opencode_models_output(output);
+
+        assert_eq!(
+            models,
+            vec![
+                "anthropic/claude-sonnet-4-6".to_string(),
+                "opencode/gpt-5.3-codex".to_string(),
+                "openrouter/anthropic/claude-3.5-haiku:free".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn ignores_verbose_json_metadata_and_deduplicates_models() {
+        let output = r#"
+opencode/gpt-5.3-codex
+{
+  "id": "gpt-5.3-codex",
+  "name": "GPT-5.3 Codex",
+  "cost": {
+    "input": 1.25
+  },
+  "url": "https://opencode.ai/zen/v1"
+}
+opencode/gpt-5.3-codex
+moonshotai/kimi-k2.5
+"#;
+
+        let models = parse_opencode_models_output(output);
+
+        assert_eq!(
+            models,
+            vec![
+                "moonshotai/kimi-k2.5".to_string(),
+                "opencode/gpt-5.3-codex".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn uses_non_verbose_refresh_args_for_model_listing() {
+        assert_eq!(opencode_models_args(true), vec!["models", "--refresh"]);
+        assert_eq!(opencode_models_args(false), vec!["models"]);
     }
 
     #[test]

@@ -1330,6 +1330,27 @@ pub struct RunEntry {
     pub cursor_chat_id: Option<String>,
 }
 
+impl RunEntry {
+    /// Whether this run should appear as user/assistant messages in the visible chat timeline.
+    ///
+    /// Cancelled runs remain in metadata and JSONL for diagnostics, but the chat UI treats
+    /// cancellation as removing the prompt/partial response from history.
+    pub fn is_renderable_in_chat_history(&self) -> bool {
+        self.status != RunStatus::Cancelled && !self.cancelled
+    }
+
+    /// Number of visible chat messages contributed by this run.
+    pub fn rendered_message_count(&self) -> u32 {
+        if !self.is_renderable_in_chat_history() {
+            0
+        } else if self.assistant_message_id.is_some() {
+            2 // user + assistant
+        } else {
+            1 // user only (running/resumable/crashed before response)
+        }
+    }
+}
+
 /// Session metadata - single source of truth for session data and run history
 /// Stored in sessions/data/{session_id}/metadata.json
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1628,22 +1649,7 @@ impl SessionMetadata {
 
     /// Convert to a lightweight index entry for tab rendering
     pub fn to_index_entry(&self) -> SessionIndexEntry {
-        // Count messages: each run has 1 user message, plus 1 assistant message if completed
-        let message_count: u32 = self
-            .runs
-            .iter()
-            .map(|run| {
-                let is_undo_send =
-                    run.status == RunStatus::Cancelled && run.assistant_message_id.is_none();
-                if is_undo_send {
-                    0
-                } else if run.assistant_message_id.is_some() {
-                    2 // user + assistant
-                } else {
-                    1 // just user (still running or cancelled without response)
-                }
-            })
-            .sum();
+        let message_count: u32 = self.runs.iter().map(RunEntry::rendered_message_count).sum();
 
         SessionIndexEntry {
             id: self.id.clone(),
@@ -2072,6 +2078,97 @@ mod tests {
 
         assert!(metadata.find_run("run-1").is_some());
         assert!(metadata.find_run("run-nonexistent").is_none());
+    }
+
+    #[test]
+    fn cancelled_runs_are_not_renderable_or_counted_even_with_assistant_content() {
+        let mut run = RunEntry {
+            run_id: "run-cancelled".to_string(),
+            user_message_id: "user-cancelled".to_string(),
+            user_message: "cancel me".to_string(),
+            model: Some("gpt-5.5".to_string()),
+            execution_mode: Some("yolo".to_string()),
+            thinking_level: None,
+            effort_level: None,
+            backend: Some(Backend::Codex),
+            started_at: 1,
+            ended_at: Some(2),
+            status: RunStatus::Cancelled,
+            assistant_message_id: Some("assistant-cancelled".to_string()),
+            cancelled: true,
+            recovered: false,
+            claude_session_id: None,
+            pid: None,
+            usage: None,
+            codex_thread_id: Some("thread-1".to_string()),
+            codex_turn_id: None,
+            cursor_chat_id: None,
+        };
+
+        assert!(!run.is_renderable_in_chat_history());
+        assert_eq!(run.rendered_message_count(), 0);
+
+        run.status = RunStatus::Completed;
+        run.cancelled = false;
+
+        assert!(run.is_renderable_in_chat_history());
+        assert_eq!(run.rendered_message_count(), 2);
+    }
+
+    #[test]
+    fn session_index_message_count_excludes_cancelled_runs() {
+        let mut metadata = SessionMetadata::new(
+            "sess-123".to_string(),
+            "wt-456".to_string(),
+            "Test".to_string(),
+            0,
+        );
+        metadata.runs.push(RunEntry {
+            run_id: "run-cancelled".to_string(),
+            user_message_id: "user-cancelled".to_string(),
+            user_message: "cancel me".to_string(),
+            model: Some("gpt-5.5".to_string()),
+            execution_mode: Some("yolo".to_string()),
+            thinking_level: None,
+            effort_level: None,
+            backend: Some(Backend::Codex),
+            started_at: 1,
+            ended_at: Some(2),
+            status: RunStatus::Cancelled,
+            assistant_message_id: Some("assistant-cancelled".to_string()),
+            cancelled: true,
+            recovered: false,
+            claude_session_id: None,
+            pid: None,
+            usage: None,
+            codex_thread_id: Some("thread-1".to_string()),
+            codex_turn_id: None,
+            cursor_chat_id: None,
+        });
+        metadata.runs.push(RunEntry {
+            run_id: "run-completed".to_string(),
+            user_message_id: "user-completed".to_string(),
+            user_message: "keep me".to_string(),
+            model: Some("gpt-5.5".to_string()),
+            execution_mode: Some("yolo".to_string()),
+            thinking_level: None,
+            effort_level: None,
+            backend: Some(Backend::Codex),
+            started_at: 3,
+            ended_at: Some(4),
+            status: RunStatus::Completed,
+            assistant_message_id: Some("assistant-completed".to_string()),
+            cancelled: false,
+            recovered: false,
+            claude_session_id: None,
+            pid: None,
+            usage: None,
+            codex_thread_id: Some("thread-1".to_string()),
+            codex_turn_id: None,
+            cursor_chat_id: None,
+        });
+
+        assert_eq!(metadata.to_index_entry().message_count, 2);
     }
 
     #[test]

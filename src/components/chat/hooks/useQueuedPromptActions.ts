@@ -4,6 +4,7 @@ import {
   persistMoveQueuedFront,
   persistRemoveQueued,
   steerCodexTurn,
+  steerPiTurn,
 } from '@/services/chat'
 import { useChatStore } from '@/store/chat-store'
 import { logger } from '@/lib/logger'
@@ -32,9 +33,9 @@ function hasAttachments(msg: QueuedMessage): boolean {
  * "Send now" is backend-aware:
  * - Idle session: promote the message to the queue front and let the queue
  *   processor send it (reuses the existing atomic dequeue + send path).
- * - Busy Codex session: inject the text into the running turn via
- *   `turn/steer` (the model sees it after the next tool call). Falls back to
- *   cancel+send when the turn already ended or the message has attachments.
+ * - Busy Codex/Pi session: inject the text into the running turn via the
+ *   backend steering API. Falls back to cancel+send when the turn already
+ *   ended or the message has attachments.
  * - Busy other backends: promote to front, cancel the current run — the
  *   queue processor auto-sends the promoted message once the session is idle.
  */
@@ -80,17 +81,25 @@ export function useQueuedPromptActions() {
         return
       }
 
-      // Busy Codex session: steer the running turn. Attachments can't be
+      // Busy Codex/Pi session: steer the running turn. Attachments can't be
       // injected mid-turn, so those messages use the cancel+send path.
       const backend = store.selectedBackends[sessionId] ?? 'claude'
-      if (backend === 'codex' && isSending && !hasAttachments(msg)) {
+      if (
+        (backend === 'codex' || backend === 'pi') &&
+        isSending &&
+        !hasAttachments(msg)
+      ) {
         try {
-          await steerCodexTurn(worktreeId, sessionId, msg.message)
+          if (backend === 'pi') {
+            await steerPiTurn(worktreeId, sessionId, msg.message)
+          } else {
+            await steerCodexTurn(worktreeId, sessionId, msg.message)
+          }
           handleRemoveQueuedMessage(sessionId, messageId)
           return
         } catch (error) {
           // Turn ended / not started yet — fall through to cancel+send
-          logger.debug('Codex steer failed, falling back to cancel+send', {
+          logger.debug(`${backend} steer failed, falling back to cancel+send`, {
             error,
             sessionId,
           })

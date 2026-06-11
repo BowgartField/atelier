@@ -338,17 +338,7 @@ pub async fn get_sessions(
                 let count: u32 = metadata
                     .runs
                     .iter()
-                    .map(|run| {
-                        let is_undo_send = run.status == RunStatus::Cancelled
-                            && run.assistant_message_id.is_none();
-                        if is_undo_send {
-                            0
-                        } else if run.assistant_message_id.is_some() {
-                            2 // user + assistant
-                        } else {
-                            1 // just user (still running or cancelled without response)
-                        }
-                    })
+                    .map(super::types::RunEntry::rendered_message_count)
                     .sum();
                 session.message_count = Some(count);
             }
@@ -778,6 +768,7 @@ async fn drain_backend_queue(
             // A Codex turn may be running — steer queued messages into it
             // instead of waiting for the run to finish (preference-gated).
             drain_queue_into_codex_turn(&app, &worktree_id, &session_id).await;
+            drain_queue_into_pi_turn(&app, &worktree_id, &session_id).await;
             log::trace!("[QueueDrain] session active, stop session={session_id}");
             return;
         }
@@ -2340,9 +2331,21 @@ pub async fn send_chat_message(
     let cursor_chat_id = sessions
         .find_session(&session_id)
         .and_then(|s| s.cursor_chat_id.clone());
-    let pi_session_id = sessions
+    let raw_pi_session_id = sessions
         .find_session(&session_id)
         .and_then(|s| s.pi_session_id.clone());
+    let pi_session_id = raw_pi_session_id
+        .as_deref()
+        .filter(|sid| *sid != session_id)
+        .map(ToOwned::to_owned);
+    if raw_pi_session_id.as_deref() == Some(session_id.as_str()) {
+        let _ = with_sessions_mut(&app, &worktree_path, &worktree_id, |sessions| {
+            if let Some(session) = sessions.find_session_mut(&session_id) {
+                session.pi_session_id = None;
+            }
+            Ok(())
+        });
+    }
 
     let previous_backend = load_metadata(&app, &session_id)
         .ok()
@@ -3467,6 +3470,7 @@ pub async fn send_chat_message(
                     &thread_app,
                     &thread_session_id,
                     &thread_worktree_id,
+                    &thread_run_id,
                     std::path::Path::new(&thread_working_dir),
                     thread_opencode_session_id.as_deref(),
                     thread_model.as_deref(),
@@ -3626,6 +3630,7 @@ pub async fn send_chat_message(
                     &thread_app,
                     &thread_session_id,
                     &thread_worktree_id,
+                    &thread_run_id,
                     std::path::Path::new(&thread_working_dir),
                     thread_cursor_chat_id.as_deref(),
                     thread_model.as_deref(),
@@ -3666,6 +3671,7 @@ pub async fn send_chat_message(
                     &thread_app,
                     &thread_session_id,
                     &thread_worktree_id,
+                    &thread_run_id,
                     std::path::Path::new(&thread_working_dir),
                     thread_execution_mode.as_deref(),
                     thread_model.as_deref(),
@@ -3806,6 +3812,7 @@ pub async fn send_chat_message(
                     &thread_app,
                     &thread_session_id,
                     &thread_worktree_id,
+                    &thread_output_file,
                     std::path::Path::new(&thread_working_dir),
                     thread_pi_session_id.as_deref(),
                     thread_model.as_deref(),
@@ -3970,8 +3977,8 @@ pub async fn send_chat_message(
     // OpenCode/Cursor runs are reconstructed in-process rather than tailed from a
     // detached JSONL stream. Write a synthetic assistant line so history reload can
     // reconstruct content after the live stream completes.
-    // Skip when cancelled: the frontend's save_cancelled_message already persists
-    // cancelled content to the same JSONL file, and writing here would duplicate it.
+    // Skip when cancelled: cancelled turns stay in run metadata/logs for diagnostics
+    // but are intentionally excluded from visible chat history on reload.
     if matches!(
         unified_response.backend,
         Backend::Opencode | Backend::Cursor | Backend::Pi | Backend::Commandcode
@@ -6783,6 +6790,101 @@ pub async fn resume_session(
             continue;
         }
 
+        // === Pi detached RPC-host resume path ===
+        if run.backend == Some(Backend::Pi) {
+            let pid = match run.pid {
+                Some(p) => p,
+                None => continue,
+            };
+            let output_file = session_dir.join(format!("{run_id}.jsonl"));
+
+            log::trace!(
+                "Resuming Pi RPC host run: {run_id}, PID: {pid}, output: {:?}",
+                output_file
+            );
+
+            if let Some(metadata_run) = metadata.find_run_mut(&run_id) {
+                metadata_run.status = RunStatus::Running;
+            }
+            save_metadata(&app, &metadata)?;
+
+            if !super::registry::register_detached_process(session_id.clone(), pid) {
+                log::warn!("Resume Pi session {session_id} was cancelled before tailing started");
+                return Ok(ResumeSessionResponse {
+                    resumed: false,
+                    run_count: 0,
+                });
+            }
+
+            let app_clone = app.clone();
+            let session_id_clone = session_id.clone();
+            let worktree_id_clone = worktree_id.clone();
+            let run_id_clone = run_id.clone();
+
+            tauri::async_runtime::spawn(async move {
+                let emit_done = |app: &tauri::AppHandle, sid: &str, wid: &str| {
+                    let _ = app.emit_all(
+                        "chat:done",
+                        &serde_json::json!({ "session_id": sid, "worktree_id": wid, "waiting_for_plan": false }),
+                    );
+                };
+
+                let (pi_session_id, usage, cancelled) = match super::pi::tail_pi_output(
+                    &app_clone,
+                    &session_id_clone,
+                    &worktree_id_clone,
+                    &output_file,
+                    pid,
+                ) {
+                    Ok(response) => (response.session_id, response.usage, response.cancelled),
+                    Err(e) => {
+                        log::error!("Resume Pi tail failed for run: {run_id_clone}, error: {e}");
+                        super::registry::unregister_process(&session_id_clone);
+                        if let Ok(mut writer) =
+                            RunLogWriter::resume(&app_clone, &session_id_clone, &run_id_clone)
+                        {
+                            if let Err(e) = writer.crash() {
+                                log::error!("Failed to mark Pi run as crashed: {e}");
+                            }
+                        }
+                        emit_done(&app_clone, &session_id_clone, &worktree_id_clone);
+                        return;
+                    }
+                };
+
+                super::registry::unregister_process(&session_id_clone);
+                if cancelled {
+                    emit_done(&app_clone, &session_id_clone, &worktree_id_clone);
+                }
+
+                if let Ok(mut writer) =
+                    RunLogWriter::resume(&app_clone, &session_id_clone, &run_id_clone)
+                {
+                    let assistant_message_id = uuid::Uuid::new_v4().to_string();
+                    if let Err(e) = writer.complete(&assistant_message_id, None, usage.clone()) {
+                        log::error!("Failed to mark resumed Pi run completed: {e}");
+                    }
+                }
+
+                if !pi_session_id.is_empty() {
+                    if let Err(e) =
+                        with_existing_metadata_mut(&app_clone, &session_id_clone, |metadata| {
+                            metadata.pi_session_id = Some(pi_session_id.clone());
+                            if let Some(run) = metadata.find_run_mut(&run_id_clone) {
+                                // Pi run entries do not have a dedicated per-run
+                                // field yet; session-level pi_session_id is the
+                                // authoritative resume id.
+                                run.usage = usage.clone();
+                            }
+                        })
+                    {
+                        log::warn!("Failed to persist recovered Pi session id: {e}");
+                    }
+                }
+            });
+            continue;
+        }
+
         // === Claude PID-based resume path ===
         let pid = match run.pid {
             Some(p) => p,
@@ -7536,8 +7638,12 @@ async fn steer_text_into_codex_turn(
 /// The `backend` field is omitted for the Claude default (see the frontend
 /// `QueuedMessage` capture), so a missing/null backend is treated as non-Codex.
 fn queued_message_is_steerable(msg: &serde_json::Value) -> bool {
-    let backend_is_codex = msg.get("backend").and_then(Value::as_str) == Some("codex");
-    if !backend_is_codex {
+    queued_message_is_steerable_for_backend(msg, "codex")
+}
+
+fn queued_message_is_steerable_for_backend(msg: &serde_json::Value, backend: &str) -> bool {
+    let backend_matches = msg.get("backend").and_then(Value::as_str) == Some(backend);
+    if !backend_matches {
         return false;
     }
 
@@ -7553,6 +7659,81 @@ fn queued_message_is_steerable(msg: &serde_json::Value) -> bool {
             .map(|a| a.is_empty())
             .unwrap_or(true)
     })
+}
+
+/// Inject a user message into a running Pi RPC turn via the detached PI host.
+#[tauri::command]
+pub async fn steer_pi_turn(
+    app: AppHandle,
+    worktree_id: String,
+    session_id: String,
+    message: String,
+) -> Result<(), String> {
+    steer_text_into_pi_turn(&app, &worktree_id, &session_id, &message).await
+}
+
+async fn steer_text_into_pi_turn(
+    app: &AppHandle,
+    worktree_id: &str,
+    session_id: &str,
+    message: &str,
+) -> Result<(), String> {
+    #[cfg(not(unix))]
+    {
+        let _ = (app, worktree_id, session_id, message);
+        Err("Pi steering is only available for detached Unix RPC hosts".to_string())
+    }
+
+    #[cfg(unix)]
+    {
+        let metadata = load_metadata(app, session_id)?
+            .ok_or_else(|| format!("No metadata found for session: {session_id}"))?;
+        let run_id = metadata
+            .runs
+            .iter()
+            .rev()
+            .find(|r| r.status == RunStatus::Running && r.backend == Some(Backend::Pi))
+            .map(|r| r.run_id.clone())
+            .ok_or_else(|| format!("No running Pi run for session: {session_id}"))?;
+        let app_data = app
+            .path()
+            .app_data_dir()
+            .map_err(|e| format!("Failed to resolve app data dir: {e}"))?;
+        let socket_path = super::pi::pi_rpc_socket_path(&app_data, session_id, &run_id);
+        let line = super::pi::serialize_pi_rpc_command(
+            "steer",
+            Some(message),
+            Some(&format!("steer-{run_id}")),
+        );
+        super::pi::send_pi_rpc_host_command(&socket_path, &line)?;
+
+        match run_log::RunLogWriter::resume(app, session_id, &run_id) {
+            Ok(mut writer) => {
+                let line = serde_json::json!({
+                    "type": "steered_user_message",
+                    "text": message,
+                });
+                if let Err(e) = writer.write_line(&line.to_string()) {
+                    log::warn!(
+                        "Failed to persist Pi steered message for session {session_id}: {e}"
+                    );
+                }
+            }
+            Err(e) => log::warn!("Failed to open run log for Pi steered message: {e}"),
+        }
+
+        app.emit_all(
+            "chat:steered",
+            &serde_json::json!({
+                "session_id": session_id,
+                "worktree_id": worktree_id,
+                "text": message,
+            }),
+        )
+        .ok();
+
+        Ok(())
+    }
 }
 
 /// Drain steerable queued messages straight into the running Codex turn
@@ -7639,6 +7820,87 @@ pub(crate) fn trigger_codex_queue_steer(app: AppHandle, worktree_id: String, ses
     tauri::async_runtime::spawn(async move {
         drain_queue_into_codex_turn(&app, &worktree_id, &session_id).await;
     });
+}
+
+/// Drain steerable queued messages into a running Pi RPC host. Pi's own
+/// steering queue delivers these at the next safe tool/turn boundary.
+async fn drain_queue_into_pi_turn(app: &AppHandle, worktree_id: &str, session_id: &str) {
+    #[cfg(not(unix))]
+    {
+        let _ = (app, worktree_id, session_id);
+    }
+
+    #[cfg(unix)]
+    loop {
+        let has_running_pi = load_metadata(app, session_id)
+            .ok()
+            .flatten()
+            .and_then(|metadata| {
+                metadata
+                    .runs
+                    .iter()
+                    .rev()
+                    .find(|r| r.status == RunStatus::Running && r.backend == Some(Backend::Pi))
+                    .map(|r| r.run_id.clone())
+            })
+            .is_some();
+        if !has_running_pi {
+            return;
+        }
+
+        let popped = match with_existing_metadata_mut(app, session_id, |metadata| {
+            match metadata.queued_messages.first() {
+                Some(front) if queued_message_is_steerable_for_backend(front, "pi") => {
+                    let msg = metadata.queued_messages.remove(0);
+                    (Some(msg), metadata.queued_messages.clone())
+                }
+                _ => (None, metadata.queued_messages.clone()),
+            }
+        }) {
+            Ok((popped, queue)) => {
+                if popped.is_some() {
+                    app.emit_all(
+                        "queue:updated",
+                        &serde_json::json!({ "sessionId": session_id, "queue": queue }),
+                    )
+                    .ok();
+                }
+                popped
+            }
+            Err(e) => {
+                log::warn!("[PiSteer] failed to read queue session={session_id}: {e}");
+                return;
+            }
+        };
+
+        let Some(msg) = popped else { return };
+        let text = msg
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        if text.is_empty() {
+            continue;
+        }
+
+        log::info!("[PiSteer] steering queued message into running Pi session={session_id}");
+        if let Err(e) = steer_text_into_pi_turn(app, worktree_id, session_id, &text).await {
+            log::warn!("[PiSteer] steer failed, requeueing at front session={session_id}: {e}");
+            let requeued = with_existing_metadata_mut(app, session_id, |metadata| {
+                metadata.queued_messages.insert(0, msg.clone());
+                metadata.queued_messages.clone()
+            });
+            if let Ok(queue) = requeued {
+                app.emit_all(
+                    "queue:updated",
+                    &serde_json::json!({ "sessionId": session_id, "queue": queue }),
+                )
+                .ok();
+            }
+            return;
+        }
+    }
 }
 
 /// Cancel the pending ScheduleWakeup for a session (user-initiated).

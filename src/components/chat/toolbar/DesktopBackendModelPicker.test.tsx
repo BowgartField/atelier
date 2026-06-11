@@ -22,6 +22,7 @@ Element.prototype.scrollIntoView = vi.fn()
 
 const modelMocks = vi.hoisted(() => ({
   opencodeModels: ['openai/gpt-5.4', 'groq/compound-mini'],
+  opencodeModelsError: false,
   cursorModels: [{ id: 'auto', label: 'Auto' }],
   piModels: [{ id: 'openai-codex/gpt-5.5', label: 'gpt-5.5 (openai-codex)' }],
 }))
@@ -43,6 +44,7 @@ vi.mock('@/hooks/use-mobile', () => ({
 vi.mock('@/services/opencode-cli', () => ({
   useAvailableOpencodeModels: () => ({
     data: modelMocks.opencodeModels,
+    isError: modelMocks.opencodeModelsError,
   }),
 }))
 
@@ -62,6 +64,7 @@ beforeEach(() => {
   envMocks.isNativeApp = true
   envMocks.isMobile = false
   modelMocks.opencodeModels = ['openai/gpt-5.4', 'groq/compound-mini']
+  modelMocks.opencodeModelsError = false
   modelMocks.cursorModels = [{ id: 'auto', label: 'Auto' }]
   modelMocks.piModels = [
     { id: 'openai-codex/gpt-5.5', label: 'gpt-5.5 (openai-codex)' },
@@ -309,5 +312,49 @@ describe('DesktopBackendModelPicker', () => {
       await screen.findByText('gpt-5.5 (openai-codex)')
     ).toBeInTheDocument()
     expect(screen.queryByText('Sonnet (PI)')).toBeNull()
+  })
+
+  it('shows the available PI default when stored PI model is unavailable', () => {
+    render(
+      <DesktopBackendModelPicker
+        selectedBackend="pi"
+        selectedModel="pi/sonnet"
+        selectedProvider={null}
+        installedBackends={['pi']}
+        customCliProfiles={[]}
+        onModelChange={vi.fn()}
+        onBackendModelChange={vi.fn()}
+      />
+    )
+
+    expect(screen.getByText(/gpt-5\.5 \(openai-codex\)/i)).toBeInTheDocument()
+    expect(screen.queryByText('· pi/sonnet')).toBeNull()
+  })
+
+  it('does not show the static OpenCode fallback when model fetching fails', async () => {
+    const user = userEvent.setup()
+    modelMocks.opencodeModels = undefined as unknown as string[]
+    modelMocks.opencodeModelsError = true
+
+    render(
+      <DesktopBackendModelPicker
+        selectedBackend="opencode"
+        selectedModel="opencode/gpt-5.3-codex"
+        selectedProvider={null}
+        installedBackends={['opencode']}
+        customCliProfiles={[]}
+        onModelChange={vi.fn()}
+        onBackendModelChange={vi.fn()}
+      />
+    )
+
+    await user.click(
+      screen.getByRole('button', { name: /choose backend and model/i })
+    )
+
+    expect(screen.queryByText('GPT-5.3 Codex (OpenCode)')).toBeNull()
+    expect(
+      await screen.findByText('No OpenCode models found.')
+    ).toBeInTheDocument()
   })
 })

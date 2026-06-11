@@ -283,6 +283,8 @@ export default function useStreamingEvents({
       addUserInputBlock,
       addSendingSession,
     } = useChatStore.getState()
+    const cancelledRunIds = new Map<string, Set<string>>()
+    const cancelledUntaggedSessionIds = new Set<string>()
 
     // Hydrate ScheduleWakeup indicator store from backend so reloads do not
     // show historical tool_use blocks stuck in the "pending" spinner state.
@@ -307,6 +309,7 @@ export default function useStreamingEvents({
       user_message: string
     }>('chat:sending', event => {
       const { session_id, worktree_id: wtId, user_message } = event.payload
+      cancelledUntaggedSessionIds.delete(session_id)
       // Check if THIS client initiated the send (sender calls addSendingSession
       // before sendMessage.mutate, so it's already in sendingSessionIds).
       const isSender = !!useChatStore.getState().sendingSessionIds[session_id]
@@ -396,11 +399,18 @@ export default function useStreamingEvents({
     }
 
     const unlistenChunk = listen<ChunkEvent>('chat:chunk', event => {
-      const { session_id, content } = event.payload
+      const { session_id, content, run_id: eventRunId } = event.payload
       // Guard: drop stale chunks for sessions already cancelled/completed.
       // Without this, late events re-add the session to sendingSessionIds
       // after cancelSession() cleared it, causing the response to "still arrive".
       const currentState = useChatStore.getState()
+      const cancelledRunsForSession = cancelledRunIds.get(session_id)
+      if (eventRunId && cancelledRunsForSession?.has(eventRunId)) {
+        return
+      }
+      if (!eventRunId && cancelledUntaggedSessionIds.has(session_id)) {
+        return
+      }
       if (
         currentState.reviewingSessions[session_id] &&
         !currentState.sendingSessionIds[session_id]
@@ -1510,9 +1520,9 @@ export default function useStreamingEvents({
       queryClient.invalidateQueries({ queryKey: ['all-sessions'] })
     })
 
-    // Handle cancellation (user pressed Cmd+Option+Backspace / Ctrl+Alt+Backspace)
-    // Preserves partial streaming content as an optimistic message (like chat:done)
-    // Backend will also persist the partial response; mutation completion will update cache
+    // Handle cancellation (user pressed Cmd+Option+Backspace / Ctrl+Alt+Backspace).
+    // Cancelled turns are removed from the visible chat timeline; run logs and
+    // metadata may still retain them for diagnostics.
     const unlistenCancelled = listen<CancelledEvent>(
       'chat:cancelled',
       event => {
@@ -1521,6 +1531,7 @@ export default function useStreamingEvents({
           worktree_id: eventWorktreeId,
           undo_send,
           emitted_at_ms,
+          run_id: eventRunId,
         } = event.payload
 
         // Flush any buffered chunks/thinking so streaming state is up to date
@@ -1613,7 +1624,8 @@ export default function useStreamingEvents({
         // - No content streamed yet (cancelled before any response)
         // BUT: Don't restore if there are queued messages (user chose "Skip to Next")
         // Any assistant output (text, tool call, thinking, content block) counts
-        // as a started response — if present, preserve it and leave input empty.
+        // as a started response — if present, remove it from history and leave
+        // input empty.
         const hasToolCalls = toolCalls && toolCalls.length > 0
         const hasText = sanitizedContent.trim().length > 0
         const hasThinking = !!streamingThinkingContent[session_id]
@@ -1626,8 +1638,25 @@ export default function useStreamingEvents({
         const shouldRestoreMessage =
           !hasQueuedMessages && (undo_send || !hasContent)
 
+        const removeLatestUserMessageFromCache = () => {
+          queryClient.setQueryData<Session>(
+            chatQueryKeys.session(session_id),
+            old => {
+              if (!old) return old
+              const messages = [...old.messages]
+              const lastIndex = messages.length - 1
+              if (messages[lastIndex]?.role === 'user') {
+                messages.splice(lastIndex, 1)
+              }
+              return { ...old, messages }
+            }
+          )
+        }
+
         // Update TanStack Query cache FIRST (before clearing Zustand streaming state)
-        // This ensures the persisted message exists before StreamingMessage unmounts
+        // so the cancelled optimistic prompt/partial response disappears as soon
+        // as StreamingMessage unmounts. The backend still keeps run logs/metadata
+        // for diagnostics, but cancelled turns are not visible chat history.
 
         // Optimistically update last_run_status so "restored session" indicator hides
         queryClient.setQueryData<Session>(
@@ -1675,22 +1704,10 @@ export default function useStreamingEvents({
             }
             clearLastSentMessage(session_id)
 
-            queryClient.setQueryData<Session>(
-              chatQueryKeys.session(session_id),
-              old => {
-                if (!old) return old
-                const messages = [...old.messages]
-                for (let i = messages.length - 1; i >= 0; i--) {
-                  if (messages[i]?.role === 'user') {
-                    messages.splice(i, 1)
-                    break
-                  }
-                }
-                return { ...old, messages }
-              }
-            )
+            removeLatestUserMessageFromCache()
           } else {
             useChatStore.getState().clearLastSentAttachments(session_id)
+            removeLatestUserMessageFromCache()
           }
         } else {
           // Partial response exists — attachments were consumed, don't restore.
@@ -1699,71 +1716,12 @@ export default function useStreamingEvents({
           // once streamingContents has been wiped by cancelSession().
           useChatStore.getState().clearLastSentAttachments(session_id)
           useChatStore.getState().clearLastSentMessage(session_id)
-          // Mark session as "cancelling" so concurrent cache:invalidate events
-          // skip the single-session refetch and don't overwrite the optimistic
-          // message before save_cancelled_message reconciles disk state.
-          // Cleared in the .finally() below once disk reconcile completes.
-          useChatStore.getState().addCancellingSession(session_id)
-          // Preserve partial response as optimistic message BEFORE clearing streaming state
-          queryClient.setQueryData<Session>(
-            chatQueryKeys.session(session_id),
-            old => {
-              if (!old) return old
-              return {
-                ...old,
-                messages: upsertAssistantMessage(old.messages, {
-                  id: generateId(),
-                  session_id,
-                  role: 'assistant' as const,
-                  content: sanitizedContent,
-                  timestamp: Math.floor(Date.now() / 1000),
-                  tool_calls: toolCalls ?? [],
-                  content_blocks: sanitizedContentBlocks ?? [],
-                  cancelled: true,
-                }),
-              }
-            }
-          )
-          // Persist partial content to JSONL so it survives app reload.
-          // The backend command handler may not have finished writing yet
-          // (e.g., OpenCode POST still in-flight, or web access WebSocket RTT
-          // exceeds the 250ms cache:invalidate debounce window).
-          // After resolution, clear the cancelling flag and refetch the single
-          // session so the now-reconciled disk state becomes authoritative.
-          void invoke('save_cancelled_message', {
-            sessionId: session_id,
-            worktreeId: sessionWorktreeId ?? eventWorktreeId,
-            worktreePath: '',
-            content: sanitizedContent,
-            toolCalls: toolCalls ?? [],
-            contentBlocks: sanitizedContentBlocks ?? [],
-          })
-            .catch(err =>
-              console.debug(
-                '[useStreamingEvents] Failed to persist partial cancelled content:',
-                err
-              )
-            )
-            .finally(() => {
-              useChatStore.getState().removeCancellingSession(session_id)
-              queryClient.invalidateQueries({
-                queryKey: chatQueryKeys.session(session_id),
-              })
-            })
-          // Safety timeout: if save_cancelled_message hangs (e.g., WebSocket
-          // disconnect), don't keep the session in cancelling state forever.
-          setTimeout(() => {
-            if (useChatStore.getState().cancellingSessionIds[session_id]) {
-              useChatStore.getState().removeCancellingSession(session_id)
-              queryClient.invalidateQueries({
-                queryKey: chatQueryKeys.session(session_id),
-              })
-            }
-          }, 5000)
+          removeLatestUserMessageFromCache()
         }
 
         // NOW batch-clear all streaming state in a single Zustand set()
-        // This happens AFTER optimistic messages are in the cache, preventing flicker
+        // This happens AFTER cancelled messages have been removed from cache,
+        // preventing flicker.
         console.log(
           `[Cancelled] about to cancelSession session=${session_id} shouldRestore=${shouldRestoreMessage}`,
           {
@@ -1773,16 +1731,24 @@ export default function useStreamingEvents({
           }
         )
         useChatStore.getState().cancelSession(session_id)
-
-        // For restore path: override reviewing state based on whether messages remain
-        if (shouldRestoreMessage) {
-          const updatedSession = queryClient.getQueryData<Session>(
-            chatQueryKeys.session(session_id)
-          )
-          if (!updatedSession || updatedSession.messages.length === 0) {
-            useChatStore.getState().setSessionReviewing(session_id, false)
-          }
+        if (eventRunId) {
+          const runIds = cancelledRunIds.get(session_id) ?? new Set<string>()
+          runIds.add(eventRunId)
+          cancelledRunIds.set(session_id, runIds)
+        } else {
+          cancelledUntaggedSessionIds.add(session_id)
         }
+
+        // Override reviewing state based on whether visible messages remain.
+        const updatedSession = queryClient.getQueryData<Session>(
+          chatQueryKeys.session(session_id)
+        )
+        useChatStore
+          .getState()
+          .setSessionReviewing(
+            session_id,
+            (updatedSession?.messages.length ?? 0) > 0
+          )
 
         // Persist cancel state to disk BEFORE invalidating queries
         // This prevents a race where invalidation refetches stale waiting_for_input: true from disk
@@ -1802,12 +1768,10 @@ export default function useStreamingEvents({
         }
 
         if (resolvedWorktreeId && wtPath) {
-          // Determine final reviewing state from the branch that just ran
-          const isNowReviewing = shouldRestoreMessage
-            ? (queryClient.getQueryData<Session>(
-                chatQueryKeys.session(session_id)
-              )?.messages.length ?? 0) > 0
-            : true
+          const isNowReviewing =
+            (queryClient.getQueryData<Session>(
+              chatQueryKeys.session(session_id)
+            )?.messages.length ?? 0) > 0
 
           invoke('update_session_state', {
             worktreeId: resolvedWorktreeId,

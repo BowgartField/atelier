@@ -449,6 +449,7 @@ export interface ChunkEvent {
   session_id: string
   worktree_id: string // Kept for backward compatibility
   content: string
+  run_id?: string
 }
 
 /**
@@ -508,6 +509,7 @@ export interface CancelledEvent {
   worktree_id: string // Kept for backward compatibility
   undo_send: boolean // True if user message should be restored to input (instant cancellation)
   emitted_at_ms: number
+  run_id?: string
 }
 
 /**

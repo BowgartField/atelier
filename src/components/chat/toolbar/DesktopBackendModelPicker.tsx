@@ -82,9 +82,10 @@ export function DesktopBackendModelPicker({
     enabled: keyboardShortcutsEnabled,
   })
 
-  const { data: availableOpencodeModels } = useAvailableOpencodeModels({
-    enabled: installedBackends.includes('opencode'),
-  })
+  const { data: availableOpencodeModels, isError: opencodeModelsError } =
+    useAvailableOpencodeModels({
+      enabled: installedBackends.includes('opencode'),
+    })
   const { data: availableCursorModels } = useAvailableCursorModels({
     enabled: installedBackends.includes('cursor'),
   })
@@ -95,14 +96,13 @@ export function DesktopBackendModelPicker({
     enabled: installedBackends.includes('commandcode'),
   })
 
-  const opencodeModelOptions = useMemo(
-    () =>
-      availableOpencodeModels?.map(model => ({
-        value: model,
-        label: formatOpencodeModelLabel(model),
-      })),
-    [availableOpencodeModels]
-  )
+  const opencodeModelOptions = useMemo(() => {
+    if (opencodeModelsError) return []
+    return availableOpencodeModels?.map(model => ({
+      value: model,
+      label: formatOpencodeModelLabel(model),
+    }))
+  }, [availableOpencodeModels, opencodeModelsError])
   const cursorModelOptions = useMemo(
     () =>
       availableCursorModels?.map(model => ({
@@ -116,6 +116,7 @@ export function DesktopBackendModelPicker({
       availablePiModels?.map(model => ({
         value: `pi/${model.id}`,
         label: model.label || formatPiModelLabel(model.id),
+        is_default: model.is_default,
       })),
     [availablePiModels]
   )

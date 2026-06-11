@@ -147,6 +147,7 @@ import {
 } from '@/lib/model-utils'
 import { copyToClipboard, copyHtmlToClipboard } from '@/lib/clipboard'
 import { useClaudeCliStatus } from '@/services/claude-cli'
+import { useAvailablePiModels } from '@/services/pi-cli'
 import { usePrStatus, usePrStatusEvents } from '@/services/pr-status'
 import type { PrDisplayStatus, CheckStatus } from '@/types/pr-status'
 import type { QueuedMessage, Session, WorktreeSessions } from '@/types/chat'
@@ -589,6 +590,18 @@ export function ChatWindow({
 
   // Installed backends (only these should be selectable)
   const { installedBackends } = useInstalledBackends()
+  const { data: availablePiModels } = useAvailablePiModels({
+    enabled: installedBackends.includes('pi'),
+  })
+  const availablePiModelOptions = useMemo(
+    () =>
+      availablePiModels?.map(model => ({
+        value: `pi/${model.id}`,
+        label: model.label,
+        is_default: model.is_default,
+      })),
+    [availablePiModels]
+  )
 
   // Per-session backend selection: session → zustand → project default → global default
   const zustandBackend = useChatStore(state =>
@@ -621,7 +634,8 @@ export function ChatWindow({
   // Per-session model selection, falls back to preferences default (backend-aware)
   const defaultModel = resolveDefaultModelForBackend(
     selectedBackend,
-    preferences
+    preferences,
+    selectedBackend === 'pi' ? availablePiModelOptions : undefined
   )
   const selectedModel: string = session?.selected_model ?? defaultModel
   const buildNewContextLabel = resolveApprovalLabel(
@@ -1976,6 +1990,7 @@ export function ChatWindow({
     installedBackends,
     session,
     preferences,
+    piModelOptions: availablePiModelOptions,
     queryClient,
     worktreeProjectId: worktree?.project_id,
     setSessionModel,

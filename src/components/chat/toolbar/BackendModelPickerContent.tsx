@@ -131,9 +131,10 @@ export function BackendModelPickerContent({
     [favKey, fastSet, fastModels, patchPreferences]
   )
 
-  const { data: availableOpencodeModels } = useAvailableOpencodeModels({
-    enabled: installedBackends.includes('opencode'),
-  })
+  const { data: availableOpencodeModels, isError: opencodeModelsError } =
+    useAvailableOpencodeModels({
+      enabled: installedBackends.includes('opencode'),
+    })
   const { data: availableCursorModels } = useAvailableCursorModels({
     enabled: installedBackends.includes('cursor'),
   })
@@ -144,14 +145,13 @@ export function BackendModelPickerContent({
     enabled: installedBackends.includes('commandcode'),
   })
 
-  const opencodeModelOptions = useMemo(
-    () =>
-      availableOpencodeModels?.map(model => ({
-        value: model,
-        label: formatOpencodeModelLabel(model),
-      })),
-    [availableOpencodeModels]
-  )
+  const opencodeModelOptions = useMemo(() => {
+    if (opencodeModelsError) return []
+    return availableOpencodeModels?.map(model => ({
+      value: model,
+      label: formatOpencodeModelLabel(model),
+    }))
+  }, [availableOpencodeModels, opencodeModelsError])
   const cursorModelOptions = useMemo(
     () =>
       availableCursorModels?.map(model => ({
@@ -165,6 +165,7 @@ export function BackendModelPickerContent({
       availablePiModels?.map(model => ({
         value: `pi/${model.id}`,
         label: model.label || formatPiModelLabel(model.id),
+        is_default: model.is_default,
       })),
     [availablePiModels]
   )
@@ -470,7 +471,9 @@ export function BackendModelPickerContent({
             )}
           >
             {filteredOptions.length === 0 && (
-              <CommandEmpty>No models found.</CommandEmpty>
+              <CommandEmpty>
+                No {getBackendPlainLabel(activeBackend)} models found.
+              </CommandEmpty>
             )}
 
             {filteredOptions.map(option => {

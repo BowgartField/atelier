@@ -577,7 +577,19 @@ export function useSession(
         const cached = queryClient.getQueryData<Session>(
           chatQueryKeys.session(sessionId)
         )
-        if (cached && cached.messages.length > session.messages.length) {
+        const cachedStart = cached?.loaded_run_start_index
+        const freshStart = session.loaded_run_start_index ?? 0
+        const cachedIncludesCancelledAssistant = cached?.messages.some(
+          message => message.role === 'assistant' && message.cancelled
+        )
+        const shouldPreserveCachedMessages =
+          cached &&
+          cached.messages.length > session.messages.length &&
+          !cachedIncludesCancelledAssistant &&
+          (useChatStore.getState().sendingSessionIds[sessionId] ||
+            (typeof cachedStart === 'number' && cachedStart < freshStart))
+
+        if (cached && shouldPreserveCachedMessages) {
           logger.warn(
             '[useSession] preserving cached messages over fresh fetch',
             {
@@ -2656,6 +2668,19 @@ export async function steerCodexTurn(
   message: string
 ): Promise<void> {
   await invoke('steer_codex_turn', { worktreeId, sessionId, message })
+}
+
+/**
+ * Inject a user message into a running Pi RPC turn via Jean's detached Pi host.
+ * Throws when the host is gone or steering is unavailable — callers fall back
+ * to cancel+send.
+ */
+export async function steerPiTurn(
+  worktreeId: string,
+  sessionId: string,
+  message: string
+): Promise<void> {
+  await invoke('steer_pi_turn', { worktreeId, sessionId, message })
 }
 
 /**

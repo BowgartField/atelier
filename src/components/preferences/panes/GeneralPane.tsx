@@ -179,6 +179,7 @@ import {
 } from '@/services/git-status'
 import { getPathUpdateAction } from '@/lib/cli-update'
 import { SettingsSection } from '../SettingsSection'
+import { resolvePiDefaultModel } from '@/lib/session-defaults'
 
 interface CleanupResult {
   deleted_worktrees: number
@@ -929,18 +930,31 @@ export const GeneralPane: React.FC<{ scope?: PreferencesPaneScope }> = ({
     effectiveBackend) as CliBackend
   const effectiveYoloBackend = (preferences?.yolo_backend ??
     effectiveBackend) as CliBackend
-  const selectedPiModel = preferences?.selected_pi_model ?? 'pi/sonnet'
-  const piModelOptions: { value: PiModel; label: string }[] = (
+  const piModelOptions: {
+    value: PiModel
+    label: string
+    is_default?: boolean
+  }[] = (
     availablePiModels?.length
       ? availablePiModels.map(model => ({
           value: `pi/${model.id}` as PiModel,
           label: model.label || formatPiModelLabel(model.id),
+          is_default: model.is_default,
         }))
-      : (PI_MODEL_OPTIONS as { value: PiModel; label: string }[])
+      : (PI_MODEL_OPTIONS as {
+          value: PiModel
+          label: string
+          is_default?: boolean
+        }[])
   ).map(option => ({
     value: option.value,
     label: option.label || formatPiModelLabel(option.value),
+    is_default: option.is_default,
   }))
+  const selectedPiModel = resolvePiDefaultModel(
+    preferences?.selected_pi_model,
+    piModelOptions
+  ) as PiModel
   const selectedPiModelLabel =
     piModelOptions.find(option => option.value === selectedPiModel)?.label ??
     formatPiModelLabel(selectedPiModel)

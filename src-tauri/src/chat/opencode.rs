@@ -17,6 +17,8 @@ struct ChunkEvent {
     session_id: String,
     worktree_id: String,
     content: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    run_id: Option<String>,
 }
 
 #[derive(serde::Serialize, Clone)]
@@ -105,6 +107,7 @@ struct TrackedPartState {
 struct SharedSseSubscriber {
     jean_session_id: String,
     worktree_id: String,
+    run_id: String,
     cancelled: Arc<AtomicBool>,
     streamed_any: Arc<AtomicBool>,
     tracked_parts: HashMap<String, TrackedPartState>,
@@ -337,6 +340,7 @@ impl SharedSseSubscription {
         opencode_session_id: String,
         jean_session_id: String,
         worktree_id: String,
+        run_id: String,
         working_dir: String,
         cancelled: Arc<AtomicBool>,
         streamed_any: Arc<AtomicBool>,
@@ -346,6 +350,7 @@ impl SharedSseSubscription {
         let subscriber = Arc::new(Mutex::new(SharedSseSubscriber {
             jean_session_id,
             worktree_id,
+            run_id,
             cancelled,
             streamed_any,
             tracked_parts: HashMap::new(),
@@ -550,6 +555,7 @@ fn emit_chunk_for_subscriber(app: &AppHandle, subscriber: &SharedSseSubscriber, 
         app,
         &subscriber.jean_session_id,
         &subscriber.worktree_id,
+        Some(&subscriber.run_id),
         content,
     );
     subscriber.streamed_any.store(true, Ordering::Relaxed);
@@ -609,7 +615,13 @@ fn has_subscribers_for_working_dir(
         .any(|entry| entry.working_dir == working_dir)
 }
 
-fn emit_chat_chunk(app: &AppHandle, session_id: &str, worktree_id: &str, content: &str) {
+fn emit_chat_chunk(
+    app: &AppHandle,
+    session_id: &str,
+    worktree_id: &str,
+    run_id: Option<&str>,
+    content: &str,
+) {
     if content.is_empty() {
         return;
     }
@@ -620,6 +632,7 @@ fn emit_chat_chunk(app: &AppHandle, session_id: &str, worktree_id: &str, content
             session_id: session_id.to_string(),
             worktree_id: worktree_id.to_string(),
             content: content.to_string(),
+            run_id: run_id.map(ToOwned::to_owned),
         },
     );
 }
@@ -1960,6 +1973,7 @@ pub fn execute_opencode_http(
     app: &tauri::AppHandle,
     session_id: &str,
     worktree_id: &str,
+    run_id: &str,
     working_dir: &std::path::Path,
     existing_opencode_session_id: Option<&str>,
     model: Option<&str>,
@@ -2099,6 +2113,7 @@ pub fn execute_opencode_http(
         opencode_session_id.clone(),
         session_id.to_string(),
         worktree_id.to_string(),
+        run_id.to_string(),
         working_dir_string.clone(),
         cancelled.clone(),
         streamed_via_sse.clone(),
@@ -2311,6 +2326,7 @@ pub fn execute_opencode_http(
                                     session_id: session_id.to_string(),
                                     worktree_id: worktree_id.to_string(),
                                     content: text.to_string(),
+                                    run_id: Some(run_id.to_string()),
                                 },
                             );
                         }
