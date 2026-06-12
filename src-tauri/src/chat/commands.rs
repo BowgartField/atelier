@@ -4154,7 +4154,11 @@ pub async fn send_chat_message(
         });
     }
 
-    if unified_response.cancelled && !has_meaningful_content && !has_tool_calls {
+    if unified_response.cancelled
+        && !has_meaningful_content
+        && !has_tool_calls
+        && !has_content_blocks
+    {
         // Instant cancellation with no content
         let resume_sid = resume_id_for_persisted_claude_run(
             &response_backend,
@@ -8408,6 +8412,30 @@ mod tests {
         ));
         assert!(!should_clear_stale_resumed_claude_session(
             true, false, false, true, false, true
+        ));
+    }
+
+    #[test]
+    fn stale_resumed_claude_session_is_kept_for_cancelled_content_block_only_response() {
+        // Regression for the send-path branch at the execute_claude_detached call
+        // site: a cancelled response that carries content_blocks but no plain
+        // content must NOT clear the resumed session id. Clearing it here is what
+        // produced "Response content was not captured for this completed run."
+        // after cancelling and resending (issue #395).
+        let was_resuming = true;
+        let has_content = false;
+        let has_tool_calls = false;
+        let has_content_blocks = true;
+        let has_usage = false;
+        let was_cancelled = true;
+
+        assert!(!should_clear_stale_resumed_claude_session(
+            was_resuming,
+            has_content,
+            has_tool_calls,
+            has_content_blocks,
+            has_usage,
+            was_cancelled,
         ));
     }
 
