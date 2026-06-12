@@ -2711,7 +2711,7 @@ export const GeneralPane: React.FC<{ scope?: PreferencesPaneScope }> = ({
 
             <InlineField
               label="Steer running turn"
-              description="Prompts sent while Codex is working are injected into the current turn (picked up after the next tool call) instead of queued"
+              description="Prompts sent while a steer-capable backend like Codex or PI is working are injected into the current turn instead of queued"
             >
               <Switch
                 checked={preferences?.codex_auto_steer_enabled ?? true}

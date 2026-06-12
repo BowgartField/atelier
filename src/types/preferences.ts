@@ -1054,7 +1054,7 @@ export interface AppPreferences {
   codex_goal_execution_mode: CodexGoalExecutionMode // Execution mode used when starting a Codex /goal
   codex_multi_agent_enabled: boolean // Enable Codex multi-agent collaboration (experimental)
   codex_max_agent_threads: number // Max concurrent agent threads (1-8) when multi-agent is enabled
-  codex_auto_steer_enabled: boolean // Steer prompts into a running Codex turn instead of queueing (default: true)
+  codex_auto_steer_enabled: boolean // Steer prompts into steer-capable running turns instead of queueing (default: true)
   restore_last_session: boolean // Restore last session when switching projects (default: true)
   close_original_on_clear_context: boolean // Close original session when using Clear Context and yolo (default: true)
   build_model: string | null // Model override for plan approval (build mode), null = use session model
