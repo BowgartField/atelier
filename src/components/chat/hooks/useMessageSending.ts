@@ -7,6 +7,9 @@ import {
   chatQueryKeys,
   cancelChatMessage,
   persistEnqueue,
+  steerCodexTurn,
+  steerOpencodeTurn,
+  steerPiTurn,
 } from '@/services/chat'
 import { skillQueryKeys } from '@/services/skills'
 import { buildMcpConfigJson } from '@/services/mcp'
@@ -48,6 +51,9 @@ interface UseMessageSendingParams {
         chrome_enabled?: boolean
         ai_language?: string
         codex_goal_execution_mode?: 'build' | 'yolo'
+        codex_auto_steer_enabled?: boolean
+        opencode_auto_steer_enabled?: boolean
+        pi_auto_steer_enabled?: boolean
       }
     | undefined
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -421,6 +427,11 @@ export function useMessageSending({
 
       const mode = executionModeRef.current
       const thinkingLvl = selectedThinkingLevelRef.current
+      const selectedBackend = selectedBackendRef.current
+      const usesEffortLevel =
+        useAdaptiveThinkingRef.current ||
+        isCodexBackendRef.current ||
+        selectedBackend === 'pi'
       const queuedMessage: QueuedMessage = {
         id: generateId(),
         message,
@@ -432,19 +443,15 @@ export function useMessageSending({
         provider: selectedProviderRef.current,
         executionMode: mode,
         thinkingLevel: thinkingLvl,
-        effortLevel:
-          useAdaptiveThinkingRef.current || isCodexBackendRef.current
-            ? selectedEffortLevelRef.current
-            : undefined,
+        effortLevel: usesEffortLevel
+          ? selectedEffortLevelRef.current
+          : undefined,
         mcpConfig: buildMcpConfigJson(
           mcpServersDataRef.current ?? [],
           enabledMcpServersRef.current,
           selectedBackendRef.current
         ),
-        backend:
-          selectedBackendRef.current !== 'claude'
-            ? selectedBackendRef.current
-            : undefined,
+        backend: selectedBackend !== 'claude' ? selectedBackend : undefined,
         queuedAt: Date.now(),
       }
 
@@ -455,6 +462,54 @@ export function useMessageSending({
         `[Send] handleSubmit sessionId=${activeSessionId} isSending=${isSendingNow}`
       )
       if (isSendingNow) {
+        // Auto-steer: inject the prompt into a steer-capable running turn
+        // instead of queueing. Attachments can't be injected mid-turn; steer
+        // failures (turn ended / not started yet) fall back to the normal queue.
+        const hasAttachments =
+          images.length > 0 ||
+          files.length > 0 ||
+          textFiles.length > 0 ||
+          skills.length > 0
+        const backend = selectedBackendRef.current
+        const autoSteerEnabled =
+          backend === 'opencode'
+            ? (preferences?.opencode_auto_steer_enabled ?? true)
+            : backend === 'pi'
+              ? (preferences?.pi_auto_steer_enabled ?? true)
+              : (preferences?.codex_auto_steer_enabled ?? true)
+        if (
+          (backend === 'codex' || backend === 'opencode' || backend === 'pi') &&
+          autoSteerEnabled &&
+          !hasAttachments
+        ) {
+          try {
+            const steerMessage = buildMessageWithRefs(queuedMessage)
+            if (backend === 'pi') {
+              await steerPiTurn(activeWorktreeId, activeSessionId, steerMessage)
+            } else if (backend === 'opencode') {
+              await steerOpencodeTurn(
+                activeWorktreeId,
+                activeWorktreePath,
+                activeSessionId,
+                steerMessage
+              )
+            } else {
+              await steerCodexTurn(
+                activeWorktreeId,
+                activeSessionId,
+                steerMessage
+              )
+            }
+            console.log(
+              `[Send] handleSubmit STEERED into running ${backend} turn`
+            )
+            return
+          } catch (err) {
+            console.log(
+              `[Send] handleSubmit steer failed, falling back to queue: ${err}`
+            )
+          }
+        }
         console.log(`[Send] handleSubmit ENQUEUING (session is sending)`)
         enqueueMessage(activeSessionId, queuedMessage)
         persistEnqueue(

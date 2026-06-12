@@ -71,6 +71,35 @@ When specifying subagent_type for Task tool calls, always use the fully qualifie
 static BACKEND_QUEUE_DRAINING: Lazy<Mutex<HashSet<String>>> =
     Lazy::new(|| Mutex::new(HashSet::new()));
 
+/// Sessions with a `send_chat_message` call currently in flight.
+///
+/// The registry-based "actively managed" guard only catches duplicates after a
+/// process/turn is registered, leaving a window where two concurrent sends
+/// (frontend queue processor vs backend queue drain vs another client) both
+/// pass the check and spawn duplicate runs. This claim is taken atomically at
+/// `send_chat_message` entry and held for the whole call.
+static ACTIVE_SENDS: Lazy<Mutex<HashSet<String>>> = Lazy::new(|| Mutex::new(HashSet::new()));
+
+/// RAII claim on a session's send slot — released on drop (any return path).
+struct SendClaim(String);
+
+impl SendClaim {
+    fn try_acquire(session_id: &str) -> Option<Self> {
+        let mut active = ACTIVE_SENDS.lock().unwrap();
+        if active.insert(session_id.to_string()) {
+            Some(Self(session_id.to_string()))
+        } else {
+            None
+        }
+    }
+}
+
+impl Drop for SendClaim {
+    fn drop(&mut self) {
+        ACTIVE_SENDS.lock().unwrap().remove(&self.0);
+    }
+}
+
 fn codex_execution_mode_instruction(execution_mode: Option<&str>) -> Option<&'static str> {
     match execution_mode.unwrap_or("plan") {
         "build" => Some(
@@ -332,17 +361,7 @@ pub async fn get_sessions(
                 let count: u32 = metadata
                     .runs
                     .iter()
-                    .map(|run| {
-                        let is_undo_send = run.status == RunStatus::Cancelled
-                            && run.assistant_message_id.is_none();
-                        if is_undo_send {
-                            0
-                        } else if run.assistant_message_id.is_some() {
-                            2 // user + assistant
-                        } else {
-                            1 // just user (still running or cancelled without response)
-                        }
-                    })
+                    .map(super::types::RunEntry::rendered_message_count)
                     .sum();
                 session.message_count = Some(count);
             }
@@ -769,6 +788,11 @@ async fn drain_backend_queue(
 ) {
     loop {
         if super::registry::is_session_actively_managed(&session_id) {
+            // A Codex turn may be running — steer queued messages into it
+            // instead of waiting for the run to finish (preference-gated).
+            drain_queue_into_codex_turn(&app, &worktree_id, &session_id).await;
+            drain_queue_into_opencode_turn(&app, &worktree_id, &worktree_path, &session_id).await;
+            drain_queue_into_pi_turn(&app, &worktree_id, &session_id).await;
             log::trace!("[QueueDrain] session active, stop session={session_id}");
             return;
         }
@@ -850,6 +874,27 @@ async fn drain_backend_queue(
         )
         .await
         {
+            // Lost a send race against another consumer (frontend queue
+            // processor or another client). Re-insert at the queue front so
+            // the message is NOT lost — the active run's completion re-triggers
+            // the drain and retries it.
+            if e.contains("already has an active request") {
+                log::warn!(
+                    "[QueueDrain] send race lost, requeueing at front session={session_id} message_id={queued_id}"
+                );
+                let requeued = with_existing_metadata_mut(&app, &session_id, |metadata| {
+                    metadata.queued_messages.insert(0, queued.clone());
+                    metadata.queued_messages.clone()
+                });
+                if let Ok(queue) = requeued {
+                    app.emit_all(
+                        "queue:updated",
+                        &serde_json::json!({ "sessionId": session_id, "queue": queue }),
+                    )
+                    .ok();
+                }
+                return;
+            }
             log::error!(
                 "[QueueDrain] queued message failed session={session_id} message_id={queued_id}: {e}"
             );
@@ -1330,6 +1375,14 @@ fn plan_mode_content_waits_for_approval(
         && execution_mode == Some("plan")
         && has_content
         && !has_plan_tool
+}
+
+fn queued_prompt_skips_plan_wait(
+    has_queued_messages: bool,
+    has_question_tool: bool,
+    has_plan_wait: bool,
+) -> bool {
+    has_queued_messages && has_plan_wait && !has_question_tool
 }
 
 /// Close/delete a session tab
@@ -2055,6 +2108,17 @@ pub async fn send_chat_message(
         return Err("Worktree path cannot be empty".to_string());
     }
 
+    // Guard: atomically claim the session's send slot for the duration of this
+    // call. Closes the race window where two concurrent sends (queue processor
+    // vs backend drain vs another client) both pass the registry check below
+    // before either registers a process.
+    let Some(_send_claim) = SendClaim::try_acquire(&session_id) else {
+        log::warn!(
+            "[SendChat] REJECTED session={session_id} — concurrent send in flight (duplicate send)"
+        );
+        return Err("Session already has an active request".to_string());
+    };
+
     // Guard: reject if this session already has an active process being tailed.
     // Without this, a double-send (frontend race, page reload, etc.) creates
     // duplicate run entries and orphans the first process in the registry.
@@ -2299,9 +2363,58 @@ pub async fn send_chat_message(
     let cursor_chat_id = sessions
         .find_session(&session_id)
         .and_then(|s| s.cursor_chat_id.clone());
-    let pi_session_id = sessions
+    let raw_pi_session_id = sessions
         .find_session(&session_id)
         .and_then(|s| s.pi_session_id.clone());
+    let pi_session_id = raw_pi_session_id
+        .as_deref()
+        .filter(|sid| *sid != session_id)
+        .map(ToOwned::to_owned);
+    if raw_pi_session_id.as_deref() == Some(session_id.as_str()) {
+        let _ = with_sessions_mut(&app, &worktree_path, &worktree_id, |sessions| {
+            if let Some(session) = sessions.find_session_mut(&session_id) {
+                session.pi_session_id = None;
+            }
+            Ok(())
+        });
+    }
+
+    let previous_backend = load_metadata(&app, &session_id)
+        .ok()
+        .flatten()
+        .and_then(|metadata| super::handoff::latest_completed_backend(&metadata));
+    let message_for_backend = if super::handoff::should_inject_handoff(
+        previous_backend.as_ref(),
+        &effective_backend,
+    ) {
+        let history = run_log::load_session_messages_window(&app, &session_id, Some(20), None)
+            .map(|loaded| super::handoff::format_handoff_history(&loaded.messages, 30_000))
+            .unwrap_or_default();
+
+        if let Some(previous_backend) = previous_backend.as_ref().filter(|_| !history.is_empty()) {
+            let template = crate::load_preferences(app.clone())
+                .await
+                .ok()
+                .and_then(|prefs| prefs.magic_prompts.provider_switch_handoff)
+                .filter(|prompt| !prompt.trim().is_empty())
+                .unwrap_or_else(crate::default_provider_switch_handoff_prompt);
+            let handoff_prompt = super::handoff::build_handoff_prompt(
+                &template,
+                previous_backend,
+                &effective_backend,
+                &history,
+            );
+            log::info!(
+                    "[SendChat] injecting hidden provider-switch handoff session={session_id} previous={previous_backend:?} current={effective_backend:?}"
+                );
+            super::handoff::prepend_hidden_handoff(&message, &handoff_prompt)
+        } else {
+            message.clone()
+        }
+    } else {
+        message.clone()
+    };
+
     // Cursor CLI doesn't support thinking/effort levels
     let run_thinking_level = if matches!(
         effective_backend,
@@ -2347,8 +2460,9 @@ pub async fn send_chat_message(
     let output_file = run_log_writer.output_file_path()?;
     let run_id = run_log_writer.run_id().to_string();
 
-    // Write input file with the user message
-    run_log::write_input_file(&app, &session_id, &run_id, &message)?;
+    // Write input file with the effective backend prompt. Hidden handoff context
+    // is intentionally not stored as the visible user message in metadata.
+    run_log::write_input_file(&app, &session_id, &run_id, &message_for_backend)?;
 
     // Use passed parameter for parallel execution prompt (None = disabled)
     let parallel_execution_prompt = parallel_execution_prompt.filter(|p| !p.trim().is_empty());
@@ -2443,7 +2557,7 @@ pub async fn send_chat_message(
         mcp_config.clone()
     };
     let thread_custom_profile = custom_profile_name.clone();
-    let thread_message = message.clone();
+    let thread_message = message_for_backend.clone();
     let thread_backend = effective_backend.clone();
     let thread_codex_search = codex_search_enabled;
     let thread_codex_multi_agent = codex_multi_agent_enabled;
@@ -2458,6 +2572,10 @@ pub async fn send_chat_message(
             log::info!("[SendChat] EXIT session={session_id} reason=pre_cancelled_opencode");
             if let Err(e) = run_log_writer.cancel(None, None) {
                 log::warn!("Failed to cancel run log for pre-cancelled OpenCode session: {e}");
+            }
+            // Remove the input file so the hidden handoff/history payload isn't retained on disk.
+            if let Err(e) = run_log::delete_input_file(&app, &session_id, &run_id) {
+                log::warn!("Failed to delete input file for pre-cancelled OpenCode session: {e}");
             }
             return Err("Request cancelled".to_string());
         }
@@ -3387,6 +3505,7 @@ pub async fn send_chat_message(
                     &thread_app,
                     &thread_session_id,
                     &thread_worktree_id,
+                    &thread_run_id,
                     std::path::Path::new(&thread_working_dir),
                     thread_opencode_session_id.as_deref(),
                     thread_model.as_deref(),
@@ -3546,6 +3665,7 @@ pub async fn send_chat_message(
                     &thread_app,
                     &thread_session_id,
                     &thread_worktree_id,
+                    &thread_run_id,
                     std::path::Path::new(&thread_working_dir),
                     thread_cursor_chat_id.as_deref(),
                     thread_model.as_deref(),
@@ -3586,6 +3706,7 @@ pub async fn send_chat_message(
                     &thread_app,
                     &thread_session_id,
                     &thread_worktree_id,
+                    &thread_run_id,
                     std::path::Path::new(&thread_working_dir),
                     thread_execution_mode.as_deref(),
                     thread_model.as_deref(),
@@ -3726,6 +3847,7 @@ pub async fn send_chat_message(
                     &thread_app,
                     &thread_session_id,
                     &thread_worktree_id,
+                    &thread_output_file,
                     std::path::Path::new(&thread_working_dir),
                     thread_pi_session_id.as_deref(),
                     thread_model.as_deref(),
@@ -3823,6 +3945,10 @@ pub async fn send_chat_message(
                     }
                 }
             }
+            // Remove the input file so the hidden handoff/history payload isn't retained on disk.
+            if let Err(del_err) = run_log::delete_input_file(&app, &session_id, &run_id) {
+                log::warn!("Failed to delete input file after thread error: {del_err}");
+            }
             trigger_backend_queue_drain(
                 app.clone(),
                 worktree_id.clone(),
@@ -3861,6 +3987,10 @@ pub async fn send_chat_message(
                     });
                 }
             }
+            // Remove the input file so the hidden handoff/history payload isn't retained on disk.
+            if let Err(del_err) = run_log::delete_input_file(&app, &session_id, &run_id) {
+                log::warn!("Failed to delete input file after thread panic: {del_err}");
+            }
             trigger_backend_queue_drain(
                 app.clone(),
                 worktree_id.clone(),
@@ -3882,8 +4012,8 @@ pub async fn send_chat_message(
     // OpenCode/Cursor runs are reconstructed in-process rather than tailed from a
     // detached JSONL stream. Write a synthetic assistant line so history reload can
     // reconstruct content after the live stream completes.
-    // Skip when cancelled: the frontend's save_cancelled_message already persists
-    // cancelled content to the same JSONL file, and writing here would duplicate it.
+    // Skip when cancelled: cancelled turns stay in run metadata/logs for diagnostics
+    // but are intentionally excluded from visible chat history on reload.
     if matches!(
         unified_response.backend,
         Backend::Opencode | Backend::Cursor | Backend::Pi | Backend::Commandcode
@@ -3893,7 +4023,12 @@ pub async fn send_chat_message(
             if !unified_response.content_blocks.is_empty() {
                 // Filter out echoed user prompt: OpenCode includes the user
                 // message as the first text block in its response.
-                let trimmed_prompt = message.trim();
+                // Compare against the *effective* prompt (message_for_backend),
+                // not the raw message — when a hidden provider-switch handoff is
+                // prepended, the backend echoes the submitted prompt including the
+                // handoff. Matching the raw message would let that injected history
+                // leak into the visible assistant transcript/NDJSON.
+                let trimmed_prompt = message_for_backend.trim();
                 let blocks_to_write: Vec<&super::types::ContentBlock> = {
                     let mut iter = unified_response.content_blocks.iter().peekable();
                     let first = iter.peek();
@@ -3934,6 +4069,9 @@ pub async fn send_chat_message(
                         }
                         super::types::ContentBlock::Thinking { thinking } => {
                             serde_json::json!({"type": "thinking", "thinking": thinking})
+                        }
+                        super::types::ContentBlock::UserInput { text } => {
+                            serde_json::json!({"type": "user_input", "text": text})
                         }
                     })
                     .collect();
@@ -4202,8 +4340,20 @@ pub async fn send_chat_message(
             // This eliminates the dual-client race where both native and web frontends
             // independently call update_session_state with conflicting decisions.
             // Flags are pre-computed above before unified_response fields are moved.
+            let queued_prompt_should_continue = queued_prompt_skips_plan_wait(
+                !session.queued_messages.is_empty(),
+                has_question_tool,
+                has_blocking_tool || is_plan_mode_with_content,
+            );
             if was_cancelled {
                 // Cancelled: don't change waiting/reviewing state
+            } else if queued_prompt_should_continue {
+                // A queued prompt is an explicit "continue now"; don't park on
+                // plan approval because the backend queue drain runs right after
+                // this write and should be allowed to dequeue it.
+                session.waiting_for_input = false;
+                session.is_reviewing = true;
+                session.waiting_for_input_type = None;
             } else if has_blocking_tool {
                 session.waiting_for_input = true;
                 session.is_reviewing = false;
@@ -4619,6 +4769,14 @@ pub async fn cancel_chat_message(
 #[tauri::command]
 pub fn has_running_sessions() -> bool {
     !super::registry::get_running_sessions().is_empty()
+}
+
+/// Check if any running sessions would NOT survive Jean quitting.
+/// Detached Claude processes and (on Unix) detached Codex app-server turns
+/// keep running after exit and are recovered on next launch; OpenCode and
+/// piped CLI sessions are not.
+pub fn has_nonsurvivable_running_sessions() -> bool {
+    super::registry::has_nonsurvivable_running_sessions()
 }
 
 /// Save a cancelled message to chat history
@@ -6683,6 +6841,101 @@ pub async fn resume_session(
             continue;
         }
 
+        // === Pi detached RPC-host resume path ===
+        if run.backend == Some(Backend::Pi) {
+            let pid = match run.pid {
+                Some(p) => p,
+                None => continue,
+            };
+            let output_file = session_dir.join(format!("{run_id}.jsonl"));
+
+            log::trace!(
+                "Resuming Pi RPC host run: {run_id}, PID: {pid}, output: {:?}",
+                output_file
+            );
+
+            if let Some(metadata_run) = metadata.find_run_mut(&run_id) {
+                metadata_run.status = RunStatus::Running;
+            }
+            save_metadata(&app, &metadata)?;
+
+            if !super::registry::register_detached_process(session_id.clone(), pid) {
+                log::warn!("Resume Pi session {session_id} was cancelled before tailing started");
+                return Ok(ResumeSessionResponse {
+                    resumed: false,
+                    run_count: 0,
+                });
+            }
+
+            let app_clone = app.clone();
+            let session_id_clone = session_id.clone();
+            let worktree_id_clone = worktree_id.clone();
+            let run_id_clone = run_id.clone();
+
+            tauri::async_runtime::spawn(async move {
+                let emit_done = |app: &tauri::AppHandle, sid: &str, wid: &str| {
+                    let _ = app.emit_all(
+                        "chat:done",
+                        &serde_json::json!({ "session_id": sid, "worktree_id": wid, "waiting_for_plan": false }),
+                    );
+                };
+
+                let (pi_session_id, usage, cancelled) = match super::pi::tail_pi_output(
+                    &app_clone,
+                    &session_id_clone,
+                    &worktree_id_clone,
+                    &output_file,
+                    pid,
+                ) {
+                    Ok(response) => (response.session_id, response.usage, response.cancelled),
+                    Err(e) => {
+                        log::error!("Resume Pi tail failed for run: {run_id_clone}, error: {e}");
+                        super::registry::unregister_process(&session_id_clone);
+                        if let Ok(mut writer) =
+                            RunLogWriter::resume(&app_clone, &session_id_clone, &run_id_clone)
+                        {
+                            if let Err(e) = writer.crash() {
+                                log::error!("Failed to mark Pi run as crashed: {e}");
+                            }
+                        }
+                        emit_done(&app_clone, &session_id_clone, &worktree_id_clone);
+                        return;
+                    }
+                };
+
+                super::registry::unregister_process(&session_id_clone);
+                if cancelled {
+                    emit_done(&app_clone, &session_id_clone, &worktree_id_clone);
+                }
+
+                if let Ok(mut writer) =
+                    RunLogWriter::resume(&app_clone, &session_id_clone, &run_id_clone)
+                {
+                    let assistant_message_id = uuid::Uuid::new_v4().to_string();
+                    if let Err(e) = writer.complete(&assistant_message_id, None, usage.clone()) {
+                        log::error!("Failed to mark resumed Pi run completed: {e}");
+                    }
+                }
+
+                if !pi_session_id.is_empty() {
+                    if let Err(e) =
+                        with_existing_metadata_mut(&app_clone, &session_id_clone, |metadata| {
+                            metadata.pi_session_id = Some(pi_session_id.clone());
+                            if let Some(run) = metadata.find_run_mut(&run_id_clone) {
+                                // Pi run entries do not have a dedicated per-run
+                                // field yet; session-level pi_session_id is the
+                                // authoritative resume id.
+                                run.usage = usage.clone();
+                            }
+                        })
+                    {
+                        log::warn!("Failed to persist recovered Pi session id: {e}");
+                    }
+                }
+            });
+            continue;
+        }
+
         // === Claude PID-based resume path ===
         let pid = match run.pid {
             Some(p) => p,
@@ -6703,7 +6956,7 @@ pub async fn resume_session(
 
         // Register the PID in the in-memory process registry so cancel works
         // Returns false if a pending cancel was queued (process killed immediately)
-        if !super::registry::register_process(session_id.clone(), pid) {
+        if !super::registry::register_detached_process(session_id.clone(), pid) {
             log::warn!("Resume session {session_id} was cancelled before tailing started");
             return Ok(ResumeSessionResponse {
                 resumed: false,
@@ -7307,6 +7560,649 @@ pub async fn clear_message_queue(
     Ok(())
 }
 
+/// Move a specific queued message to the front of the queue by its `id` field.
+/// Returns `false` when the message is no longer queued (another client dequeued
+/// or removed it) — callers must abort their send-now flow in that case.
+/// Holds the metadata lock across the entire read-modify-write to prevent TOCTOU races.
+#[tauri::command]
+pub async fn move_queued_message_front(
+    app: AppHandle,
+    worktree_id: String,
+    worktree_path: String,
+    session_id: String,
+    message_id: String,
+) -> Result<bool, String> {
+    let (moved, queue) = with_existing_metadata_mut(&app, &session_id, |metadata| {
+        let idx = metadata
+            .queued_messages
+            .iter()
+            .position(|m| m.get("id").and_then(|v| v.as_str()) == Some(message_id.as_str()));
+        let moved = match idx {
+            Some(idx) => {
+                let msg = metadata.queued_messages.remove(idx);
+                metadata.queued_messages.insert(0, msg);
+                true
+            }
+            None => false,
+        };
+        (moved, metadata.queued_messages.clone())
+    })?;
+
+    if moved {
+        app.emit_all(
+            "queue:updated",
+            &serde_json::json!({ "sessionId": session_id, "queue": queue }),
+        )
+        .ok();
+
+        // A session that went idle mid-click should still pick up the promoted message.
+        trigger_backend_queue_drain(app.clone(), worktree_id, worktree_path, session_id);
+    }
+
+    Ok(moved)
+}
+
+/// Inject a user message into a running Codex turn via app-server `turn/steer`.
+/// The injected text becomes part of the current turn (the model sees it after
+/// the next tool call). Fails when the session has no active turn or the turn
+/// already ended — callers fall back to cancel+send.
+#[tauri::command]
+pub async fn steer_codex_turn(
+    app: AppHandle,
+    worktree_id: String,
+    session_id: String,
+    message: String,
+) -> Result<(), String> {
+    steer_text_into_codex_turn(&app, &worktree_id, &session_id, &message).await
+}
+
+/// Inject a text-only user message into a running OpenCode session via
+/// OpenCode's `prompt_async` endpoint. Unlike Codex `turn/steer`, OpenCode
+/// appends an async prompt to the active session; callers still fall back to
+/// queue/cancel+send when this request fails.
+#[tauri::command]
+pub async fn steer_opencode_turn(
+    app: AppHandle,
+    worktree_id: String,
+    worktree_path: String,
+    session_id: String,
+    message: String,
+) -> Result<(), String> {
+    steer_text_into_opencode_turn(&app, &worktree_id, &worktree_path, &session_id, &message).await
+}
+
+fn opencode_text_prompt_payload(message: &str) -> serde_json::Value {
+    serde_json::json!({
+        "parts": [
+            {
+                "type": "text",
+                "text": message,
+            }
+        ]
+    })
+}
+
+async fn steer_text_into_opencode_turn(
+    app: &AppHandle,
+    worktree_id: &str,
+    worktree_path: &str,
+    session_id: &str,
+    message: &str,
+) -> Result<(), String> {
+    let metadata = load_metadata(app, session_id)?
+        .ok_or_else(|| format!("No metadata found for session: {session_id}"))?;
+    // Prefer the live run's OpenCode session id from the registry: on the FIRST
+    // turn of a new session, `metadata.opencode_session_id` is still None (only
+    // persisted after the run completes), so metadata-only resolution silently
+    // dropped first-turn steers. The registry holds the currently-running id.
+    let opencode_session_id = super::registry::get_opencode_session_id(session_id)
+        .or_else(|| metadata.opencode_session_id.clone())
+        .ok_or_else(|| format!("No OpenCode session id for session: {session_id}"))?;
+    let run_id = metadata
+        .runs
+        .iter()
+        .rev()
+        .find(|r| r.status == RunStatus::Running && r.backend == Some(Backend::Opencode))
+        .map(|r| r.run_id.clone())
+        .ok_or_else(|| format!("No running OpenCode run for session: {session_id}"))?;
+
+    // Wait until the main `/message` turn is actively streaming before injecting.
+    // A `prompt_async` sent before the turn is live starts a SECOND concurrent
+    // turn on the same OpenCode session, which resets the in-flight `/message`
+    // connection (the "error sending request for url" failure). If the turn never
+    // starts within the window, bail so the caller requeues instead of colliding.
+    if !crate::chat::opencode::wait_opencode_turn_started(
+        &opencode_session_id,
+        std::time::Duration::from_secs(15),
+    ) {
+        return Err(format!(
+            "OpenCode turn not yet active for session {session_id}; cannot steer"
+        ));
+    }
+
+    let base_url = crate::opencode_server::acquire(app)?;
+
+    struct ServerReleaseGuard;
+    impl Drop for ServerReleaseGuard {
+        fn drop(&mut self) {
+            crate::opencode_server::release();
+        }
+    }
+    let _server_guard = ServerReleaseGuard;
+
+    let prompt_url = format!("{base_url}/session/{opencode_session_id}/prompt_async");
+    let directory = worktree_path.to_string();
+    let payload = opencode_text_prompt_payload(message);
+
+    tauri::async_runtime::spawn_blocking(move || {
+        let client = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .map_err(|e| format!("Failed to build OpenCode steer client: {e}"))?;
+
+        let response = client
+            .post(&prompt_url)
+            .query(&[("directory", directory)])
+            .json(&payload)
+            .send()
+            .map_err(|e| format!("Failed to steer OpenCode session: {e}"))?;
+
+        if response.status().is_success() {
+            Ok(())
+        } else {
+            let status = response.status();
+            let body = response.text().unwrap_or_default();
+            Err(format!(
+                "OpenCode steer failed: status={status}, body={body}"
+            ))
+        }
+    })
+    .await
+    .map_err(|e| format!("OpenCode steer task failed: {e}"))??;
+
+    // Tell the running OpenCode turn to wait for `session.idle` before finalizing,
+    // so this injected prompt's streamed output is captured into the run.
+    crate::chat::opencode::mark_opencode_steered(&opencode_session_id);
+
+    match run_log::RunLogWriter::resume(app, session_id, &run_id) {
+        Ok(mut writer) => {
+            let line = serde_json::json!({
+                "type": "steered_user_message",
+                "text": message,
+            });
+            if let Err(e) = writer.write_line(&line.to_string()) {
+                log::warn!(
+                    "Failed to persist OpenCode steered message for session {session_id}: {e}"
+                );
+            }
+        }
+        Err(e) => log::warn!("Failed to open OpenCode run log for steered message: {e}"),
+    }
+
+    app.emit_all(
+        "chat:steered",
+        &serde_json::json!({
+            "session_id": session_id,
+            "worktree_id": worktree_id,
+            "text": message,
+        }),
+    )
+    .ok();
+
+    Ok(())
+}
+
+/// Core steer implementation shared by the `steer_codex_turn` command and the
+/// queue auto-steer drain: sends `turn/steer`, persists the injected text into
+/// the run log, and broadcasts `chat:steered` for live display.
+async fn steer_text_into_codex_turn(
+    app: &AppHandle,
+    worktree_id: &str,
+    session_id: &str,
+    message: &str,
+) -> Result<(), String> {
+    let (thread_id, turn_id) = super::registry::get_codex_turn(session_id)
+        .ok_or_else(|| format!("No active Codex turn for session: {session_id}"))?;
+    // Turn registered with empty id before turn/started arrives — too early to steer.
+    if turn_id.is_empty() {
+        return Err("Codex turn not started yet".to_string());
+    }
+
+    let metadata = load_metadata(app, session_id)?
+        .ok_or_else(|| format!("No metadata found for session: {session_id}"))?;
+    let run_id = metadata
+        .runs
+        .iter()
+        .rev()
+        .find(|r| r.status == RunStatus::Running)
+        .map(|r| r.run_id.clone())
+        .ok_or_else(|| format!("No running run for session: {session_id}"))?;
+
+    // send_request blocks on a oneshot channel — must not run on the async runtime.
+    let params = super::codex::build_turn_steer_params(&thread_id, &turn_id, message);
+    tauri::async_runtime::spawn_blocking(move || {
+        super::codex_server::send_request("turn/steer", params)
+    })
+    .await
+    .map_err(|e| format!("Steer task failed: {e}"))??;
+
+    // Persist into the run log so transcript reconstruction keeps the injected
+    // text ordered between the surrounding tool calls. Appends are atomic per
+    // write, so this is safe alongside the live event writer.
+    match run_log::RunLogWriter::resume(app, session_id, &run_id) {
+        Ok(mut writer) => {
+            let line = serde_json::json!({
+                "type": "steered_user_message",
+                "text": message,
+            });
+            if let Err(e) = writer.write_line(&line.to_string()) {
+                log::warn!("Failed to persist steered message for session {session_id}: {e}");
+            }
+        }
+        Err(e) => log::warn!("Failed to open run log for steered message: {e}"),
+    }
+
+    // Live display on all clients (native + web).
+    app.emit_all(
+        "chat:steered",
+        &serde_json::json!({
+            "session_id": session_id,
+            "worktree_id": worktree_id,
+            "text": message,
+        }),
+    )
+    .ok();
+
+    Ok(())
+}
+
+/// A queued message can be steered into a running Codex turn only when:
+/// - it carries no attachments (images/files/skills can't be injected mid-turn), AND
+/// - its captured backend is Codex. A message queued with a different backend
+///   selected (the user switched mid-run) must NOT be injected into the Codex
+///   turn — it runs as its own backend once the current run finishes.
+///
+/// The `backend` field is omitted for the Claude default (see the frontend
+/// `QueuedMessage` capture), so a missing/null backend is treated as non-Codex.
+fn queued_message_is_steerable(msg: &serde_json::Value) -> bool {
+    queued_message_is_steerable_for_backend(msg, "codex")
+}
+
+fn queued_message_is_steerable_for_backend(msg: &serde_json::Value, backend: &str) -> bool {
+    let backend_matches = msg.get("backend").and_then(Value::as_str) == Some(backend);
+    if !backend_matches {
+        return false;
+    }
+
+    const ATTACHMENT_KEYS: [&str; 4] = [
+        "pendingImages",
+        "pendingFiles",
+        "pendingSkills",
+        "pendingTextFiles",
+    ];
+    ATTACHMENT_KEYS.iter().all(|key| {
+        msg.get(key)
+            .and_then(Value::as_array)
+            .map(|a| a.is_empty())
+            .unwrap_or(true)
+    })
+}
+
+/// Inject a user message into a running Pi RPC turn via the detached PI host.
+#[tauri::command]
+pub async fn steer_pi_turn(
+    app: AppHandle,
+    worktree_id: String,
+    session_id: String,
+    message: String,
+) -> Result<(), String> {
+    steer_text_into_pi_turn(&app, &worktree_id, &session_id, &message).await
+}
+
+async fn steer_text_into_pi_turn(
+    app: &AppHandle,
+    worktree_id: &str,
+    session_id: &str,
+    message: &str,
+) -> Result<(), String> {
+    #[cfg(not(unix))]
+    {
+        let _ = (app, worktree_id, session_id, message);
+        Err("Pi steering is only available for detached Unix RPC hosts".to_string())
+    }
+
+    #[cfg(unix)]
+    {
+        let metadata = load_metadata(app, session_id)?
+            .ok_or_else(|| format!("No metadata found for session: {session_id}"))?;
+        let run_id = metadata
+            .runs
+            .iter()
+            .rev()
+            .find(|r| r.status == RunStatus::Running && r.backend == Some(Backend::Pi))
+            .map(|r| r.run_id.clone())
+            .ok_or_else(|| format!("No running Pi run for session: {session_id}"))?;
+        let app_data = app
+            .path()
+            .app_data_dir()
+            .map_err(|e| format!("Failed to resolve app data dir: {e}"))?;
+        let socket_path = super::pi::pi_rpc_socket_path(&app_data, session_id, &run_id);
+        let line = super::pi::serialize_pi_rpc_command(
+            "steer",
+            Some(message),
+            Some(&format!("steer-{run_id}")),
+        );
+        super::pi::send_pi_rpc_host_command(&socket_path, &line)?;
+
+        match run_log::RunLogWriter::resume(app, session_id, &run_id) {
+            Ok(mut writer) => {
+                let line = serde_json::json!({
+                    "type": "steered_user_message",
+                    "text": message,
+                });
+                if let Err(e) = writer.write_line(&line.to_string()) {
+                    log::warn!(
+                        "Failed to persist Pi steered message for session {session_id}: {e}"
+                    );
+                }
+            }
+            Err(e) => log::warn!("Failed to open run log for Pi steered message: {e}"),
+        }
+
+        app.emit_all(
+            "chat:steered",
+            &serde_json::json!({
+                "session_id": session_id,
+                "worktree_id": worktree_id,
+                "text": message,
+            }),
+        )
+        .ok();
+
+        Ok(())
+    }
+}
+
+/// Drain steerable queued messages straight into the running Codex turn
+/// (when the `codex_auto_steer_enabled` preference is on, default true).
+/// Pops from the queue front in FIFO order and stops at the first message
+/// that can't be steered (attachments) so queue order is preserved.
+async fn drain_queue_into_codex_turn(app: &AppHandle, worktree_id: &str, session_id: &str) {
+    let auto_steer = crate::load_preferences_sync(app)
+        .map(|p| p.codex_auto_steer_enabled)
+        .unwrap_or(true);
+    if !auto_steer {
+        return;
+    }
+
+    loop {
+        // Only steer while a started codex turn is registered.
+        let Some((_, turn_id)) = super::registry::get_codex_turn(session_id) else {
+            return;
+        };
+        if turn_id.is_empty() {
+            return;
+        }
+
+        let popped = match with_existing_metadata_mut(app, session_id, |metadata| {
+            match metadata.queued_messages.first() {
+                Some(front) if queued_message_is_steerable(front) => {
+                    let msg = metadata.queued_messages.remove(0);
+                    (Some(msg), metadata.queued_messages.clone())
+                }
+                _ => (None, metadata.queued_messages.clone()),
+            }
+        }) {
+            Ok((popped, queue)) => {
+                if popped.is_some() {
+                    app.emit_all(
+                        "queue:updated",
+                        &serde_json::json!({ "sessionId": session_id, "queue": queue }),
+                    )
+                    .ok();
+                }
+                popped
+            }
+            Err(e) => {
+                log::warn!("[CodexSteer] failed to read queue session={session_id}: {e}");
+                return;
+            }
+        };
+
+        let Some(msg) = popped else { return };
+        let text = msg
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        if text.is_empty() {
+            continue;
+        }
+
+        log::info!("[CodexSteer] steering queued message into running turn session={session_id}");
+        if let Err(e) = steer_text_into_codex_turn(app, worktree_id, session_id, &text).await {
+            // Turn ended mid-drain — put the message back so the normal
+            // queue path sends it when the run completes.
+            log::warn!("[CodexSteer] steer failed, requeueing at front session={session_id}: {e}");
+            let requeued = with_existing_metadata_mut(app, session_id, |metadata| {
+                metadata.queued_messages.insert(0, msg.clone());
+                metadata.queued_messages.clone()
+            });
+            if let Ok(queue) = requeued {
+                app.emit_all(
+                    "queue:updated",
+                    &serde_json::json!({ "sessionId": session_id, "queue": queue }),
+                )
+                .ok();
+            }
+            return;
+        }
+    }
+}
+
+/// Fire-and-forget steer drain — called from the Codex `turn/started` handler
+/// so prompts queued before the turn became steerable get injected.
+pub(crate) fn trigger_codex_queue_steer(app: AppHandle, worktree_id: String, session_id: String) {
+    tauri::async_runtime::spawn(async move {
+        drain_queue_into_codex_turn(&app, &worktree_id, &session_id).await;
+    });
+}
+
+/// Drain steerable queued messages into a running OpenCode session via
+/// `prompt_async` (when `opencode_auto_steer_enabled` is on, default true).
+async fn drain_queue_into_opencode_turn(
+    app: &AppHandle,
+    worktree_id: &str,
+    worktree_path: &str,
+    session_id: &str,
+) {
+    let auto_steer = crate::load_preferences_sync(app)
+        .map(|p| p.opencode_auto_steer_enabled)
+        .unwrap_or(true);
+    if !auto_steer {
+        return;
+    }
+
+    loop {
+        let has_running_opencode = load_metadata(app, session_id)
+            .ok()
+            .flatten()
+            .and_then(|metadata| {
+                metadata
+                    .runs
+                    .iter()
+                    .rev()
+                    .find(|r| {
+                        r.status == RunStatus::Running && r.backend == Some(Backend::Opencode)
+                    })
+                    .map(|r| r.run_id.clone())
+            })
+            .is_some();
+        if !has_running_opencode {
+            return;
+        }
+
+        let popped = match with_existing_metadata_mut(app, session_id, |metadata| {
+            match metadata.queued_messages.first() {
+                Some(front) if queued_message_is_steerable_for_backend(front, "opencode") => {
+                    let msg = metadata.queued_messages.remove(0);
+                    (Some(msg), metadata.queued_messages.clone())
+                }
+                _ => (None, metadata.queued_messages.clone()),
+            }
+        }) {
+            Ok((popped, queue)) => {
+                if popped.is_some() {
+                    app.emit_all(
+                        "queue:updated",
+                        &serde_json::json!({ "sessionId": session_id, "queue": queue }),
+                    )
+                    .ok();
+                }
+                popped
+            }
+            Err(e) => {
+                log::warn!("[OpenCodeSteer] failed to read queue session={session_id}: {e}");
+                return;
+            }
+        };
+
+        let Some(msg) = popped else { return };
+        let text = msg
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        if text.is_empty() {
+            continue;
+        }
+
+        log::info!("[OpenCodeSteer] steering queued message into running session={session_id}");
+        if let Err(e) =
+            steer_text_into_opencode_turn(app, worktree_id, worktree_path, session_id, &text).await
+        {
+            log::warn!(
+                "[OpenCodeSteer] steer failed, requeueing at front session={session_id}: {e}"
+            );
+            let requeued = with_existing_metadata_mut(app, session_id, |metadata| {
+                metadata.queued_messages.insert(0, msg.clone());
+                metadata.queued_messages.clone()
+            });
+            if let Ok(queue) = requeued {
+                app.emit_all(
+                    "queue:updated",
+                    &serde_json::json!({ "sessionId": session_id, "queue": queue }),
+                )
+                .ok();
+            }
+            return;
+        }
+    }
+}
+
+/// Fire-and-forget OpenCode steer drain — called after OpenCode session id is
+/// known, so prompts queued while startup was still registering can be injected.
+pub(crate) fn trigger_opencode_queue_steer(
+    app: AppHandle,
+    worktree_id: String,
+    worktree_path: String,
+    session_id: String,
+) {
+    tauri::async_runtime::spawn(async move {
+        drain_queue_into_opencode_turn(&app, &worktree_id, &worktree_path, &session_id).await;
+    });
+}
+
+/// Drain steerable queued messages into a running Pi RPC host. Pi's own
+/// steering queue delivers these at the next safe tool/turn boundary.
+async fn drain_queue_into_pi_turn(app: &AppHandle, worktree_id: &str, session_id: &str) {
+    let auto_steer = crate::load_preferences_sync(app)
+        .map(|p| p.pi_auto_steer_enabled)
+        .unwrap_or(true);
+    if !auto_steer {
+        return;
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = (app, worktree_id, session_id);
+    }
+
+    #[cfg(unix)]
+    loop {
+        let has_running_pi = load_metadata(app, session_id)
+            .ok()
+            .flatten()
+            .and_then(|metadata| {
+                metadata
+                    .runs
+                    .iter()
+                    .rev()
+                    .find(|r| r.status == RunStatus::Running && r.backend == Some(Backend::Pi))
+                    .map(|r| r.run_id.clone())
+            })
+            .is_some();
+        if !has_running_pi {
+            return;
+        }
+
+        let popped = match with_existing_metadata_mut(app, session_id, |metadata| {
+            match metadata.queued_messages.first() {
+                Some(front) if queued_message_is_steerable_for_backend(front, "pi") => {
+                    let msg = metadata.queued_messages.remove(0);
+                    (Some(msg), metadata.queued_messages.clone())
+                }
+                _ => (None, metadata.queued_messages.clone()),
+            }
+        }) {
+            Ok((popped, queue)) => {
+                if popped.is_some() {
+                    app.emit_all(
+                        "queue:updated",
+                        &serde_json::json!({ "sessionId": session_id, "queue": queue }),
+                    )
+                    .ok();
+                }
+                popped
+            }
+            Err(e) => {
+                log::warn!("[PiSteer] failed to read queue session={session_id}: {e}");
+                return;
+            }
+        };
+
+        let Some(msg) = popped else { return };
+        let text = msg
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        if text.is_empty() {
+            continue;
+        }
+
+        log::info!("[PiSteer] steering queued message into running Pi session={session_id}");
+        if let Err(e) = steer_text_into_pi_turn(app, worktree_id, session_id, &text).await {
+            log::warn!("[PiSteer] steer failed, requeueing at front session={session_id}: {e}");
+            let requeued = with_existing_metadata_mut(app, session_id, |metadata| {
+                metadata.queued_messages.insert(0, msg.clone());
+                metadata.queued_messages.clone()
+            });
+            if let Ok(queue) = requeued {
+                app.emit_all(
+                    "queue:updated",
+                    &serde_json::json!({ "sessionId": session_id, "queue": queue }),
+                )
+                .ok();
+            }
+            return;
+        }
+    }
+}
+
 /// Cancel the pending ScheduleWakeup for a session (user-initiated).
 #[tauri::command]
 pub async fn cancel_session_wakeup(app: AppHandle, session_id: String) -> Result<bool, String> {
@@ -7382,6 +8278,87 @@ mod tests {
                 "7".to_string(),
                 "/tmp/Main.kt".to_string()
             ]
+        );
+    }
+
+    #[test]
+    fn queued_message_steerable_requires_codex_backend_and_no_attachments() {
+        // Codex backend, no attachments → steerable
+        let codex_plain = serde_json::json!({
+            "id": "m1", "message": "hello", "backend": "codex",
+        });
+        assert!(queued_message_is_steerable(&codex_plain));
+
+        let codex_empty_attachments = serde_json::json!({
+            "id": "m2",
+            "message": "hello",
+            "backend": "codex",
+            "pendingImages": [],
+            "pendingFiles": [],
+            "pendingSkills": [],
+            "pendingTextFiles": [],
+        });
+        assert!(queued_message_is_steerable(&codex_empty_attachments));
+
+        // Codex backend but with attachments → not steerable
+        let codex_with_image = serde_json::json!({
+            "id": "m3",
+            "message": "hello",
+            "backend": "codex",
+            "pendingImages": [{ "id": "img-1", "path": "/tmp/a.png" }],
+        });
+        assert!(!queued_message_is_steerable(&codex_with_image));
+
+        // Different backend selected mid-run → never steer into the codex turn
+        let claude_default = serde_json::json!({ "id": "m4", "message": "hello" });
+        assert!(!queued_message_is_steerable(&claude_default));
+
+        let opencode = serde_json::json!({
+            "id": "m5", "message": "hello", "backend": "opencode",
+        });
+        assert!(!queued_message_is_steerable(&opencode));
+    }
+
+    #[test]
+    fn queued_message_steerable_for_backend_accepts_opencode_text_only() {
+        let opencode_plain = serde_json::json!({
+            "id": "m1",
+            "message": "hello",
+            "backend": "opencode",
+            "pendingImages": [],
+            "pendingFiles": [],
+            "pendingSkills": [],
+            "pendingTextFiles": [],
+        });
+        assert!(queued_message_is_steerable_for_backend(
+            &opencode_plain,
+            "opencode"
+        ));
+
+        let opencode_with_file = serde_json::json!({
+            "id": "m2",
+            "message": "hello",
+            "backend": "opencode",
+            "pendingFiles": [{ "id": "file-1", "path": "/tmp/a.txt" }],
+        });
+        assert!(!queued_message_is_steerable_for_backend(
+            &opencode_with_file,
+            "opencode"
+        ));
+    }
+
+    #[test]
+    fn opencode_text_prompt_payload_uses_text_part_only() {
+        assert_eq!(
+            opencode_text_prompt_payload("steer now"),
+            serde_json::json!({
+                "parts": [
+                    {
+                        "type": "text",
+                        "text": "steer now",
+                    }
+                ]
+            })
         );
     }
 
@@ -7593,6 +8570,14 @@ mod tests {
             true,
             false
         ));
+    }
+
+    #[test]
+    fn queued_prompt_skips_plan_wait_but_not_questions() {
+        assert!(queued_prompt_skips_plan_wait(true, false, true));
+        assert!(!queued_prompt_skips_plan_wait(false, false, true));
+        assert!(!queued_prompt_skips_plan_wait(true, true, true));
+        assert!(!queued_prompt_skips_plan_wait(true, false, false));
     }
 
     #[test]

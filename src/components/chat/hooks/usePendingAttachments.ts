@@ -1,6 +1,6 @@
 import { useCallback, type RefObject } from 'react'
 import { generateId } from '@/lib/uuid'
-import { persistEnqueue, persistRemoveQueued } from '@/services/chat'
+import { persistEnqueue } from '@/services/chat'
 import { useChatStore } from '@/store/chat-store'
 import { buildMcpConfigJson } from '@/services/mcp'
 import { getFilename } from '@/lib/path-utils'
@@ -120,7 +120,9 @@ export function usePendingAttachments({
         executionMode: executionModeRef.current,
         thinkingLevel: selectedThinkingLevelRef.current,
         effortLevel:
-          useAdaptiveThinkingRef.current || isCodexBackendRef.current
+          useAdaptiveThinkingRef.current ||
+          isCodexBackendRef.current ||
+          selectedBackendRef.current === 'pi'
             ? selectedEffortLevelRef.current
             : undefined,
         mcpConfig: buildMcpConfigJson(
@@ -150,31 +152,11 @@ export function usePendingAttachments({
     [activeSessionId, activeWorktreeId, activeWorktreePath, sendMessageNow]
   )
 
-  const handleRemoveQueuedMessage = useCallback(
-    (sessionId: string, messageId: string) => {
-      useChatStore.getState().removeQueuedMessage(sessionId, messageId)
-      // Persist removal to backend for cross-client sync
-      const { sessionWorktreeMap, worktreePaths } = useChatStore.getState()
-      const wtId = sessionWorktreeMap[sessionId]
-      const wtPath = wtId ? worktreePaths[wtId] : undefined
-      if (wtId && wtPath) {
-        persistRemoveQueued(wtId, wtPath, sessionId, messageId)
-      }
-    },
-    []
-  )
-
-  const handleForceSendQueued = useCallback((sessionId: string) => {
-    useChatStore.getState().forceProcessQueue(sessionId)
-  }, [])
-
   return {
     handleRemovePendingImage,
     handleRemovePendingTextFile,
     handleRemovePendingSkill,
     handleRemovePendingFile,
     handleCommandExecute,
-    handleRemoveQueuedMessage,
-    handleForceSendQueued,
   }
 }

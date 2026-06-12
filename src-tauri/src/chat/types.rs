@@ -59,6 +59,15 @@ pub struct CompactMetadata {
     pub pre_tokens: u64,
 }
 
+pub(crate) const CLAUDE_COMPACTION_SUMMARY_PREFIX: &str =
+    "This session is being continued from a previous conversation that ran out of context. \
+The summary below covers the earlier portion of the conversation.";
+
+pub(crate) fn is_claude_compaction_summary_text(text: &str) -> bool {
+    text.trim_start()
+        .starts_with(CLAUDE_COMPACTION_SUMMARY_PREFIX)
+}
+
 // ============================================================================
 // Usage Types
 // ============================================================================
@@ -393,9 +402,19 @@ pub struct DeniedMessageContext {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ContentBlock {
-    Text { text: String },
-    ToolUse { tool_call_id: String },
-    Thinking { thinking: String },
+    Text {
+        text: String,
+    },
+    ToolUse {
+        tool_call_id: String,
+    },
+    Thinking {
+        thinking: String,
+    },
+    /// User text injected into a running turn (Codex `turn/steer`)
+    UserInput {
+        text: String,
+    },
 }
 
 /// A single chat message
@@ -1270,6 +1289,10 @@ pub struct RunEntry {
     /// Effort level for Opus adaptive thinking (low, medium, high, xhigh, max, ultracode)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effort_level: Option<String>,
+    /// Backend used for this run. Persisted so Jean can detect cross-provider
+    /// switches without relying on provider-owned resume history.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backend: Option<Backend>,
     /// Unix timestamp when run started
     pub started_at: u64,
     /// Unix timestamp when run ended (None if still running)
@@ -1305,6 +1328,27 @@ pub struct RunEntry {
     /// Cursor chat ID — persisted per-run so future runs can resume the same chat.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cursor_chat_id: Option<String>,
+}
+
+impl RunEntry {
+    /// Whether this run should appear as user/assistant messages in the visible chat timeline.
+    ///
+    /// Cancelled runs remain in metadata and JSONL for diagnostics, but the chat UI treats
+    /// cancellation as removing the prompt/partial response from history.
+    pub fn is_renderable_in_chat_history(&self) -> bool {
+        self.status != RunStatus::Cancelled && !self.cancelled
+    }
+
+    /// Number of visible chat messages contributed by this run.
+    pub fn rendered_message_count(&self) -> u32 {
+        if !self.is_renderable_in_chat_history() {
+            0
+        } else if self.assistant_message_id.is_some() {
+            2 // user + assistant
+        } else {
+            1 // user only (running/resumable/crashed before response)
+        }
+    }
 }
 
 /// Session metadata - single source of truth for session data and run history
@@ -1605,22 +1649,7 @@ impl SessionMetadata {
 
     /// Convert to a lightweight index entry for tab rendering
     pub fn to_index_entry(&self) -> SessionIndexEntry {
-        // Count messages: each run has 1 user message, plus 1 assistant message if completed
-        let message_count: u32 = self
-            .runs
-            .iter()
-            .map(|run| {
-                let is_undo_send =
-                    run.status == RunStatus::Cancelled && run.assistant_message_id.is_none();
-                if is_undo_send {
-                    0
-                } else if run.assistant_message_id.is_some() {
-                    2 // user + assistant
-                } else {
-                    1 // just user (still running or cancelled without response)
-                }
-            })
-            .sum();
+        let message_count: u32 = self.runs.iter().map(RunEntry::rendered_message_count).sum();
 
         SessionIndexEntry {
             id: self.id.clone(),
@@ -1993,6 +2022,7 @@ mod tests {
             execution_mode: Some("plan".to_string()),
             thinking_level: None,
             effort_level: None,
+            backend: None,
             started_at: 1,
             ended_at: Some(2),
             status: RunStatus::Completed,
@@ -2031,6 +2061,7 @@ mod tests {
             execution_mode: None,
             thinking_level: None,
             effort_level: None,
+            backend: None,
             started_at: 1234567890,
             ended_at: None,
             status: RunStatus::Running,
@@ -2047,6 +2078,97 @@ mod tests {
 
         assert!(metadata.find_run("run-1").is_some());
         assert!(metadata.find_run("run-nonexistent").is_none());
+    }
+
+    #[test]
+    fn cancelled_runs_are_not_renderable_or_counted_even_with_assistant_content() {
+        let mut run = RunEntry {
+            run_id: "run-cancelled".to_string(),
+            user_message_id: "user-cancelled".to_string(),
+            user_message: "cancel me".to_string(),
+            model: Some("gpt-5.5".to_string()),
+            execution_mode: Some("yolo".to_string()),
+            thinking_level: None,
+            effort_level: None,
+            backend: Some(Backend::Codex),
+            started_at: 1,
+            ended_at: Some(2),
+            status: RunStatus::Cancelled,
+            assistant_message_id: Some("assistant-cancelled".to_string()),
+            cancelled: true,
+            recovered: false,
+            claude_session_id: None,
+            pid: None,
+            usage: None,
+            codex_thread_id: Some("thread-1".to_string()),
+            codex_turn_id: None,
+            cursor_chat_id: None,
+        };
+
+        assert!(!run.is_renderable_in_chat_history());
+        assert_eq!(run.rendered_message_count(), 0);
+
+        run.status = RunStatus::Completed;
+        run.cancelled = false;
+
+        assert!(run.is_renderable_in_chat_history());
+        assert_eq!(run.rendered_message_count(), 2);
+    }
+
+    #[test]
+    fn session_index_message_count_excludes_cancelled_runs() {
+        let mut metadata = SessionMetadata::new(
+            "sess-123".to_string(),
+            "wt-456".to_string(),
+            "Test".to_string(),
+            0,
+        );
+        metadata.runs.push(RunEntry {
+            run_id: "run-cancelled".to_string(),
+            user_message_id: "user-cancelled".to_string(),
+            user_message: "cancel me".to_string(),
+            model: Some("gpt-5.5".to_string()),
+            execution_mode: Some("yolo".to_string()),
+            thinking_level: None,
+            effort_level: None,
+            backend: Some(Backend::Codex),
+            started_at: 1,
+            ended_at: Some(2),
+            status: RunStatus::Cancelled,
+            assistant_message_id: Some("assistant-cancelled".to_string()),
+            cancelled: true,
+            recovered: false,
+            claude_session_id: None,
+            pid: None,
+            usage: None,
+            codex_thread_id: Some("thread-1".to_string()),
+            codex_turn_id: None,
+            cursor_chat_id: None,
+        });
+        metadata.runs.push(RunEntry {
+            run_id: "run-completed".to_string(),
+            user_message_id: "user-completed".to_string(),
+            user_message: "keep me".to_string(),
+            model: Some("gpt-5.5".to_string()),
+            execution_mode: Some("yolo".to_string()),
+            thinking_level: None,
+            effort_level: None,
+            backend: Some(Backend::Codex),
+            started_at: 3,
+            ended_at: Some(4),
+            status: RunStatus::Completed,
+            assistant_message_id: Some("assistant-completed".to_string()),
+            cancelled: false,
+            recovered: false,
+            claude_session_id: None,
+            pid: None,
+            usage: None,
+            codex_thread_id: Some("thread-1".to_string()),
+            codex_turn_id: None,
+            cursor_chat_id: None,
+        });
+
+        assert_eq!(metadata.to_index_entry().message_count, 2);
     }
 
     #[test]
@@ -2070,6 +2192,7 @@ mod tests {
             execution_mode: None,
             thinking_level: None,
             effort_level: None,
+            backend: None,
             started_at: 1234567890,
             ended_at: None,
             status: RunStatus::Completed,
@@ -2095,6 +2218,7 @@ mod tests {
             execution_mode: None,
             thinking_level: None,
             effort_level: None,
+            backend: None,
             started_at: 1234567891,
             ended_at: None,
             status: RunStatus::Completed,

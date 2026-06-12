@@ -106,7 +106,8 @@ import { SessionDebugPanel } from './SessionDebugPanel'
 import { ChatToolbar } from './ChatToolbar'
 import { ReviewResultsPanel } from './ReviewResultsPanel'
 import { ReviewMethodModal } from './ReviewMethodModal'
-import { QueuedMessagesList } from './QueuedMessageItem'
+import { QueuedPromptsPanel } from './QueuedPromptsPanel'
+import { useQueuedPromptActions } from './hooks/useQueuedPromptActions'
 import { FloatingButtons } from './FloatingButtons'
 import { PlanDialog } from './PlanDialog'
 import type { ApprovalModelOverride } from './ApprovalModelSubmenu'
@@ -146,6 +147,7 @@ import {
 } from '@/lib/model-utils'
 import { copyToClipboard, copyHtmlToClipboard } from '@/lib/clipboard'
 import { useClaudeCliStatus } from '@/services/claude-cli'
+import { useAvailablePiModels } from '@/services/pi-cli'
 import { usePrStatus, usePrStatusEvents } from '@/services/pr-status'
 import type { PrDisplayStatus, CheckStatus } from '@/types/pr-status'
 import type { QueuedMessage, Session, WorktreeSessions } from '@/types/chat'
@@ -588,6 +590,18 @@ export function ChatWindow({
 
   // Installed backends (only these should be selectable)
   const { installedBackends } = useInstalledBackends()
+  const { data: availablePiModels } = useAvailablePiModels({
+    enabled: installedBackends.includes('pi'),
+  })
+  const availablePiModelOptions = useMemo(
+    () =>
+      availablePiModels?.map(model => ({
+        value: `pi/${model.id}`,
+        label: model.label,
+        is_default: model.is_default,
+      })),
+    [availablePiModels]
+  )
 
   // Per-session backend selection: session → zustand → project default → global default
   const zustandBackend = useChatStore(state =>
@@ -620,7 +634,8 @@ export function ChatWindow({
   // Per-session model selection, falls back to preferences default (backend-aware)
   const defaultModel = resolveDefaultModelForBackend(
     selectedBackend,
-    preferences
+    preferences,
+    selectedBackend === 'pi' ? availablePiModelOptions : undefined
   )
   const selectedModel: string = session?.selected_model ?? defaultModel
   const buildNewContextLabel = resolveApprovalLabel(
@@ -1240,19 +1255,19 @@ export function ChatWindow({
       const effectiveYoloBackend = yoloBackend ?? session?.backend
       const yoloModeThinking = yoloThinkingLevelRef.current
       const yoloModeEffort = yoloEffortLevelRef.current
-      const yoloThinkingLevel: ThinkingLevel =
-        effectiveYoloBackend === 'codex'
-          ? 'off'
-          : ((yoloModeThinking ??
-              selectedThinkingLevelRef.current) as ThinkingLevel)
-      const yoloEffortLevel: EffortLevel | undefined =
-        effectiveYoloBackend === 'codex'
+      const yoloUsesEffort =
+        effectiveYoloBackend === 'codex' || effectiveYoloBackend === 'pi'
+      const yoloThinkingLevel: ThinkingLevel = yoloUsesEffort
+        ? 'off'
+        : ((yoloModeThinking ??
+            selectedThinkingLevelRef.current) as ThinkingLevel)
+      const yoloEffortLevel: EffortLevel | undefined = yoloUsesEffort
+        ? ((yoloModeEffort as EffortLevel | null) ??
+          selectedEffortLevelRef.current)
+        : useAdaptiveThinkingRef.current
           ? ((yoloModeEffort as EffortLevel | null) ??
             selectedEffortLevelRef.current)
-          : useAdaptiveThinkingRef.current
-            ? ((yoloModeEffort as EffortLevel | null) ??
-              selectedEffortLevelRef.current)
-            : undefined
+          : undefined
       sendMessage.mutate({
         sessionId: newSession.id,
         worktreeId: activeWorktreeId,
@@ -1425,19 +1440,19 @@ export function ChatWindow({
       const effectiveBuildBackend = buildBackend ?? session?.backend
       const buildModeThinking = buildThinkingLevelRef.current
       const buildModeEffort = buildEffortLevelRef.current
-      const buildThinkingLevel: ThinkingLevel =
-        effectiveBuildBackend === 'codex'
-          ? 'off'
-          : ((buildModeThinking ??
-              selectedThinkingLevelRef.current) as ThinkingLevel)
-      const buildEffortLevel: EffortLevel | undefined =
-        effectiveBuildBackend === 'codex'
+      const buildUsesEffort =
+        effectiveBuildBackend === 'codex' || effectiveBuildBackend === 'pi'
+      const buildThinkingLevel: ThinkingLevel = buildUsesEffort
+        ? 'off'
+        : ((buildModeThinking ??
+            selectedThinkingLevelRef.current) as ThinkingLevel)
+      const buildEffortLevel: EffortLevel | undefined = buildUsesEffort
+        ? ((buildModeEffort as EffortLevel | null) ??
+          selectedEffortLevelRef.current)
+        : useAdaptiveThinkingRef.current
           ? ((buildModeEffort as EffortLevel | null) ??
             selectedEffortLevelRef.current)
-          : useAdaptiveThinkingRef.current
-            ? ((buildModeEffort as EffortLevel | null) ??
-              selectedEffortLevelRef.current)
-            : undefined
+          : undefined
       sendMessage.mutate({
         sessionId: newSession.id,
         worktreeId: activeWorktreeId,
@@ -1696,19 +1711,17 @@ export function ChatWindow({
       const effectiveBackend = modeBackend ?? session?.backend
       const modeThinking = modeThinkingRef.current
       const modeEffort = modeEffortRef.current
-      const thinkingLevel: ThinkingLevel =
-        effectiveBackend === 'codex'
-          ? 'off'
-          : ((modeThinking ??
-              selectedThinkingLevelRef.current) as ThinkingLevel)
-      const effortLevel: EffortLevel | undefined =
-        effectiveBackend === 'codex'
+      const modeUsesEffort =
+        effectiveBackend === 'codex' || effectiveBackend === 'pi'
+      const thinkingLevel: ThinkingLevel = modeUsesEffort
+        ? 'off'
+        : ((modeThinking ?? selectedThinkingLevelRef.current) as ThinkingLevel)
+      const effortLevel: EffortLevel | undefined = modeUsesEffort
+        ? ((modeEffort as EffortLevel | null) ?? selectedEffortLevelRef.current)
+        : useAdaptiveThinkingRef.current
           ? ((modeEffort as EffortLevel | null) ??
             selectedEffortLevelRef.current)
-          : useAdaptiveThinkingRef.current
-            ? ((modeEffort as EffortLevel | null) ??
-              selectedEffortLevelRef.current)
-            : undefined
+          : undefined
       sendMessage.mutate({
         sessionId: newSession.id,
         worktreeId: readyWorktree.id,
@@ -1975,6 +1988,7 @@ export function ChatWindow({
     installedBackends,
     session,
     preferences,
+    piModelOptions: availablePiModelOptions,
     queryClient,
     worktreeProjectId: worktree?.project_id,
     setSessionModel,
@@ -2275,15 +2289,17 @@ export function ChatWindow({
     [pendingPlanMessage, handleWorktreeYoloApproval]
   )
 
-  // Pending attachment removal, slash command execution, queue management
+  // Queued prompts panel actions (remove / send-now)
+  const { handleRemoveQueuedMessage, handleSendQueuedNow } =
+    useQueuedPromptActions()
+
+  // Pending attachment removal, slash command execution
   const {
     handleRemovePendingImage,
     handleRemovePendingTextFile,
     handleRemovePendingSkill,
     handleRemovePendingFile,
     handleCommandExecute,
-    handleRemoveQueuedMessage,
-    handleForceSendQueued,
   } = usePendingAttachments({
     activeSessionId,
     activeWorktreeId,
@@ -2847,18 +2863,6 @@ export function ChatWindow({
                                 }
                               />
                             )}
-
-                            {/* Queued messages - shown inline after streaming/messages */}
-                            {activeSessionId && (
-                              <QueuedMessagesList
-                                messages={currentQueuedMessages}
-                                sessionId={activeSessionId}
-                                worktreePath={activeWorktreePath}
-                                onRemove={handleRemoveQueuedMessage}
-                                onForceSend={handleForceSendQueued}
-                                isSessionIdle={!isSending}
-                              />
-                            )}
                           </div>
                         </div>
                       </ScrollArea>
@@ -2907,12 +2911,27 @@ export function ChatWindow({
                     <div className="bg-background">
                       <div className="mx-auto max-w-7xl">
                         <div className="relative sm:mx-auto sm:mb-3 sm:max-w-3xl xl:max-w-4xl">
+                          {/* Queued prompts - rendered as an extension above the chat input */}
+                          {activeSessionId &&
+                            currentQueuedMessages.length > 0 && (
+                              <QueuedPromptsPanel
+                                key={activeSessionId}
+                                sessionId={activeSessionId}
+                                messages={currentQueuedMessages}
+                                isSessionBusy={isSending || isWaitingForInput}
+                                onRemove={handleRemoveQueuedMessage}
+                                onSendNow={handleSendQueuedNow}
+                              />
+                            )}
                           {/* Input area - unified container with textarea and toolbar */}
                           <form
                             ref={formRef}
                             onSubmit={handleSubmit}
                             className={cn(
                               'relative overflow-hidden border-t border-border bg-card transition-[background-color,box-shadow] duration-150 sm:rounded-lg sm:border',
+                              activeSessionId &&
+                                currentQueuedMessages.length > 0 &&
+                                'sm:rounded-t-none',
                               isDragging &&
                                 'ring-2 ring-primary ring-inset bg-primary/5'
                             )}

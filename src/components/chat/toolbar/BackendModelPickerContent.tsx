@@ -63,7 +63,7 @@ export function BackendModelPickerContent({
   selectedProvider,
   installedBackends,
   customCliProfiles,
-  sessionHasMessages,
+  sessionHasMessages: _sessionHasMessages,
   providerLocked,
   onModelChange,
   onBackendModelChange,
@@ -84,7 +84,9 @@ export function BackendModelPickerContent({
     /Mac|iPhone|iPad/.test(navigator.platform || navigator.userAgent || '')
   const fastShortcutLabel = isApplePlatform ? '⌘F' : 'Ctrl F'
 
-  const isLocked = Boolean(sessionHasMessages)
+  // Sessions with messages can now switch backends because the backend gets a
+  // hidden Jean-local handoff prompt on provider changes.
+  const isLocked = false
 
   const { data: prefs } = usePreferences()
   const { data: modelCatalog } = useModelCatalog()
@@ -129,9 +131,10 @@ export function BackendModelPickerContent({
     [favKey, fastSet, fastModels, patchPreferences]
   )
 
-  const { data: availableOpencodeModels } = useAvailableOpencodeModels({
-    enabled: installedBackends.includes('opencode'),
-  })
+  const { data: availableOpencodeModels, isError: opencodeModelsError } =
+    useAvailableOpencodeModels({
+      enabled: installedBackends.includes('opencode'),
+    })
   const { data: availableCursorModels } = useAvailableCursorModels({
     enabled: installedBackends.includes('cursor'),
   })
@@ -142,14 +145,13 @@ export function BackendModelPickerContent({
     enabled: installedBackends.includes('commandcode'),
   })
 
-  const opencodeModelOptions = useMemo(
-    () =>
-      availableOpencodeModels?.map(model => ({
-        value: model,
-        label: formatOpencodeModelLabel(model),
-      })),
-    [availableOpencodeModels]
-  )
+  const opencodeModelOptions = useMemo(() => {
+    if (opencodeModelsError) return []
+    return availableOpencodeModels?.map(model => ({
+      value: model,
+      label: formatOpencodeModelLabel(model),
+    }))
+  }, [availableOpencodeModels, opencodeModelsError])
   const cursorModelOptions = useMemo(
     () =>
       availableCursorModels?.map(model => ({
@@ -163,6 +165,7 @@ export function BackendModelPickerContent({
       availablePiModels?.map(model => ({
         value: `pi/${model.id}`,
         label: model.label || formatPiModelLabel(model.id),
+        is_default: model.is_default,
       })),
     [availablePiModels]
   )
@@ -409,7 +412,6 @@ export function BackendModelPickerContent({
 
   const showProviderHint =
     Boolean(providerLocked) &&
-    isLocked &&
     activeBackend === 'claude' &&
     customCliProfiles.length > 0
 
@@ -469,7 +471,9 @@ export function BackendModelPickerContent({
             )}
           >
             {filteredOptions.length === 0 && (
-              <CommandEmpty>No models found.</CommandEmpty>
+              <CommandEmpty>
+                No {getBackendPlainLabel(activeBackend)} models found.
+              </CommandEmpty>
             )}
 
             {filteredOptions.map(option => {

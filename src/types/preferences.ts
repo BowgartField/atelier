@@ -62,6 +62,8 @@ export interface MagicPrompts {
   parallel_execution: string | null
   /** Global system prompt appended to every chat session (like ~/.claude/CLAUDE.md) */
   global_system_prompt: string | null
+  /** Hidden prompt prepended when switching providers within a Jean session */
+  provider_switch_handoff: string | null
   /** Prompt for investigating Dependabot vulnerability alerts */
   investigate_security_alert: string | null
   /** Prompt for investigating repository security advisories */
@@ -207,16 +209,26 @@ export const DEFAULT_PR_CONTENT_PROMPT = `<task>Generate a pull request title an
 /** Default prompt for commit message generation */
 export const DEFAULT_COMMIT_MESSAGE_PROMPT = `Generate a conventional commit message for these staged changes.
 
+Rules:
+- Output only the commit message text.
+- Describe the actual staged code changes only.
+- Base the subject on the staged diff and file summary, not on recent commits, repository instructions, agent skills, or this prompt.
+- Do not describe prompt text, commit-message guidance, instructions, inspection, skills, or the act of generating a commit message.
+- Avoid vague/meta subjects like "update files", "inspect changes", "inspect staged changes", "inspect commit-message skill", "generate commit message", "adjust code", or "misc changes".
+- Use a specific Conventional Commits subject: type(optional-scope): concrete behavior changed.
+- First line must be 72 characters or fewer.
+- If prompt/config files changed, name the user-facing behavior affected, not "guidance" or "prompt".
+
 Files changed:
 {diff_stat}
 
 Git status:
 {status}
 
-Diff:
+Staged diff:
 {diff}
 
-Recent commits (style reference):
+Recent commits (style reference only — do not summarize these commits):
 {recent_commits}`
 
 /** Default prompt for code review */
@@ -603,6 +615,19 @@ export const DEFAULT_GLOBAL_SYSTEM_PROMPT = `### 1. Planning Guidance
 
 - After each finished task, please write a few bullet points on how to test the changes.`
 
+export const DEFAULT_PROVIDER_SWITCH_HANDOFF_PROMPT = `You are continuing a Jean chat session after the user switched AI backends.
+
+Jean-local history is the source of truth because provider-owned server history may be incomplete after backend switches.
+
+Previous backend: {previous_backend}
+Current backend: {current_backend}
+
+Use the Jean-local history below to reconstruct context before answering the user's latest message. Do not mention this hidden handoff unless it is directly relevant.
+
+<jean_local_history>
+{history}
+</jean_local_history>`
+
 /** Default prompt for addressing inline PR review comments */
 export const DEFAULT_REVIEW_COMMENTS_PROMPT = `<task>
 
@@ -654,6 +679,7 @@ export const DEFAULT_MAGIC_PROMPTS: MagicPrompts = {
   session_naming: null,
   parallel_execution: null,
   global_system_prompt: null,
+  provider_switch_handoff: null,
   investigate_security_alert: null,
   investigate_advisory: null,
   investigate_linear_issue: null,
@@ -1028,6 +1054,9 @@ export interface AppPreferences {
   codex_goal_execution_mode: CodexGoalExecutionMode // Execution mode used when starting a Codex /goal
   codex_multi_agent_enabled: boolean // Enable Codex multi-agent collaboration (experimental)
   codex_max_agent_threads: number // Max concurrent agent threads (1-8) when multi-agent is enabled
+  codex_auto_steer_enabled: boolean // Steer prompts into a running Codex turn instead of queueing (default: true)
+  opencode_auto_steer_enabled: boolean // Steer prompts into a running OpenCode turn instead of queueing (default: true)
+  pi_auto_steer_enabled: boolean // Steer prompts into a running PI turn instead of queueing (default: true)
   restore_last_session: boolean // Restore last session when switching projects (default: true)
   close_original_on_clear_context: boolean // Close original session when using Clear Context and yolo (default: true)
   build_model: string | null // Model override for plan approval (build mode), null = use session model
@@ -1858,6 +1887,9 @@ export const defaultPreferences: AppPreferences = {
   codex_goal_execution_mode: 'build', // Default: build mode for goals
   codex_multi_agent_enabled: false, // Default: disabled
   codex_max_agent_threads: 3, // Default: 3 threads
+  codex_auto_steer_enabled: true, // Default: steer Codex running turn instead of queueing
+  opencode_auto_steer_enabled: true, // Default: steer OpenCode running turn instead of queueing
+  pi_auto_steer_enabled: true, // Default: steer PI running turn instead of queueing
   restore_last_session: true, // Default: enabled
   close_original_on_clear_context: true, // Default: enabled
   build_model: null, // Default: use session model

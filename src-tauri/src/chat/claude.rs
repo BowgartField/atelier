@@ -1,8 +1,8 @@
 use tauri::Manager;
 
 use super::types::{
-    CompactMetadata, ContentBlock, EffortLevel, PermissionDenial, PermissionDeniedEvent,
-    ThinkingLevel, ToolCall, UsageData,
+    is_claude_compaction_summary_text, CompactMetadata, ContentBlock, EffortLevel,
+    PermissionDenial, PermissionDeniedEvent, ThinkingLevel, ToolCall, UsageData,
 };
 use crate::http_server::EmitExt;
 use crate::projects::github_issues::{
@@ -134,6 +134,8 @@ struct ChunkEvent {
     session_id: String,
     worktree_id: String, // Kept for backward compatibility
     content: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    run_id: Option<String>,
 }
 
 /// Payload for tool use events sent to frontend
@@ -173,6 +175,8 @@ pub struct CancelledEvent {
     pub worktree_id: String, // Kept for backward compatibility
     pub undo_send: bool, // True if user message should be restored to input (instant cancellation)
     pub emitted_at_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
 }
 
 /// Payload for tool block position events sent to frontend
@@ -232,6 +236,14 @@ struct CompactedEvent {
     session_id: String,
     worktree_id: String,
     metadata: CompactMetadata,
+}
+
+fn compact_metadata_from_system_message(msg: &serde_json::Value) -> Option<CompactMetadata> {
+    msg.get("compact_metadata")
+        .or_else(|| msg.get("compactMetadata"))
+        .and_then(|metadata_val| {
+            serde_json::from_value::<CompactMetadata>(metadata_val.clone()).ok()
+        })
 }
 
 // =============================================================================
@@ -1074,7 +1086,7 @@ pub fn execute_claude_detached(
     }
 
     // Register the process for cancellation (returns false if pending cancel exists)
-    if !super::registry::register_process(session_id.to_string(), pid) {
+    if !super::registry::register_detached_process(session_id.to_string(), pid) {
         // Process was killed by pending cancel — return cancelled response
         return Ok((
             pid,
@@ -1134,6 +1146,10 @@ pub fn tail_claude_output(
 
     log::trace!("Starting to tail NDJSON output for session: {session_id}");
     log::trace!("Output file: {output_file:?}, PID: {pid}");
+    let run_id = output_file
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .map(|stem| stem.to_string());
 
     // Create tailer starting from beginning (we want all content)
     let mut tailer = NdjsonTailer::new_from_start(output_file)?;
@@ -1288,7 +1304,9 @@ pub fn tail_claude_output(
                                         {
                                             // Skip CLI placeholder text emitted when extended
                                             // thinking starts before any real text content
-                                            if text == "(no content)" {
+                                            if text == "(no content)"
+                                                || is_claude_compaction_summary_text(text)
+                                            {
                                                 continue;
                                             }
 
@@ -1330,6 +1348,7 @@ pub fn tail_claude_output(
                                                             session_id: session_id.to_string(),
                                                             worktree_id: worktree_id.to_string(),
                                                             content: chat_buf.clone(),
+                                                            run_id: run_id.clone(),
                                                         };
                                                         if let Err(e) =
                                                             app.emit_all("chat:chunk", &chunk)
@@ -1377,6 +1396,7 @@ pub fn tail_claude_output(
                                                     session_id: session_id.to_string(),
                                                     worktree_id: worktree_id.to_string(),
                                                     content: chat_buf,
+                                                    run_id: run_id.clone(),
                                                 };
                                                 if let Err(e) = app.emit_all("chat:chunk", &chunk) {
                                                     log::error!("Failed to emit chunk: {e}");
@@ -1893,18 +1913,14 @@ pub fn tail_claude_output(
                         }
 
                         // Emit compacted event with metadata if available
-                        if let Some(metadata_val) = msg.get("compactMetadata") {
-                            if let Ok(metadata) =
-                                serde_json::from_value::<CompactMetadata>(metadata_val.clone())
-                            {
-                                let compacted_event = CompactedEvent {
-                                    session_id: session_id.to_string(),
-                                    worktree_id: worktree_id.to_string(),
-                                    metadata,
-                                };
-                                if let Err(e) = app.emit_all("chat:compacted", &compacted_event) {
-                                    log::error!("Failed to emit compacted: {e}");
-                                }
+                        if let Some(metadata) = compact_metadata_from_system_message(&msg) {
+                            let compacted_event = CompactedEvent {
+                                session_id: session_id.to_string(),
+                                worktree_id: worktree_id.to_string(),
+                                metadata,
+                            };
+                            if let Err(e) = app.emit_all("chat:compacted", &compacted_event) {
+                                log::error!("Failed to emit compacted: {e}");
                             }
                         }
                     }
@@ -2148,6 +2164,23 @@ pub fn tail_claude_output(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compact_metadata_accepts_snake_case_from_claude_cli() {
+        let msg = serde_json::json!({
+            "type": "system",
+            "subtype": "compact_boundary",
+            "compact_metadata": {
+                "trigger": "auto",
+                "pre_tokens": 170298
+            }
+        });
+
+        let metadata = compact_metadata_from_system_message(&msg).unwrap();
+
+        assert_eq!(metadata.trigger, "auto");
+        assert_eq!(metadata.pre_tokens, 170298);
+    }
 
     #[test]
     fn split_fast_model_strips_suffix() {

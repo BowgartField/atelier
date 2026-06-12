@@ -36,4 +36,32 @@ describe('resolveDefaultModelForBackend', () => {
       resolveDefaultModelForBackend('commandcode', {} as AppPreferences)
     ).toBe('commandcode/default')
   })
+
+  it('uses the first available PI provider model when the stored PI default is unavailable', () => {
+    expect(
+      resolveDefaultModelForBackend(
+        'pi',
+        { selected_pi_model: 'pi/sonnet' } as unknown as AppPreferences,
+        [
+          { value: 'pi/openai-codex/gpt-5.5', label: 'GPT 5.5' },
+          { value: 'pi/openai-codex/gpt-5.4', label: 'GPT 5.4' },
+        ]
+      )
+    ).toBe('pi/openai-codex/gpt-5.5')
+  })
+
+  it('keeps a stored PI model when it is available', () => {
+    expect(
+      resolveDefaultModelForBackend(
+        'pi',
+        {
+          selected_pi_model: 'pi/openai-codex/gpt-5.4',
+        } as unknown as AppPreferences,
+        [
+          { value: 'pi/openai-codex/gpt-5.5', label: 'GPT 5.5' },
+          { value: 'pi/openai-codex/gpt-5.4', label: 'GPT 5.4' },
+        ]
+      )
+    ).toBe('pi/openai-codex/gpt-5.4')
+  })
 })

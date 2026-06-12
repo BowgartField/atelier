@@ -2528,6 +2528,7 @@ dependencies = [
  "tauri-plugin-window-state",
  "tempfile",
  "tokio",
+ "tokio-tungstenite",
  "toml 0.8.2",
  "toml_edit 0.23.10+spec-1.0.0",
  "tower-http",

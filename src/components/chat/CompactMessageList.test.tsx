@@ -99,4 +99,70 @@ describe('CompactMessageList', () => {
     expect(screen.getByText('Bash')).toBeVisible()
     expect(screen.getByText('1 step')).toBeVisible()
   })
+
+  it('surfaces steered user prompts as separate visible rows', () => {
+    renderCompact([
+      message('user-1', 'user', 100, 'do the work'),
+      message('assistant-1', 'assistant', 104, 'Done', {
+        tool_calls: [
+          {
+            id: 'tool-1',
+            name: 'Bash',
+            input: { command: 'rtk git status' },
+            output: 'clean',
+          },
+        ],
+        content_blocks: [
+          { type: 'tool_use', tool_call_id: 'tool-1' },
+          { type: 'user_input', text: 'also check the tests' },
+          { type: 'text', text: 'Done' },
+        ],
+      }),
+    ])
+
+    // Steered prompt visible without expanding the collapsed activity row
+    expect(screen.getByText('also check the tests')).toBeVisible()
+    // Activity after the steer renders after the bubble (pure text segment)
+    expect(screen.getByText('Done')).toBeVisible()
+  })
+
+  it('keeps steered prompts in chronological order around activity', () => {
+    renderCompact([
+      message('user-1', 'user', 100, 'hello'),
+      message('assistant-1', 'assistant', 104, 'All received', {
+        tool_calls: [
+          {
+            id: 'tool-1',
+            name: 'Bash',
+            input: { command: 'rtk git status' },
+            output: 'clean',
+          },
+        ],
+        content_blocks: [
+          { type: 'user_input', text: 'whatsup' },
+          { type: 'user_input', text: 'is it?' },
+          { type: 'tool_use', tool_call_id: 'tool-1' },
+          { type: 'text', text: 'All received' },
+        ],
+      }),
+    ])
+
+    const whatsup = screen.getByText('whatsup')
+    const isIt = screen.getByText('is it?')
+    const activity = screen.getAllByText('All received')[0]
+
+    // Consecutive steered prompts render inside ONE connected group card
+    expect(whatsup.closest('.divide-y')).toBe(isIt.closest('.divide-y'))
+    expect(whatsup.closest('.divide-y')).not.toBeNull()
+
+    // Steered prompts come BEFORE the activity that followed them
+    expect(
+      whatsup.compareDocumentPosition(isIt) & Node.DOCUMENT_POSITION_FOLLOWING
+    ).toBeTruthy()
+    expect(
+      activity &&
+        isIt.compareDocumentPosition(activity) &
+          Node.DOCUMENT_POSITION_FOLLOWING
+    ).toBeTruthy()
+  })
 })

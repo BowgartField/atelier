@@ -50,6 +50,8 @@ struct ChunkEvent {
     session_id: String,
     worktree_id: String,
     content: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    run_id: Option<String>,
 }
 
 #[derive(serde::Serialize, Clone)]
@@ -583,6 +585,21 @@ pub fn build_turn_start_params(
     params
 }
 
+/// Build JSON-RPC params for `turn/steer` — injects user input into a running turn.
+/// The request fails server-side when `expectedTurnId` no longer matches the
+/// active turn (turn ended), which callers treat as a fallback signal.
+pub fn build_turn_steer_params(thread_id: &str, turn_id: &str, text: &str) -> serde_json::Value {
+    serde_json::json!({
+        "threadId": thread_id,
+        "expectedTurnId": turn_id,
+        "input": [{
+            "type": "text",
+            "text": text,
+            "text_elements": [],
+        }],
+    })
+}
+
 // =============================================================================
 // Execution via app-server
 // =============================================================================
@@ -928,6 +945,53 @@ fn append_codex_thread_snapshot_to_history_file(
     let existing = std::fs::read_to_string(output_file).unwrap_or_default();
     let existing_lines: std::collections::HashSet<&str> = existing.lines().map(str::trim).collect();
 
+    // Snapshot items use synthetic `item-N` ids while live-written lines use
+    // real ids (msg_…, rs_…). Collect (type, text, id) of existing text items
+    // so re-snapshotted duplicates of already-written items are skipped.
+    let mut existing_text_items: std::collections::HashMap<(String, String), String> =
+        std::collections::HashMap::new();
+    for line in existing.lines() {
+        let Ok(msg) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        let Some(item) = msg.get("item") else {
+            continue;
+        };
+        let item_type = item.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        if item_type != "agent_message" && item_type != "reasoning" {
+            continue;
+        }
+        let Some(text) = item.get("text").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let id = item.get("id").and_then(|v| v.as_str()).unwrap_or("");
+        existing_text_items
+            .entry((item_type.to_string(), text.to_string()))
+            .or_insert_with(|| id.to_string());
+    }
+    let is_known_text_item = |line: &str| -> bool {
+        let Ok(msg) = serde_json::from_str::<serde_json::Value>(line) else {
+            return false;
+        };
+        let Some(item) = msg.get("item") else {
+            return false;
+        };
+        let item_type = item.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        if item_type != "agent_message" && item_type != "reasoning" {
+            return false;
+        }
+        let Some(text) = item.get("text").and_then(|v| v.as_str()) else {
+            return false;
+        };
+        let id = item.get("id").and_then(|v| v.as_str()).unwrap_or("");
+        match existing_text_items.get(&(item_type.to_string(), text.to_string())) {
+            Some(first_id) => {
+                first_id != id && (first_id.starts_with("item-") || id.starts_with("item-"))
+            }
+            None => false,
+        }
+    };
+
     let mut writer = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -935,7 +999,7 @@ fn append_codex_thread_snapshot_to_history_file(
         .map_err(|e| format!("Failed to open Codex recovery history: {e}"))?;
 
     for line in lines {
-        if existing_lines.contains(line.as_str()) {
+        if existing_lines.contains(line.as_str()) || is_known_text_item(&line) {
             continue;
         }
         writeln!(writer, "{line}")
@@ -1078,6 +1142,19 @@ pub fn resume_codex_after_crash(
                     thread_id.to_string(),
                     codex_turn_id.unwrap_or_default().to_string(),
                 );
+
+                // Backfill items that completed while Jean was closed. Live
+                // notifications only cover events from reconnect onward; the
+                // resume snapshot holds the earlier ones. Existing lines are
+                // skipped (exact-line dedupe) and the parser upserts by item id.
+                if let Err(e) = append_codex_thread_snapshot_to_history_file(
+                    &output_file,
+                    &response,
+                    codex_turn_id,
+                    false,
+                ) {
+                    log::warn!("Failed to backfill Codex resume snapshot: {e}");
+                }
 
                 // Determine execution mode from run metadata (single load)
                 let exec_mode = super::storage::load_metadata(app, session_id)?.and_then(|m| {
@@ -1449,6 +1526,7 @@ fn process_turn_events(
                     app,
                     session_id,
                     worktree_id,
+                    run_id,
                     &method,
                     &params,
                     &mut full_content,
@@ -1485,6 +1563,13 @@ fn process_turn_events(
                                 log::warn!("Failed to persist codex_turn_id on run: {e}");
                             }
                         }
+                        // Steer any prompts that were queued before the turn
+                        // became steerable (auto-steer preference, default on).
+                        super::commands::trigger_codex_queue_steer(
+                            app.clone(),
+                            worktree_id.to_string(),
+                            session_id.to_string(),
+                        );
                     }
                 }
             }
@@ -1633,6 +1718,7 @@ fn process_turn_events(
                 worktree_id: worktree_id.to_string(),
                 undo_send: false,
                 emitted_at_ms,
+                run_id: Some(run_id.to_string()),
             },
         );
     }
@@ -1738,6 +1824,7 @@ fn process_server_notification(
     app: &tauri::AppHandle,
     session_id: &str,
     worktree_id: &str,
+    run_id: &str,
     method: &str,
     params: &serde_json::Value,
     full_content: &mut String,
@@ -1777,6 +1864,7 @@ fn process_server_notification(
                             session_id: session_id.to_string(),
                             worktree_id: worktree_id.to_string(),
                             content: delta.to_string(),
+                            run_id: Some(run_id.to_string()),
                         },
                     );
                 }
@@ -1863,6 +1951,7 @@ fn process_server_notification(
                 app,
                 session_id,
                 worktree_id,
+                run_id,
                 &event_msg,
                 event_type,
                 full_content,
@@ -1957,6 +2046,7 @@ fn process_server_notification(
                 app,
                 session_id,
                 worktree_id,
+                run_id,
                 &event_msg,
                 event_type,
                 full_content,
@@ -2042,6 +2132,13 @@ fn process_server_notification(
                         .unwrap_or(0),
                     cache_creation_input_tokens: 0,
                 });
+            }
+        }
+        "account/rateLimits/updated" => {
+            if let Err(e) =
+                crate::codex_cli::update_codex_usage_from_app_server_rate_limits(app, params)
+            {
+                log::warn!("Failed to update Codex usage from rate limits notification: {e}");
             }
         }
         "item/reasoning/textDelta" | "item/reasoning/summaryTextDelta" => {
@@ -2526,6 +2623,7 @@ fn process_codex_event(
     app: &tauri::AppHandle,
     session_id: &str,
     worktree_id: &str,
+    run_id: &str,
     msg: &serde_json::Value,
     event_type: &str,
     full_content: &mut String,
@@ -2924,6 +3022,7 @@ fn process_codex_event(
                                         session_id: session_id.to_string(),
                                         worktree_id: worktree_id.to_string(),
                                         content: text.to_string(),
+                                        run_id: Some(run_id.to_string()),
                                     },
                                 );
                             }
@@ -3263,6 +3362,25 @@ pub fn parse_codex_run_to_message(
     let mut content_blocks: Vec<ContentBlock> = Vec::new();
     let mut pending_tool_ids: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
+    // Crash-recovery snapshots renumber agent_message/reasoning items to
+    // synthetic `item-N` ids while live notifications use real ids (msg_…,
+    // rs_…). Track (type, text) → first id so the same item appended under
+    // both id schemes renders once. Two REAL ids with identical text are
+    // kept (legitimate repeated model output).
+    let mut seen_text_items: std::collections::HashMap<(&'static str, String), String> =
+        std::collections::HashMap::new();
+    let mut is_duplicate_text_item = |kind: &'static str, text: &str, item_id: &str| -> bool {
+        match seen_text_items.entry((kind, text.to_string())) {
+            std::collections::hash_map::Entry::Vacant(e) => {
+                e.insert(item_id.to_string());
+                false
+            }
+            std::collections::hash_map::Entry::Occupied(e) => {
+                let first_id = e.get();
+                first_id == item_id || first_id.starts_with("item-") || item_id.starts_with("item-")
+            }
+        }
+    };
 
     for line in lines {
         if line.trim().is_empty() {
@@ -3285,6 +3403,16 @@ pub fn parse_codex_run_to_message(
         let event_type = msg.get("type").and_then(|v| v.as_str()).unwrap_or("");
 
         match event_type {
+            // User text injected mid-turn via `turn/steer` (written by steer_codex_turn).
+            // Codex's own userMessage items are filtered (unordered duplicates) —
+            // this explicit line is the single source of truth for transcript order.
+            "steered_user_message" => {
+                if let Some(text) = msg.get("text").and_then(|v| v.as_str()) {
+                    content_blocks.push(ContentBlock::UserInput {
+                        text: text.to_string(),
+                    });
+                }
+            }
             "turn.plan_updated" => {
                 if !is_plan_mode {
                     continue;
@@ -3530,6 +3658,9 @@ pub fn parse_codex_run_to_message(
                             if run.cancelled && content == text {
                                 continue;
                             }
+                            if is_duplicate_text_item("agent_message", &text, item_id) {
+                                continue;
+                            }
                             content.push_str(&text);
 
                             // In plan mode, merge final_answer into the CodexPlan tool
@@ -3584,6 +3715,9 @@ pub fn parse_codex_run_to_message(
                     }
                     "reasoning" => {
                         if let Some(text) = item.get("text").and_then(|v| v.as_str()) {
+                            if is_duplicate_text_item("reasoning", text, item_id) {
+                                continue;
+                            }
                             content_blocks.push(ContentBlock::Thinking {
                                 thinking: text.to_string(),
                             });
@@ -4059,6 +4193,139 @@ mod tests {
         assert_eq!(agent["item"]["text"], "done");
     }
 
+    fn test_run_entry() -> RunEntry {
+        serde_json::from_value(serde_json::json!({
+            "run_id": "run-1",
+            "user_message_id": "u1",
+            "user_message": "hi",
+            "started_at": 0,
+            "status": "completed"
+        }))
+        .expect("test RunEntry")
+    }
+
+    #[test]
+    fn parse_codex_run_dedupes_snapshot_and_live_ids_for_same_text() {
+        // Live notifications use real ids (msg_…); crash-recovery snapshots
+        // renumber the same items to synthetic item-N ids. The parser must
+        // render the item once.
+        let run = test_run_entry();
+        let lines = vec![
+            r#"{"type":"item.completed","item":{"id":"msg_abc","type":"agent_message","text":"Hello"}}"#.to_string(),
+            r#"{"type":"item.completed","item":{"id":"item-2","type":"agent_message","text":"Hello"}}"#.to_string(),
+            r#"{"type":"item.completed","item":{"id":"rs_abc","type":"reasoning","text":"thinking…"}}"#.to_string(),
+            r#"{"type":"item.completed","item":{"id":"item-1","type":"reasoning","text":"thinking…"}}"#.to_string(),
+        ];
+
+        let msg = parse_codex_run_to_message(&lines, &run).expect("parse");
+        assert_eq!(msg.content, "Hello");
+        let text_blocks = msg
+            .content_blocks
+            .iter()
+            .filter(|b| matches!(b, ContentBlock::Text { .. }))
+            .count();
+        let thinking_blocks = msg
+            .content_blocks
+            .iter()
+            .filter(|b| matches!(b, ContentBlock::Thinking { .. }))
+            .count();
+        assert_eq!(text_blocks, 1);
+        assert_eq!(thinking_blocks, 1);
+    }
+
+    #[test]
+    fn parse_codex_run_keeps_repeated_text_from_distinct_real_ids() {
+        let run = test_run_entry();
+        let lines = vec![
+            r#"{"type":"item.completed","item":{"id":"msg_a","type":"agent_message","text":"Done."}}"#.to_string(),
+            r#"{"type":"item.completed","item":{"id":"msg_b","type":"agent_message","text":"Done."}}"#.to_string(),
+        ];
+
+        let msg = parse_codex_run_to_message(&lines, &run).expect("parse");
+        assert_eq!(msg.content, "Done.Done.");
+    }
+
+    #[test]
+    fn snapshot_append_skips_text_items_already_written_under_live_ids() {
+        let tmp = tempfile::tempdir().unwrap();
+        let output_file = tmp.path().join("run.jsonl");
+        std::fs::write(
+            &output_file,
+            concat!(
+                r#"{"type":"item.completed","item":{"id":"msg_abc","type":"agent_message","text":"Hello"}}"#,
+                "\n"
+            ),
+        )
+        .unwrap();
+
+        let response = serde_json::json!({
+            "thread": {
+                "status": { "type": "active" },
+                "turns": [
+                    {
+                        "id": "turn-1",
+                        "status": "inProgress",
+                        "items": [
+                            { "id": "item-2", "type": "agentMessage", "text": "Hello" },
+                            { "id": "item-3", "type": "agentMessage", "text": "New content" }
+                        ]
+                    }
+                ]
+            }
+        });
+
+        append_codex_thread_snapshot_to_history_file(
+            &output_file,
+            &response,
+            Some("turn-1"),
+            false,
+        )
+        .expect("append");
+
+        let contents = std::fs::read_to_string(&output_file).unwrap();
+        assert_eq!(
+            contents.matches("\"text\":\"Hello\"").count(),
+            1,
+            "duplicate snapshot of live-written item must be skipped: {contents}"
+        );
+        assert!(contents.contains("New content"));
+    }
+
+    #[test]
+    fn snapshot_history_lines_match_live_notification_lines_byte_for_byte() {
+        // The resume backfill relies on exact-line dedupe between snapshot
+        // lines (thread/resume) and live lines (item/completed notifications).
+        // Both must serialize identically for the same item.
+        let item = serde_json::json!({
+            "id": "msg-1",
+            "type": "agentMessage",
+            "text": "done"
+        });
+
+        let live_params = serde_json::json!({ "item": item });
+        let live_line = notification_to_history_line("item/completed", &live_params)
+            .expect("live history line");
+
+        let response = serde_json::json!({
+            "thread": {
+                "status": { "type": "active" },
+                "turns": [
+                    {
+                        "id": "turn-1",
+                        "status": "inProgress",
+                        "items": [item]
+                    }
+                ]
+            }
+        });
+        let snapshot_lines = codex_thread_snapshot_history_lines(&response, Some("turn-1"), false);
+
+        assert!(
+            snapshot_lines.contains(&live_line),
+            "snapshot lines {snapshot_lines:?} must contain live line {live_line}"
+        );
+    }
+
     #[test]
     fn gpt_5_4_fast_enables_fast_service_tier() {
         let params = build_thread_start_params(
@@ -4294,6 +4561,7 @@ mod tests {
             execution_mode: Some("plan".to_string()),
             thinking_level: None,
             effort_level: None,
+            backend: None,
             started_at: 1,
             ended_at: Some(2),
             status: RunStatus::Cancelled,
@@ -4319,6 +4587,69 @@ mod tests {
     }
 
     #[test]
+    fn build_turn_steer_params_shape() {
+        let params = build_turn_steer_params("thread-1", "turn-1", "do this next");
+
+        assert_eq!(params["threadId"], "thread-1");
+        assert_eq!(params["expectedTurnId"], "turn-1");
+        let input = params["input"].as_array().expect("input array");
+        assert_eq!(input.len(), 1);
+        assert_eq!(input[0]["type"], "text");
+        assert_eq!(input[0]["text"], "do this next");
+    }
+
+    #[test]
+    fn parse_run_orders_steered_user_message_between_items() {
+        let lines = vec![
+            r#"{"type":"item.completed","item":{"type":"agent_message","text":"Before steer"}}"#
+                .to_string(),
+            r#"{"type":"steered_user_message","text":"also check tests"}"#.to_string(),
+            r#"{"type":"item.completed","item":{"type":"agent_message","text":"After steer"}}"#
+                .to_string(),
+        ];
+        let run = RunEntry {
+            run_id: "run-3".to_string(),
+            user_message_id: "user-3".to_string(),
+            user_message: "prompt".to_string(),
+            model: None,
+            execution_mode: Some("build".to_string()),
+            thinking_level: None,
+            effort_level: None,
+            backend: None,
+            started_at: 1,
+            ended_at: Some(2),
+            status: RunStatus::Completed,
+            assistant_message_id: Some("assistant-3".to_string()),
+            cancelled: false,
+            recovered: false,
+            claude_session_id: None,
+            pid: None,
+            usage: None,
+            codex_thread_id: None,
+            codex_turn_id: None,
+            cursor_chat_id: None,
+        };
+
+        let message = parse_codex_run_to_message(&lines, &run).expect("message");
+
+        assert_eq!(message.content_blocks.len(), 3);
+        assert!(matches!(
+            &message.content_blocks[0],
+            ContentBlock::Text { text } if text == "Before steer"
+        ));
+        assert!(matches!(
+            &message.content_blocks[1],
+            ContentBlock::UserInput { text } if text == "also check tests"
+        ));
+        assert!(matches!(
+            &message.content_blocks[2],
+            ContentBlock::Text { text } if text == "After steer"
+        ));
+        // Steered text must not leak into the assistant content blob.
+        assert!(!message.content.contains("also check tests"));
+    }
+
+    #[test]
     fn parse_plan_run_preserves_agent_message_text_blocks() {
         let lines = vec![
             r#"{"type":"item.plan.delta","item_id":"plan-1","delta":"Partial plan"}"#.to_string(),
@@ -4335,6 +4666,7 @@ mod tests {
             execution_mode: Some("plan".to_string()),
             thinking_level: None,
             effort_level: None,
+            backend: None,
             started_at: 1,
             ended_at: Some(2),
             status: RunStatus::Completed,
@@ -4388,6 +4720,7 @@ mod tests {
             execution_mode: Some("plan".to_string()),
             thinking_level: None,
             effort_level: None,
+            backend: None,
             started_at: 1,
             ended_at: Some(2),
             status: RunStatus::Completed,
@@ -4456,6 +4789,7 @@ mod tests {
             execution_mode: Some("plan".to_string()),
             thinking_level: None,
             effort_level: None,
+            backend: None,
             started_at: 1,
             ended_at: Some(2),
             status: RunStatus::Completed,
@@ -4509,6 +4843,7 @@ mod tests {
             execution_mode: Some("yolo".to_string()),
             thinking_level: None,
             effort_level: None,
+            backend: None,
             started_at: 1,
             ended_at: Some(2),
             status: RunStatus::Completed,
@@ -4567,6 +4902,7 @@ mod tests {
             execution_mode: Some("plan".to_string()),
             thinking_level: None,
             effort_level: None,
+            backend: None,
             started_at: 1,
             ended_at: Some(2),
             status: RunStatus::Completed,
@@ -4606,6 +4942,7 @@ mod tests {
             execution_mode: Some("plan".to_string()),
             thinking_level: None,
             effort_level: None,
+            backend: None,
             started_at: 1,
             ended_at: Some(2),
             status: RunStatus::Completed,

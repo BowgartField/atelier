@@ -109,7 +109,7 @@ fn format_pi_model_label(provider: &str, model: &str) -> String {
 fn parse_pi_models(stdout: &[u8], stderr: &[u8]) -> Vec<PiModelInfo> {
     let stdout = String::from_utf8_lossy(stdout);
     let stderr = String::from_utf8_lossy(stderr);
-    stdout
+    let mut models = stdout
         .lines()
         .chain(stderr.lines())
         .map(str::trim)
@@ -127,12 +127,16 @@ fn parse_pi_models(stdout: &[u8], stderr: &[u8]) -> Vec<PiModelInfo> {
                 is_default: false,
             })
         })
-        .collect()
+        .collect::<Vec<_>>();
+    if let Some(first) = models.first_mut() {
+        first.is_default = true;
+    }
+    models
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_pi_models, parse_version};
+    use super::{default_pi_models, parse_pi_models, parse_version};
 
     #[test]
     fn parse_version_reads_pi_version_from_stderr() {
@@ -148,7 +152,18 @@ mod tests {
 
         assert_eq!(models[0].id, "openai-codex/gpt-5.4");
         assert_eq!(models[0].label, "GPT 5.4 (OpenAI Codex)");
+        assert!(models[0].is_default);
         assert_eq!(models[1].id, "openai-codex/gpt-5.5");
+        assert!(!models[1].is_default);
+    }
+
+    #[test]
+    fn default_pi_models_keeps_legacy_sonnet_default_for_unavailable_cli() {
+        let models = default_pi_models();
+
+        assert_eq!(models[0].id, "sonnet");
+        assert!(models[0].is_default);
+        assert!(models.iter().skip(1).all(|model| !model.is_default));
     }
 }
 

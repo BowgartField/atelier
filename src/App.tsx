@@ -28,7 +28,11 @@ import MainWindow from './components/layout/MainWindow'
 import { ThemeProvider } from './components/ThemeProvider'
 import ErrorBoundary from './components/ErrorBoundary'
 import { useClaudeCliStatus, useClaudeCliAuth } from './services/claude-cli'
-import { useCodexCliStatus, useCodexCliAuth } from './services/codex-cli'
+import {
+  useCodexCliStatus,
+  useCodexCliAuth,
+  useCodexUsageUpdateListener,
+} from './services/codex-cli'
 import { useGhCliStatus, useGhCliAuth } from './services/gh-cli'
 import {
   useOpencodeCliStatus,
@@ -563,6 +567,9 @@ function App() {
   // Global streaming event listeners - must be at App level so they stay active
   // even when ChatWindow is unmounted (e.g., when viewing a different worktree)
   useStreamingEvents({ queryClient })
+
+  // Keep Codex usage UI fresh when the app-server pushes account rate-limit updates.
+  useCodexUsageUpdateListener()
 
   // Browser mode: only open WebSocket after preload + listener registration.
   // This lets us replay buffered server events before live events start arriving.
@@ -1101,6 +1108,7 @@ function App() {
 
               hydrateRunningSnapshot(session.session_id, lastMsg, {
                 allowWhileSending: true,
+                dedupeReplayedOutput: sessionSnapshot?.backend === 'claude',
               })
 
               queryClient.setQueryData<Session>(

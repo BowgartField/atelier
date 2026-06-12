@@ -179,6 +179,7 @@ import {
 } from '@/services/git-status'
 import { getPathUpdateAction } from '@/lib/cli-update'
 import { SettingsSection } from '../SettingsSection'
+import { resolvePiDefaultModel } from '@/lib/session-defaults'
 
 interface CleanupResult {
   deleted_worktrees: number
@@ -929,18 +930,31 @@ export const GeneralPane: React.FC<{ scope?: PreferencesPaneScope }> = ({
     effectiveBackend) as CliBackend
   const effectiveYoloBackend = (preferences?.yolo_backend ??
     effectiveBackend) as CliBackend
-  const selectedPiModel = preferences?.selected_pi_model ?? 'pi/sonnet'
-  const piModelOptions: { value: PiModel; label: string }[] = (
+  const piModelOptions: {
+    value: PiModel
+    label: string
+    is_default?: boolean
+  }[] = (
     availablePiModels?.length
       ? availablePiModels.map(model => ({
           value: `pi/${model.id}` as PiModel,
           label: model.label || formatPiModelLabel(model.id),
+          is_default: model.is_default,
         }))
-      : (PI_MODEL_OPTIONS as { value: PiModel; label: string }[])
+      : (PI_MODEL_OPTIONS as {
+          value: PiModel
+          label: string
+          is_default?: boolean
+        }[])
   ).map(option => ({
     value: option.value,
     label: option.label || formatPiModelLabel(option.value),
+    is_default: option.is_default,
   }))
+  const selectedPiModel = resolvePiDefaultModel(
+    preferences?.selected_pi_model,
+    piModelOptions
+  ) as PiModel
   const selectedPiModelLabel =
     piModelOptions.find(option => option.value === selectedPiModel)?.label ??
     formatPiModelLabel(selectedPiModel)
@@ -968,6 +982,30 @@ export const GeneralPane: React.FC<{ scope?: PreferencesPaneScope }> = ({
     if (preferences) {
       patchPreferences.mutate({
         codex_multi_agent_enabled: enabled,
+      })
+    }
+  }
+
+  const handleCodexAutoSteerToggle = (enabled: boolean) => {
+    if (preferences) {
+      patchPreferences.mutate({
+        codex_auto_steer_enabled: enabled,
+      })
+    }
+  }
+
+  const handleOpenCodeAutoSteerToggle = (enabled: boolean) => {
+    if (preferences) {
+      patchPreferences.mutate({
+        opencode_auto_steer_enabled: enabled,
+      })
+    }
+  }
+
+  const handlePiAutoSteerToggle = (enabled: boolean) => {
+    if (preferences) {
+      patchPreferences.mutate({
+        pi_auto_steer_enabled: enabled,
       })
     }
   }
@@ -2688,6 +2726,16 @@ export const GeneralPane: React.FC<{ scope?: PreferencesPaneScope }> = ({
             </InlineField>
 
             <InlineField
+              label="Steer running turn"
+              description="Prompts sent while Codex is working are injected into the current turn instead of queued"
+            >
+              <Switch
+                checked={preferences?.codex_auto_steer_enabled ?? true}
+                onCheckedChange={handleCodexAutoSteerToggle}
+              />
+            </InlineField>
+
+            <InlineField
               label="Multi-Agent"
               description="Allow Codex to spawn parallel subagents (experimental)"
             >
@@ -2782,6 +2830,15 @@ export const GeneralPane: React.FC<{ scope?: PreferencesPaneScope }> = ({
                   </Command>
                 </PopoverContent>
               </Popover>
+            </InlineField>
+            <InlineField
+              label="Steer running turn"
+              description="Prompts sent while OpenCode is working are sent to the running session instead of queued"
+            >
+              <Switch
+                checked={preferences?.opencode_auto_steer_enabled ?? true}
+                onCheckedChange={handleOpenCodeAutoSteerToggle}
+              />
             </InlineField>
           </div>
         </SettingsSection>
@@ -2940,6 +2997,15 @@ export const GeneralPane: React.FC<{ scope?: PreferencesPaneScope }> = ({
                   </Command>
                 </PopoverContent>
               </Popover>
+            </InlineField>
+            <InlineField
+              label="Steer running turn"
+              description="Prompts sent while PI is working are injected into the current turn instead of queued"
+            >
+              <Switch
+                checked={preferences?.pi_auto_steer_enabled ?? true}
+                onCheckedChange={handlePiAutoSteerToggle}
+              />
             </InlineField>
           </div>
         </SettingsSection>
@@ -4096,7 +4162,7 @@ export const GeneralPane: React.FC<{ scope?: PreferencesPaneScope }> = ({
             <AlertDialogAction
               onClick={handleDeleteAllArchives}
               disabled={isDeleting}
-              className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
+              className="bg-destructive text-white hover:bg-destructive/90"
             >
               {isDeleting ? 'Deleting...' : 'Delete All'}
             </AlertDialogAction>
@@ -4156,7 +4222,7 @@ export const GeneralPane: React.FC<{ scope?: PreferencesPaneScope }> = ({
             <AlertDialogAction
               onClick={handleConfirmDeleteCli}
               disabled={isDeletingCli}
-              className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
+              className="bg-destructive text-white hover:bg-destructive/90"
             >
               {isDeletingCli ? 'Deleting...' : 'Delete'}
             </AlertDialogAction>

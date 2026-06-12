@@ -82,6 +82,7 @@ pub struct CodexUsageSnapshot {
     pub weekly: Option<CodexUsageWindowSnapshot>,
     pub reviews: Option<CodexUsageWindowSnapshot>,
     pub credits_remaining: Option<f64>,
+    pub rate_limit_reached_type: Option<String>,
     pub model_limits: Vec<CodexAdditionalUsageLimit>,
     pub fetched_at: u64,
 }
@@ -240,6 +241,45 @@ struct CodexUsageApiResponse {
     additional_rate_limits: Option<Vec<CodexUsageAdditionalRateLimit>>,
     #[serde(default)]
     credits: Option<CodexCredits>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CodexAppServerRateLimitsParams {
+    rate_limits: CodexAppServerRateLimitSnapshot,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CodexAppServerRateLimitSnapshot {
+    #[serde(default)]
+    plan_type: Option<String>,
+    #[serde(default)]
+    primary: Option<CodexAppServerRateLimitWindow>,
+    #[serde(default)]
+    secondary: Option<CodexAppServerRateLimitWindow>,
+    #[serde(default)]
+    credits: Option<CodexAppServerCredits>,
+    #[serde(default)]
+    rate_limit_reached_type: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CodexAppServerRateLimitWindow {
+    #[serde(default, deserialize_with = "de_opt_f64")]
+    used_percent: Option<f64>,
+    #[serde(default, deserialize_with = "de_opt_u64")]
+    resets_at: Option<u64>,
+    #[serde(default, deserialize_with = "de_opt_u64")]
+    window_duration_mins: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CodexAppServerCredits {
+    #[serde(default, deserialize_with = "de_opt_f64")]
+    balance: Option<f64>,
 }
 
 fn de_opt_f64<'de, D>(deserializer: D) -> Result<Option<f64>, D::Error>
@@ -677,6 +717,58 @@ fn map_usage_window(
     })
 }
 
+fn current_unix_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+fn map_app_server_rate_limit_window(
+    window: Option<CodexAppServerRateLimitWindow>,
+) -> Option<CodexUsageWindowSnapshot> {
+    let window = window?;
+    let used_percent = window.used_percent?;
+
+    Some(CodexUsageWindowSnapshot {
+        used_percent,
+        resets_at: window.resets_at,
+        limit_window_seconds: window
+            .window_duration_mins
+            .map(|mins| mins.saturating_mul(60)),
+    })
+}
+
+pub(crate) fn codex_usage_snapshot_from_app_server_rate_limits(
+    params: &Value,
+    fetched_at: u64,
+) -> Result<CodexUsageSnapshot, String> {
+    let notification = serde_json::from_value::<CodexAppServerRateLimitsParams>(params.clone())
+        .map_err(|e| format!("Failed to parse Codex rate limits notification payload: {e}"))?;
+    let rate_limits = notification.rate_limits;
+
+    Ok(CodexUsageSnapshot {
+        plan_type: rate_limits.plan_type,
+        session: map_app_server_rate_limit_window(rate_limits.primary),
+        weekly: map_app_server_rate_limit_window(rate_limits.secondary),
+        reviews: None,
+        credits_remaining: rate_limits.credits.and_then(|credits| credits.balance),
+        rate_limit_reached_type: rate_limits.rate_limit_reached_type,
+        model_limits: Vec::new(),
+        fetched_at,
+    })
+}
+
+pub(crate) fn update_codex_usage_from_app_server_rate_limits(
+    app: &AppHandle,
+    params: &Value,
+) -> Result<CodexUsageSnapshot, String> {
+    let snapshot = codex_usage_snapshot_from_app_server_rate_limits(params, current_unix_secs())?;
+    save_cached_codex_usage(&snapshot, snapshot.fetched_at);
+    let _ = app.emit_all("codex-cli:usage-updated", &snapshot);
+    Ok(snapshot)
+}
+
 async fn refresh_codex_access_token(
     client: &reqwest::Client,
     auth_source: &CodexAuthSource,
@@ -979,10 +1071,7 @@ pub async fn check_codex_cli_auth(app: AppHandle) -> Result<CodexAuthStatus, Str
 /// Get current Codex usage for authenticated users.
 #[tauri::command]
 pub async fn get_codex_usage(app: AppHandle) -> Result<CodexUsageSnapshot, String> {
-    let now_secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+    let now_secs = current_unix_secs();
     if let Some(cached) = load_cached_codex_usage(now_secs) {
         return Ok(cached);
     }
@@ -1161,6 +1250,7 @@ pub async fn get_codex_usage(app: AppHandle) -> Result<CodexUsageSnapshot, Strin
         weekly,
         reviews,
         credits_remaining,
+        rate_limit_reached_type: None,
         model_limits,
         fetched_at: now_secs,
     };
@@ -2006,5 +2096,66 @@ mod tests {
 
         assert_eq!(target, "x86_64-unknown-linux-musl");
         assert_eq!(version, Some("0.130.0".to_string()));
+    }
+
+    #[test]
+    fn app_server_rate_limits_map_to_usage_snapshot() {
+        let params = serde_json::json!({
+            "rateLimits": {
+                "limitId": "codex",
+                "limitName": null,
+                "primary": {
+                    "usedPercent": 23,
+                    "windowDurationMins": 300,
+                    "resetsAt": 1_771_456_509
+                },
+                "secondary": {
+                    "usedPercent": 15,
+                    "windowDurationMins": 10080,
+                    "resetsAt": 1_772_023_891
+                },
+                "credits": {
+                    "hasCredits": true,
+                    "unlimited": false,
+                    "balance": "12.5"
+                },
+                "planType": "plus",
+                "rateLimitReachedType": "rate_limit_reached"
+            }
+        });
+
+        let snapshot = codex_usage_snapshot_from_app_server_rate_limits(&params, 1_771_450_000)
+            .expect("rate limits snapshot should parse");
+
+        assert_eq!(snapshot.plan_type.as_deref(), Some("plus"));
+        assert_eq!(
+            snapshot.session.as_ref().map(|w| w.used_percent),
+            Some(23.0)
+        );
+        assert_eq!(
+            snapshot.session.as_ref().and_then(|w| w.resets_at),
+            Some(1_771_456_509)
+        );
+        assert_eq!(
+            snapshot
+                .session
+                .as_ref()
+                .and_then(|w| w.limit_window_seconds),
+            Some(18_000)
+        );
+        assert_eq!(snapshot.weekly.as_ref().map(|w| w.used_percent), Some(15.0));
+        assert_eq!(
+            snapshot
+                .weekly
+                .as_ref()
+                .and_then(|w| w.limit_window_seconds),
+            Some(604_800)
+        );
+        assert_eq!(snapshot.credits_remaining, Some(12.5));
+        assert_eq!(
+            snapshot.rate_limit_reached_type.as_deref(),
+            Some("rate_limit_reached")
+        );
+        assert_eq!(snapshot.fetched_at, 1_771_450_000);
     }
 }

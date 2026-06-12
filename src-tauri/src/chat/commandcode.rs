@@ -27,6 +27,8 @@ struct ChunkEvent {
     session_id: String,
     worktree_id: String,
     content: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    run_id: Option<String>,
 }
 
 #[derive(serde::Serialize, Clone)]
@@ -152,6 +154,7 @@ pub fn execute_commandcode_headless(
     app: &AppHandle,
     jean_session_id: &str,
     worktree_id: &str,
+    run_id: &str,
     working_dir: &Path,
     execution_mode: Option<&str>,
     model: Option<&str>,
@@ -328,6 +331,7 @@ pub fn execute_commandcode_headless(
                 session_id: jean_session_id.to_string(),
                 worktree_id: worktree_id.to_string(),
                 content: content.clone(),
+                run_id: Some(run_id.to_string()),
             },
         ) {
             Ok(_) => log::debug!(

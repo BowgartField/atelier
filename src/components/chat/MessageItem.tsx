@@ -34,6 +34,7 @@ import {
   TooltipContent,
 } from '@/components/ui/tooltip'
 import { ThinkingBlock } from './ThinkingBlock'
+import { SteeredPromptGroup } from './SteeredPromptGroup'
 import { ErrorBoundary } from '@/components/ui/ErrorBoundary'
 import { logger } from '@/lib/logger'
 import { formatDuration } from './time-utils'
@@ -520,6 +521,8 @@ export const MessageItem = memo(function MessageItem({
                               </>
                             )
                           }
+                          case 'userInput':
+                            return <SteeredPromptGroup texts={item.texts} />
                           case 'task':
                             return (
                               <TaskCallInline

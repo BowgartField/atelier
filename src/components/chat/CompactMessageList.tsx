@@ -32,6 +32,7 @@ import {
 } from '@/types/chat'
 import { MessageItem } from './MessageItem'
 import { AskUserQuestion } from './AskUserQuestion'
+import { SteeredPromptGroup } from './SteeredPromptGroup'
 import { buildTimeline } from './tool-call-utils'
 import { formatDuration, getAssistantDurationMs } from './time-utils'
 import {
@@ -103,6 +104,7 @@ type RenderItem =
       latestText: string | null
     }
   | { kind: 'question'; message: ChatMessage; globalIndex: number }
+  | { kind: 'steered'; texts: string[]; key: string }
 
 /**
  * Returns true if an assistant message should always render in full
@@ -114,6 +116,74 @@ function messageContainsPlan(message: ChatMessage): boolean {
 
 function messageContainsQuestion(message: ChatMessage): boolean {
   return Boolean(message.tool_calls?.some(isAskUserQuestion))
+}
+
+type SteerSegment =
+  | { kind: 'blocks'; message: ChatMessage }
+  | { kind: 'steered'; texts: string[]; key: string }
+
+/**
+ * Splits an assistant message at mid-turn steered user prompts (Codex
+ * `turn/steer`, `user_input` blocks) so the compact view can interleave them
+ * chronologically: activity before a steer renders before its bubble, and
+ * activity after the steer renders after it. Returns null when the message
+ * contains no steered input.
+ */
+function splitMessageAtSteeredInputs(
+  message: ChatMessage
+): SteerSegment[] | null {
+  const blocks = message.content_blocks ?? []
+  if (!blocks.some(block => block.type === 'user_input')) return null
+
+  const segments: SteerSegment[] = []
+  let current: ContentBlock[] = []
+  let part = 0
+
+  const flushBlocks = () => {
+    if (current.length === 0) return
+    const toolIds = new Set(
+      current.flatMap(b => (b.type === 'tool_use' ? [b.tool_call_id] : []))
+    )
+    const text = current
+      .filter(b => b.type === 'text')
+      .map(b => b.text)
+      .join('')
+    segments.push({
+      kind: 'blocks',
+      message: {
+        ...message,
+        id: `${message.id}-part-${part++}`,
+        content: text,
+        content_blocks: current,
+        tool_calls: (message.tool_calls ?? []).filter(tc => toolIds.has(tc.id)),
+      },
+    })
+    current = []
+  }
+
+  blocks.forEach((block, index) => {
+    if (block.type === 'user_input') {
+      flushBlocks()
+      if (block.text.trim()) {
+        // Consecutive steered prompts merge into one connected group
+        const last = segments[segments.length - 1]
+        if (last && last.kind === 'steered') {
+          last.texts.push(block.text)
+        } else {
+          segments.push({
+            kind: 'steered',
+            texts: [block.text],
+            key: `steered-${message.id}-${index}`,
+          })
+        }
+      }
+    } else {
+      current.push(block)
+    }
+  })
+  flushBlocks()
+
+  return segments
 }
 
 function isPureTextAssistantMessage(message: ChatMessage): boolean {
@@ -731,6 +801,35 @@ export const CompactMessageList = memo(
           buffer = []
         }
 
+        // Buffer an assistant message. Messages containing mid-turn steered
+        // user prompts are split at each steer so the visible order matches
+        // chronology: activity → steered bubble → activity after the steer.
+        const pushBuffered = (message: ChatMessage, globalIndex: number) => {
+          const segments = splitMessageAtSteeredInputs(message)
+          if (!segments) {
+            buffer.push({ message, globalIndex })
+            return
+          }
+          for (const segment of segments) {
+            if (segment.kind === 'steered') {
+              flush()
+              // Merge with a preceding steered group (e.g. across messages)
+              const last = items[items.length - 1]
+              if (last && last.kind === 'steered') {
+                last.texts.push(...segment.texts)
+              } else {
+                items.push({
+                  kind: 'steered',
+                  texts: segment.texts,
+                  key: segment.key,
+                })
+              }
+            } else {
+              buffer.push({ message: segment.message, globalIndex })
+            }
+          }
+        }
+
         messages.forEach((message, globalIndex) => {
           if (message.role === 'user') {
             flush()
@@ -747,7 +846,7 @@ export const CompactMessageList = memo(
               items.push({ kind: 'message', message, globalIndex })
               return
             }
-            buffer.push({ message, globalIndex })
+            pushBuffered(message, globalIndex)
             return
           }
 
@@ -757,7 +856,7 @@ export const CompactMessageList = memo(
             return
           }
 
-          buffer.push({ message, globalIndex })
+          pushBuffered(message, globalIndex)
         })
 
         flush()
@@ -1021,6 +1120,14 @@ export const CompactMessageList = memo(
                     hasFollowUpFor={hasFollowUpFor}
                     durationFor={durationFor}
                   />
+                </div>
+              )
+            }
+
+            if (item.kind === 'steered') {
+              return (
+                <div key={item.key} className="pb-4">
+                  <SteeredPromptGroup texts={item.texts} />
                 </div>
               )
             }

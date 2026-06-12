@@ -1455,6 +1455,10 @@ export function useDeleteWorktree() {
         }
       )
 
+      // Drop the worktree's sessions from the finished-session bell, which
+      // reads from ['all-sessions'].
+      queryClient.invalidateQueries({ queryKey: ['all-sessions'] })
+
       // Cleanup terminal instances for this worktree
       disposeAllWorktreeTerminals(worktreeId)
 

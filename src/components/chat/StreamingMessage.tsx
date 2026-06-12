@@ -21,6 +21,7 @@ import { PlanDisplay } from './PlanFileDisplay'
 import { EditedFilesDisplay } from './EditedFilesDisplay'
 import type { FileEdit } from './FileEditsDiffModal'
 import { ThinkingBlock } from './ThinkingBlock'
+import { SteeredPromptGroup } from './SteeredPromptGroup'
 import { ErrorBoundary } from '@/components/ui/ErrorBoundary'
 import { logger } from '@/lib/logger'
 
@@ -196,6 +197,10 @@ export const StreamingMessage = memo(function StreamingMessage({
                                     <Markdown streaming>{item.text}</Markdown>
                                   )
                                 }
+                                case 'userInput':
+                                  return (
+                                    <SteeredPromptGroup texts={item.texts} />
+                                  )
                                 case 'task':
                                   return (
                                     <TaskCallInline
