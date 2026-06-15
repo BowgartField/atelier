@@ -1947,7 +1947,9 @@ fn process_shared_sse_event(
                 .unwrap_or("");
             if let Some((_, session_idle, _)) = opencode_session_flags(opencode_session_id) {
                 session_idle.store(true, Ordering::Relaxed);
-                log::info!("OpenCode shared SSE: session.idle opencode_session={opencode_session_id}");
+                log::info!(
+                    "OpenCode shared SSE: session.idle opencode_session={opencode_session_id}"
+                );
             }
             Some(false)
         }
@@ -3020,8 +3022,7 @@ mod tests {
         // No subscriber registered → gate must time out (not block forever) and
         // report the turn never started, so the steer caller requeues instead.
         let start = Instant::now();
-        let started =
-            wait_opencode_turn_started("ses_does_not_exist", Duration::from_millis(120));
+        let started = wait_opencode_turn_started("ses_does_not_exist", Duration::from_millis(120));
         assert!(!started);
         assert!(start.elapsed() < Duration::from_secs(2));
     }

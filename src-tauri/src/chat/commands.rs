@@ -100,6 +100,20 @@ impl Drop for SendClaim {
     }
 }
 
+fn should_forward_cancel_request(session_id: &str) -> bool {
+    ACTIVE_SENDS.lock().unwrap().contains(session_id)
+        || super::registry::is_session_actively_managed(session_id)
+}
+
+fn clear_stale_pending_cancel_before_send(session_id: &str) {
+    let has_active_send = ACTIVE_SENDS.lock().unwrap().contains(session_id);
+    if !has_active_send && !super::registry::is_session_actively_managed(session_id) {
+        if super::registry::clear_pending_cancel(session_id) {
+            log::warn!("Cleared stale pending cancel before fresh send: {session_id}");
+        }
+    }
+}
+
 fn codex_execution_mode_instruction(execution_mode: Option<&str>) -> Option<&'static str> {
     match execution_mode.unwrap_or("plan") {
         "build" => Some(
@@ -2107,6 +2121,8 @@ pub async fn send_chat_message(
     if worktree_path.is_empty() {
         return Err("Worktree path cannot be empty".to_string());
     }
+
+    clear_stale_pending_cancel_before_send(&session_id);
 
     // Guard: atomically claim the session's send slot for the duration of this
     // call. Closes the race window where two concurrent sends (queue processor
@@ -4765,6 +4781,13 @@ pub async fn cancel_chat_message(
     worktree_id: String,
 ) -> Result<bool, String> {
     log::trace!("Cancel chat message requested for session: {session_id}");
+    if !should_forward_cancel_request(&session_id) {
+        log::warn!(
+            "Ignoring cancel request for idle session: {session_id} (no active send/process)"
+        );
+        super::registry::cleanup_session_registrations(&session_id);
+        return Ok(false);
+    }
     cancel_process(&app, &session_id, &worktree_id)
 }
 
@@ -8437,6 +8460,19 @@ mod tests {
             has_usage,
             was_cancelled,
         ));
+    }
+
+    #[test]
+    fn idle_sessions_should_not_forward_cancel_requests() {
+        assert!(!should_forward_cancel_request("idle-session"));
+    }
+
+    #[test]
+    fn active_send_should_forward_cancel_requests_before_process_registration() {
+        let _claim =
+            SendClaim::try_acquire("pre-register-session").expect("send claim should acquire");
+
+        assert!(should_forward_cancel_request("pre-register-session"));
     }
 
     #[test]

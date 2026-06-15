@@ -425,7 +425,11 @@ interface CompactActivityRowProps {
   total: number
   renderMessage: (
     item: { message: ChatMessage; globalIndex: number },
-    extra: { hasFollowUpMessage: boolean; durationMs: number | null }
+    extra: {
+      hasFollowUpMessage: boolean
+      durationMs: number | null
+      hideCancelledIndicator?: boolean
+    }
   ) => React.ReactNode
   hasFollowUpFor: (globalIndex: number) => boolean
   durationFor: (globalIndex: number, message: ChatMessage) => number | null
@@ -447,6 +451,10 @@ function CompactActivityRow({
   const summary = useMemo(() => summarizeGroup(group), [group])
   const stepCount = useMemo(() => countSteps(group), [group])
   const messageCount = group.length
+  const hasCancelledMessage = useMemo(
+    () => group.some(item => item.message.cancelled),
+    [group]
+  )
   const groupDurationMs = useMemo(() => {
     for (let i = group.length - 1; i >= 0; i--) {
       const item = group[i]
@@ -518,16 +526,26 @@ function CompactActivityRow({
                 {renderMessage(item, {
                   hasFollowUpMessage: hasFollowUpFor(item.globalIndex),
                   durationMs: durationFor(item.globalIndex, item.message),
+                  hideCancelledIndicator: hasCancelledMessage,
                 })}
               </div>
             ))}
           </div>
         </CollapsibleContent>
       </div>
-      {groupDurationMs != null && (
-        <span className="mt-1 block min-h-4 text-xs leading-4 text-muted-foreground/40 tabular-nums font-mono">
-          {formatDuration(groupDurationMs)}
-        </span>
+      {(groupDurationMs != null || hasCancelledMessage) && (
+        <div className="mt-1 flex min-h-4 items-center gap-2 text-xs leading-4 text-muted-foreground/40">
+          {groupDurationMs != null && (
+            <span className="tabular-nums font-mono">
+              {formatDuration(groupDurationMs)}
+            </span>
+          )}
+          {hasCancelledMessage && (
+            <span className="italic text-muted-foreground/50">
+              (cancelled)
+            </span>
+          )}
+        </div>
       )}
       <span aria-hidden className="sr-only">
         Total: {total}
@@ -557,7 +575,11 @@ interface CompactQuestionMessageProps {
   areQuestionsSkipped: (sessionId: string) => boolean
   renderMessage: (
     item: { message: ChatMessage; globalIndex: number },
-    extra: { hasFollowUpMessage: boolean; durationMs: number | null }
+    extra: {
+      hasFollowUpMessage: boolean
+      durationMs: number | null
+      hideCancelledIndicator?: boolean
+    }
   ) => React.ReactNode
   hasFollowUpFor: (globalIndex: number) => boolean
   durationFor: (globalIndex: number, message: ChatMessage) => number | null
@@ -875,6 +897,7 @@ export const CompactMessageList = memo(
           extra: {
             hasFollowUpMessage: boolean
             durationMs: number | null
+            hideCancelledIndicator?: boolean
           }
         ) => (
           <MessageItem
@@ -913,6 +936,7 @@ export const CompactMessageList = memo(
             isFindingFixed={isFindingFixed}
             onCopyToInput={onCopyToInput}
             hideApproveButtons={hideApproveButtons}
+            hideCancelledIndicator={extra.hideCancelledIndicator}
             durationMs={extra.durationMs}
           />
         ),

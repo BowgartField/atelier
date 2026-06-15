@@ -295,6 +295,13 @@ pub fn cleanup_session_registrations(session_id: &str) {
     }
 }
 
+/// Clear only a queued pre-registration cancel for an otherwise idle session.
+/// Used before starting a fresh send so stale pending cancel state from a
+/// previous idle-cancel race cannot poison the next run.
+pub fn clear_pending_cancel(session_id: &str) -> bool {
+    lock_recover(&PENDING_CANCELS, "PENDING_CANCELS").remove(session_id)
+}
+
 /// Check if a session has a running process
 #[allow(dead_code)]
 pub fn is_process_running(session_id: &str) -> bool {
@@ -456,6 +463,23 @@ mod tests {
         cleanup_session_registrations("opencode-session");
 
         assert!(!is_session_actively_managed("opencode-session"));
+
+        clear_registries();
+    }
+
+    #[test]
+    fn clear_pending_cancel_leaves_active_registrations_intact() {
+        let _guard = lock_recover(&TEST_LOCK, "TEST_LOCK");
+        clear_registries();
+
+        assert!(register_cancel_flag(
+            "active-session".to_string(),
+            Arc::new(AtomicBool::new(false))
+        ));
+        lock_recover(&PENDING_CANCELS, "PENDING_CANCELS").insert("active-session".to_string());
+
+        assert!(clear_pending_cancel("active-session"));
+        assert!(is_session_actively_managed("active-session"));
 
         clear_registries();
     }
