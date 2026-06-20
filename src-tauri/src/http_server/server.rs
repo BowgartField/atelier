@@ -57,6 +57,9 @@ pub struct ServerStatus {
 #[derive(Deserialize)]
 struct WsAuth {
     token: Option<String>,
+    /// `reconnect` returns the smallest payload needed after a WebSocket drop.
+    /// Full page loads omit this and receive the broader bootstrap payload.
+    mode: Option<String>,
     /// Comma-separated worktreeId:sessionId pairs from the browser's current state.
     /// Used by /api/init to load the correct active sessions even when
     /// ui_state.json on disk is stale (debounced save hasn't flushed yet).
@@ -65,6 +68,12 @@ struct WsAuth {
     /// when the disk copy is stale. Used to scope the init payload to only the
     /// worktrees/sessions the user is currently viewing.
     selected_project: Option<String>,
+}
+
+impl WsAuth {
+    fn is_reconnect(&self) -> bool {
+        self.mode.as_deref() == Some("reconnect")
+    }
 }
 
 #[derive(Serialize, Clone)]
@@ -254,8 +263,8 @@ async fn ws_handler(
 ) -> Response {
     // Validate token (skip if token not required)
     if state.token_required {
-        let provided = params.token.unwrap_or_default();
-        if !auth::validate_token(&provided, &state.token) {
+        let provided = params.token.as_deref().unwrap_or_default();
+        if !auth::validate_token(provided, &state.token) {
             return (StatusCode::UNAUTHORIZED, "Invalid token").into_response();
         }
     }
@@ -308,8 +317,8 @@ async fn auth_handler(Query(params): Query<WsAuth>, State(state): State<AppState
 
 async fn version_handler(Query(params): Query<WsAuth>, State(state): State<AppState>) -> Response {
     if state.token_required {
-        let provided = params.token.unwrap_or_default();
-        if !auth::validate_token(&provided, &state.token) {
+        let provided = params.token.as_deref().unwrap_or_default();
+        if !auth::validate_token(provided, &state.token) {
             return (StatusCode::UNAUTHORIZED, "Invalid token").into_response();
         }
     }
@@ -327,6 +336,126 @@ const INIT_MESSAGE_WINDOW: usize = 50;
 /// continues over the WebSocket connection.
 const INIT_REPLAY_EVENT_CAP: usize = 200;
 
+fn parse_active_sessions_param(value: Option<&str>) -> std::collections::HashMap<String, String> {
+    value
+        .unwrap_or("")
+        .split(',')
+        .filter_map(|pair| {
+            let pair = pair.trim();
+            let (wt, sess) = pair.split_once(':')?;
+            if wt.is_empty() || sess.is_empty() {
+                return None;
+            }
+            Some((wt.to_string(), sess.to_string()))
+        })
+        .collect()
+}
+
+async fn reconnect_init_response(params: WsAuth, state: AppState) -> Response {
+    let mut response = serde_json::json!({});
+    let build_info = read_web_build_info(&state.dist_path).await;
+    response["webBuildId"] = Value::String(build_info.web_build_id);
+    response["appVersion"] = Value::String(build_info.app_version);
+
+    if let Ok(app_data_dir) = state.app.path().app_data_dir() {
+        response["appDataDir"] = Value::String(app_data_dir.to_string_lossy().to_string());
+    }
+
+    let browser_active_sessions = parse_active_sessions_param(params.active_sessions.as_deref());
+
+    if !browser_active_sessions.is_empty() {
+        let session_futures: Vec<_> = browser_active_sessions
+            .iter()
+            .map(|(worktree_id, session_id)| {
+                let app = state.app.clone();
+                let wt_id = worktree_id.clone();
+                let sess_id = session_id.clone();
+                async move {
+                    let worktree =
+                        crate::projects::get_worktree(app.clone(), wt_id.clone()).await?;
+                    let session = crate::chat::get_session(
+                        app,
+                        wt_id.clone(),
+                        worktree.path,
+                        sess_id.clone(),
+                        Some(INIT_MESSAGE_WINDOW),
+                    )
+                    .await?;
+                    Ok::<_, String>((sess_id, wt_id, session))
+                }
+            })
+            .collect();
+
+        let mut active_sessions = serde_json::Map::new();
+        let mut active_session_worktree_ids = serde_json::Map::new();
+
+        for result in futures_util::future::join_all(session_futures).await {
+            match result {
+                Ok((session_id, worktree_id, session)) => {
+                    if let Ok(value) = serde_json::to_value(session) {
+                        active_sessions.insert(session_id.clone(), value);
+                        active_session_worktree_ids.insert(session_id, Value::String(worktree_id));
+                    }
+                }
+                Err(e) => {
+                    log::warn!("Failed to load reconnect active session: {e}");
+                }
+            }
+        }
+
+        if !active_sessions.is_empty() {
+            response["activeSessions"] = Value::Object(active_sessions);
+            response["activeSessionWorktreeIds"] = Value::Object(active_session_worktree_ids);
+        }
+    }
+
+    let running_sessions = crate::chat::registry::get_running_sessions();
+    response["runningSessions"] = serde_json::to_value(&running_sessions).unwrap_or_default();
+
+    if !running_sessions.is_empty() && !browser_active_sessions.is_empty() {
+        let focused: HashSet<&String> = browser_active_sessions
+            .values()
+            .filter(|session_id| running_sessions.contains(session_id))
+            .collect();
+
+        if !focused.is_empty() {
+            let mut replay_events: Vec<Value> = state
+                .app
+                .try_state::<WsBroadcaster>()
+                .map(|broadcaster| {
+                    let mut events: Vec<Value> = focused
+                        .iter()
+                        .flat_map(|session_id| {
+                            let buffered = broadcaster.replay_events(session_id, 0);
+                            let start = buffered.len().saturating_sub(INIT_REPLAY_EVENT_CAP);
+                            buffered[start..].to_vec()
+                        })
+                        .filter_map(|(_, json)| serde_json::from_str::<Value>(&json).ok())
+                        .collect();
+                    events.sort_by_key(|event| {
+                        event
+                            .get("seq")
+                            .and_then(|seq| seq.as_u64())
+                            .unwrap_or_default()
+                    });
+                    events
+                })
+                .unwrap_or_default();
+
+            replay_events.dedup_by(|a, b| {
+                a.get("seq").and_then(|seq| seq.as_u64())
+                    == b.get("seq").and_then(|seq| seq.as_u64())
+            });
+
+            if !replay_events.is_empty() {
+                response["replayEvents"] = Value::Array(replay_events);
+            }
+        }
+    }
+
+    Json(response).into_response()
+}
+
 /// Initial data endpoint. Returns only the data needed to render the view the
 /// user lands on (project list + currently-selected project's worktrees +
 /// windowed messages for the focused session). Additional data is lazy-loaded
@@ -334,10 +463,14 @@ const INIT_REPLAY_EVENT_CAP: usize = 200;
 async fn init_handler(Query(params): Query<WsAuth>, State(state): State<AppState>) -> Response {
     // Validate token (skip if token not required)
     if state.token_required {
-        let provided = params.token.unwrap_or_default();
-        if !auth::validate_token(&provided, &state.token) {
+        let provided = params.token.as_deref().unwrap_or_default();
+        if !auth::validate_token(provided, &state.token) {
             return (StatusCode::UNAUTHORIZED, "Invalid token").into_response();
         }
+    }
+
+    if params.is_reconnect() {
+        return reconnect_init_response(params, state).await;
     }
 
     // Fetch base (always-included) data in parallel
@@ -452,20 +585,7 @@ async fn init_handler(Query(params): Query<WsAuth>, State(state): State<AppState
 
     // Parse browser-provided active session IDs (worktreeId:sessionId pairs).
     // These override ui_state.json which may be stale due to debounced save.
-    let browser_active_sessions: std::collections::HashMap<String, String> = params
-        .active_sessions
-        .as_deref()
-        .unwrap_or("")
-        .split(',')
-        .filter_map(|pair| {
-            let pair = pair.trim();
-            let (wt, sess) = pair.split_once(':')?;
-            if wt.is_empty() || sess.is_empty() {
-                return None;
-            }
-            Some((wt.to_string(), sess.to_string()))
-        })
-        .collect();
+    let browser_active_sessions = parse_active_sessions_param(params.active_sessions.as_deref());
 
     // Merge browser's active sessions into ui_state (browser is more recent
     // than disk when ui_state.json save is debounced). Only merge entries we

@@ -346,14 +346,31 @@ function App() {
       // Use function updater to avoid overwriting cache that has MORE messages
       // (e.g., from chat:done upsert that arrived before this reconnect seed).
       if (data.activeSessions) {
+        const activeSessionWorktreeIds = data.activeSessionWorktreeIds ?? {}
+        const activeReviewingUpdates: Record<string, boolean> = {}
+        const activeWaitingUpdates: Record<string, boolean> = {}
+        const activeSessionMappings: Record<string, string> = {}
+
         for (const [sessionId, initSession] of Object.entries(
           data.activeSessions
         )) {
+          const session = initSession as Session
+          const worktreeId = activeSessionWorktreeIds[sessionId]
+          if (worktreeId) {
+            activeSessionMappings[sessionId] = worktreeId
+          }
+          if (session.is_reviewing) {
+            activeReviewingUpdates[sessionId] = true
+          }
+          if (session.waiting_for_input) {
+            activeWaitingUpdates[sessionId] = true
+          }
+
           queryClient.setQueryData<Session>(
             chatQueryKeys.session(sessionId),
             old => {
-              if (!old) return initSession as Session
-              const init = initSession as Session
+              if (!old) return session
+              const init = session
               if (old.messages.length > init.messages.length) {
                 logger.warn('[seedCache] preserving cached messages', {
                   sessionId,
@@ -375,6 +392,35 @@ function App() {
             lastMsg.id.startsWith('running-')
           ) {
             runningSnapshotMessages.push({ sessionId, message: lastMsg })
+          }
+        }
+
+        if (
+          Object.keys(activeSessionMappings).length > 0 ||
+          Object.keys(activeReviewingUpdates).length > 0 ||
+          Object.keys(activeWaitingUpdates).length > 0
+        ) {
+          beginSessionStateHydration()
+          try {
+            useChatStore.setState(state => ({
+              sessionWorktreeMap:
+                Object.keys(activeSessionMappings).length > 0
+                  ? {
+                      ...state.sessionWorktreeMap,
+                      ...activeSessionMappings,
+                    }
+                  : state.sessionWorktreeMap,
+              reviewingSessions:
+                data.sessionsByWorktree === undefined
+                  ? activeReviewingUpdates
+                  : state.reviewingSessions,
+              waitingForInputSessionIds:
+                data.sessionsByWorktree === undefined
+                  ? activeWaitingUpdates
+                  : state.waitingForInputSessionIds,
+            }))
+          } finally {
+            endSessionStateHydration()
           }
         }
       }
