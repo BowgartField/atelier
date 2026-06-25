@@ -45,6 +45,7 @@ mod codex_cli;
 mod commandcode_cli;
 mod cursor_cli;
 mod gh_cli;
+mod grok_cli;
 pub mod http_server;
 pub mod jean_mcp_config;
 pub mod jean_mcp_core;
@@ -278,6 +279,8 @@ pub struct AppPreferences {
     pub selected_pi_model: String, // Default PI model
     #[serde(default = "default_commandcode_model")]
     pub selected_commandcode_model: String, // Default Command Code model
+    #[serde(default = "default_grok_model")]
+    pub selected_grok_model: String, // Default Grok model
     #[serde(default = "default_codex_reasoning_effort")]
     pub default_codex_reasoning_effort: String, // Codex reasoning effort: low, medium, high, xhigh
     #[serde(default = "default_codex_goal_execution_mode")]
@@ -320,6 +323,8 @@ pub struct AppPreferences {
     pub codex_cli_source: String, // Codex CLI source: "jean" (managed) or "path" (system PATH)
     #[serde(default = "default_cli_source")]
     pub opencode_cli_source: String, // OpenCode CLI source: "jean" (managed) or "path" (system PATH)
+    #[serde(default = "default_grok_cli_source")]
+    pub grok_cli_source: String, // Grok CLI source: currently "path" (system PATH)
     #[serde(default = "default_cli_source")]
     pub gh_cli_source: String, // GitHub CLI source: "jean" (managed) or "path" (system PATH)
     #[serde(default)]
@@ -614,6 +619,14 @@ fn default_commandcode_model() -> String {
     "commandcode/default".to_string()
 }
 
+fn default_grok_model() -> String {
+    "grok/grok-composer-2.5-fast".to_string()
+}
+
+fn default_grok_cli_source() -> String {
+    "path".to_string()
+}
+
 fn default_codex_reasoning_effort() -> String {
     "high".to_string()
 }
@@ -898,6 +911,8 @@ pub struct MagicPrompts {
     pub investigate_workflow_run: Option<String>,
     #[serde(default)]
     pub release_notes: Option<String>,
+    #[serde(default)]
+    pub release_post: Option<String>,
     #[serde(default)]
     pub session_naming: Option<String>,
     #[serde(default)]
@@ -1363,6 +1378,26 @@ fn default_release_notes_prompt() -> String {
         .to_string()
 }
 
+fn default_release_post_prompt() -> String {
+    r#"Write one short release announcement for Twitter/X, Mastodon, Bluesky, LinkedIn, and similar platforms.
+
+Release: {release_name}
+Tag: {tag}
+GitHub release link: {release_url}
+
+Release notes:
+{release_body}
+
+Instructions:
+- Be a bit more generous than a terse tweet, but keep the full post under 280 characters including the GitHub release link.
+- Include the exact GitHub release link.
+- Put each feature, fix, or improvement on its own line.
+- Mention the most user-facing changes or theme.
+- Keep it clear, upbeat, and not hype-heavy.
+- Do not use markdown headings."#
+        .to_string()
+}
+
 fn default_session_naming_prompt() -> String {
     r#"<task>Generate a short, human-friendly name for this chat session based on the user's request.</task>
 
@@ -1550,6 +1585,8 @@ pub struct MagicPromptModels {
     #[serde(default = "default_sonnet_model")]
     pub release_notes_model: String,
     #[serde(default = "default_sonnet_model")]
+    pub release_post_model: String,
+    #[serde(default = "default_sonnet_model")]
     pub session_naming_model: String,
     #[serde(default = "default_model")]
     pub investigate_security_alert_model: String,
@@ -1577,6 +1614,7 @@ impl Default for MagicPromptModels {
             context_summary_model: default_model(),
             resolve_conflicts_model: default_model(),
             release_notes_model: default_sonnet_model(),
+            release_post_model: default_sonnet_model(),
             session_naming_model: default_sonnet_model(),
             investigate_security_alert_model: default_model(),
             investigate_advisory_model: default_model(),
@@ -1633,12 +1671,19 @@ pub fn is_pi_model(model: &str) -> bool {
     model.starts_with("pi/")
 }
 
+/// Returns true if the given model string identifies a Grok model.
+/// Grok model IDs are prefixed with "grok/" (e.g. "grok/grok-composer-2.5-fast").
+pub fn is_grok_model(model: &str) -> bool {
+    model.starts_with("grok/")
+}
+
 /// Returns true if the given model string identifies a Codex model.
 /// Codex model IDs contain "codex" or start with "gpt-", but NOT OpenCode models.
 pub fn is_codex_model(model: &str) -> bool {
     !is_opencode_model(model)
         && !is_cursor_model(model)
         && !is_pi_model(model)
+        && !is_grok_model(model)
         && (model.contains("codex") || model.starts_with("gpt-"))
 }
 
@@ -1663,6 +1708,8 @@ pub struct MagicPromptProviders {
     pub resolve_conflicts_provider: Option<String>,
     #[serde(default)]
     pub release_notes_provider: Option<String>,
+    #[serde(default)]
+    pub release_post_provider: Option<String>,
     #[serde(default)]
     pub session_naming_provider: Option<String>,
     #[serde(default)]
@@ -1697,6 +1744,8 @@ pub struct MagicPromptBackends {
     #[serde(default)]
     pub release_notes_backend: Option<String>,
     #[serde(default)]
+    pub release_post_backend: Option<String>,
+    #[serde(default)]
     pub session_naming_backend: Option<String>,
     #[serde(default)]
     pub investigate_security_alert_backend: Option<String>,
@@ -1729,6 +1778,8 @@ pub struct MagicPromptReasoningEfforts {
     pub resolve_conflicts_effort: Option<String>,
     #[serde(default)]
     pub release_notes_effort: Option<String>,
+    #[serde(default)]
+    pub release_post_effort: Option<String>,
     #[serde(default)]
     pub session_naming_effort: Option<String>,
     #[serde(default)]
@@ -1790,7 +1841,7 @@ impl MagicPrompts {
     /// This ensures users who never customized a prompt get auto-updated defaults.
     fn migrate_defaults(&mut self) {
         type DefaultEntry<'a> = (fn() -> String, &'a mut Option<String>);
-        let defaults: [DefaultEntry; 17] = [
+        let defaults: [DefaultEntry; 18] = [
             (
                 default_investigate_issue_prompt,
                 &mut self.investigate_issue,
@@ -1809,6 +1860,7 @@ impl MagicPrompts {
                 &mut self.investigate_workflow_run,
             ),
             (default_release_notes_prompt, &mut self.release_notes),
+            (default_release_post_prompt, &mut self.release_post),
             (default_session_naming_prompt, &mut self.session_naming),
             (
                 default_parallel_execution_prompt,
@@ -1928,6 +1980,7 @@ impl Default for AppPreferences {
             selected_cursor_model: default_cursor_model(),
             selected_pi_model: default_pi_model(),
             selected_commandcode_model: default_commandcode_model(),
+            selected_grok_model: default_grok_model(),
             default_codex_reasoning_effort: default_codex_reasoning_effort(),
             codex_goal_execution_mode: default_codex_goal_execution_mode(),
             codex_multi_agent_enabled: false,
@@ -1949,6 +2002,7 @@ impl Default for AppPreferences {
             claude_cli_source: default_cli_source(),
             codex_cli_source: default_cli_source(),
             opencode_cli_source: default_cli_source(),
+            grok_cli_source: default_grok_cli_source(),
             gh_cli_source: default_cli_source(),
             wsl_mode_chosen: false,
             wsl_enabled: false,
@@ -4206,6 +4260,7 @@ pub fn run() {
             projects::cancel_review_with_ai,
             projects::list_github_releases,
             projects::generate_release_notes,
+            projects::generate_release_post,
             projects::commit_changes,
             projects::open_project_on_github,
             projects::open_branch_on_github,
@@ -4480,6 +4535,13 @@ pub fn run() {
             cursor_cli::check_cursor_cli_auth,
             cursor_cli::list_cursor_models,
             cursor_cli::get_cursor_install_command,
+            // Grok CLI management commands
+            grok_cli::check_grok_cli_installed,
+            grok_cli::detect_grok_in_path,
+            grok_cli::check_grok_cli_auth,
+            grok_cli::list_grok_models,
+            grok_cli::get_grok_install_command,
+            grok_cli::login_grok_cli_device,
             // OpenCode CLI management commands
             opencode_cli::check_opencode_cli_installed,
             opencode_cli::detect_opencode_in_path,
