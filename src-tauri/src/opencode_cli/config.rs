@@ -81,15 +81,12 @@ pub fn resolve_cli_binary(app: &AppHandle) -> PathBuf {
 
             if let Ok(output) = silent_command(which_cmd).arg("opencode").output() {
                 if output.status.success() {
-                    // On Windows, `where` can return multiple paths; take only the first line
-                    let path_str = String::from_utf8_lossy(&output.stdout)
-                        .lines()
-                        .next()
-                        .unwrap_or("")
-                        .trim()
-                        .to_string();
-                    if !path_str.is_empty() {
-                        let path = PathBuf::from(&path_str);
+                    let stdout = String::from_utf8_lossy(&output.stdout);
+                    if let Some(path) = crate::platform::select_cli_candidate(
+                        &stdout,
+                        cfg!(target_os = "windows"),
+                        None,
+                    ) {
                         if path.exists() {
                             return path;
                         }

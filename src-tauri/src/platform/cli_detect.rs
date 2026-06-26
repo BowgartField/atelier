@@ -69,25 +69,11 @@ pub fn detect_cli_in_path(
         _ => return CliDetection::not_found(),
     };
 
-    let found = String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .next()
-        .unwrap_or("")
-        .trim()
-        .to_string();
-    if found.is_empty() {
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let Some(found_path) = select_cli_candidate(&stdout, cfg!(target_os = "windows"), jean_managed)
+    else {
         return CliDetection::not_found();
-    }
-
-    let found_path = PathBuf::from(&found);
-
-    if let Some(jean_path) = jean_managed {
-        if let Ok(canonical_found) = std::fs::canonicalize(&found_path) {
-            if canonical_found == jean_path {
-                return CliDetection::not_found();
-            }
-        }
-    }
+    };
 
     let version = match silent_command(&found_path).arg("--version").output() {
         Ok(ver_output) if ver_output.status.success() => Some(
@@ -100,15 +86,102 @@ pub fn detect_cli_in_path(
 
     CliDetection {
         found: true,
-        path: Some(found),
+        path: Some(found_path.to_string_lossy().to_string()),
         version,
         package_manager: detect_package_manager(&found_path),
     }
 }
 
+/// Select the path Jean should use from `where`/`which` output.
+///
+/// Windows npm installs often produce several shims for one command. The
+/// extensionless shim (for Unix shells) can appear before `*.cmd`, but it is
+/// not directly executable by Windows `CreateProcessW`.
+pub fn select_cli_candidate(
+    output: &str,
+    prefer_windows_executable: bool,
+    jean_managed: Option<&Path>,
+) -> Option<PathBuf> {
+    let mut candidates: Vec<PathBuf> = output
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(PathBuf::from)
+        .filter(|path| !is_jean_managed_candidate(path, jean_managed))
+        .collect();
+
+    if prefer_windows_executable {
+        candidates.sort_by_key(|path| windows_cli_candidate_rank(path));
+    }
+
+    candidates.into_iter().next()
+}
+
+fn is_jean_managed_candidate(path: &Path, jean_managed: Option<&Path>) -> bool {
+    let Some(jean_path) = jean_managed else {
+        return false;
+    };
+
+    std::fs::canonicalize(path).is_ok_and(|canonical_found| canonical_found == jean_path)
+}
+
+fn windows_cli_candidate_rank(path: &Path) -> u8 {
+    match path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("exe") => 0,
+        Some("cmd") => 1,
+        Some("bat") => 2,
+        None | Some("") => 3,
+        Some("ps1") => 4,
+        _ => 5,
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use super::super::wsl_detect_package_manager;
+    use super::select_cli_candidate;
+
+    #[test]
+    fn windows_path_detection_prefers_cmd_shim_over_extensionless_npm_shim() {
+        let output = r"C:\Users\u\AppData\Roaming\npm\opencode
+C:\Users\u\AppData\Roaming\npm\opencode.cmd
+C:\Users\u\AppData\Roaming\npm\opencode.ps1";
+
+        assert_eq!(
+            select_cli_candidate(output, true, None),
+            Some(PathBuf::from(
+                r"C:\Users\u\AppData\Roaming\npm\opencode.cmd"
+            ))
+        );
+    }
+
+    #[test]
+    fn windows_path_detection_prefers_exe_over_cmd() {
+        let output = r"C:\tools\opencode.cmd
+C:\tools\opencode.exe";
+
+        assert_eq!(
+            select_cli_candidate(output, true, None),
+            Some(PathBuf::from(r"C:\tools\opencode.exe"))
+        );
+    }
+
+    #[test]
+    fn unix_path_detection_keeps_first_candidate() {
+        let output = "/usr/local/bin/opencode\n/opt/bin/opencode";
+
+        assert_eq!(
+            select_cli_candidate(output, false, None),
+            Some(PathBuf::from("/usr/local/bin/opencode"))
+        );
+    }
 
     #[test]
     fn wsl_pkg_mgr_homebrew() {
