@@ -150,7 +150,9 @@ export async function reconnectNativeCliSession(
     await invoke('stop_terminal', { terminalId: oldTerminalId }).catch(() => {
       // Terminal may already be stopped.
     })
-    await disposeTerminal(oldTerminalId)
+    await disposeTerminal(oldTerminalId).catch(() => {
+      // Terminal UI may already be disposed.
+    })
     terminalStore.removeTerminal(worktreeId, oldTerminalId)
   }
 

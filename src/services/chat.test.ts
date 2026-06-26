@@ -22,6 +22,7 @@ import { useChatStore } from '@/store/chat-store'
 import { useUIStore } from '@/store/ui-store'
 import { useTerminalStore } from '@/store/terminal-store'
 import { toast } from 'sonner'
+import { disposeTerminal } from '@/lib/terminal-instances'
 import type { Session } from '@/types/chat'
 
 const toastMock = toast as unknown as {
@@ -108,6 +109,8 @@ describe('reconnectNativeCliSession', () => {
   beforeEach(async () => {
     toastMock.success.mockClear()
     toastMock.error.mockClear()
+    ;(disposeTerminal as ReturnType<typeof vi.fn>).mockClear()
+    ;(disposeTerminal as ReturnType<typeof vi.fn>).mockResolvedValue(undefined)
     const { invoke } = await import('@/lib/transport')
     ;(invoke as ReturnType<typeof vi.fn>).mockClear()
     ;(invoke as ReturnType<typeof vi.fn>).mockResolvedValue(undefined)
@@ -167,5 +170,49 @@ describe('reconnectNativeCliSession', () => {
     expect(invoke).not.toHaveBeenCalledWith('set_session_last_opened', {
       sessionId: 'session-1',
     })
+  })
+
+  it('marks the session opened by default (manual reconnect)', async () => {
+    const { invoke } = await import('@/lib/transport')
+
+    await reconnectNativeCliSession(terminalSession, 'wt-1')
+
+    expect(invoke).toHaveBeenCalledWith('set_session_last_opened', {
+      sessionId: 'session-1',
+    })
+  })
+
+  it('continues reconnecting when old terminal disposal fails', async () => {
+    useUIStore.setState({
+      sessionPrimarySurface: {},
+      sessionTerminalIds: { 'session-1': 'old-terminal' },
+    })
+    useTerminalStore.setState({
+      terminals: {
+        'wt-1': [
+          {
+            id: 'old-terminal',
+            worktreeId: 'wt-1',
+            label: 'Old Terminal',
+            command: 'claude',
+          },
+        ],
+      },
+      modalTerminalOpen: {},
+    })
+    ;(disposeTerminal as ReturnType<typeof vi.fn>).mockRejectedValueOnce(
+      new Error('already disposed')
+    )
+
+    await reconnectNativeCliSession(terminalSession, 'wt-1')
+
+    const terminalId = useUIStore.getState().sessionTerminalIds['session-1']
+    expect(terminalId).toBeDefined()
+    expect(terminalId).not.toBe('old-terminal')
+    expect(
+      useTerminalStore
+        .getState()
+        .terminals['wt-1']?.some(terminal => terminal.id === 'old-terminal')
+    ).toBe(false)
   })
 })
