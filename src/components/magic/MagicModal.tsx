@@ -18,7 +18,6 @@ import {
   Link2,
   ShieldAlert,
   Loader2,
-  Megaphone,
 } from 'lucide-react'
 import {
   Dialog,
@@ -123,7 +122,6 @@ type MagicOption =
   | 'merge'
   | 'resolve-conflicts'
   | 'release-notes'
-  | 'release-post'
   | 'investigate-issue'
   | 'investigate-pr'
   | 'investigate-advisory'
@@ -150,7 +148,6 @@ const CANVAS_ALLOWED_OPTIONS = new Set<MagicOption>([
   'review',
   'review-comments',
   'release-notes',
-  'release-post',
   'merge',
   'merge-pr',
   'resolve-conflicts',
@@ -299,12 +296,6 @@ function buildMagicColumns(hasOpenPr: boolean): MagicColumns {
           key: 'G',
         },
         {
-          id: 'release-post',
-          label: 'Generate Release Post',
-          icon: Megaphone,
-          key: 'X',
-        },
-        {
           id: 'update-pr',
           label: 'Generate PR Description',
           icon: RefreshCw,
@@ -364,7 +355,6 @@ const KEY_TO_OPTION: Record<string, MagicOption> = {
   m: 'merge',
   f: 'resolve-conflicts',
   g: 'release-notes',
-  x: 'release-post',
   i: 'investigate-issue',
   a: 'investigate-pr',
   y: 'investigate-advisory',
@@ -1887,17 +1877,12 @@ ${resolveInstructions}`
       }
 
       // Release generation only needs a project selected, not a worktree
-      if (option === 'release-notes' || option === 'release-post') {
+      if (option === 'release-notes') {
         if (!selectedProjectId) {
           notify('No project selected', undefined, { type: 'error' })
           setMagicModalOpen(false)
           return
         }
-        useUIStore
-          .getState()
-          .setReleaseNotesModalMode(
-            option === 'release-post' ? 'post' : 'notes'
-          )
         useUIStore.getState().setReleaseNotesModalOpen(true)
         setMagicModalOpen(false)
         return
@@ -1947,8 +1932,6 @@ ${resolveInstructions}`
         }
         return
       }
-
-
 
       // Investigate options: guard against missing contexts
       if (

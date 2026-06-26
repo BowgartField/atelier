@@ -2866,30 +2866,6 @@ pub async fn dispatch_command(
             .await?;
             to_value(result)
         }
-        "generate_release_post" => {
-            let project_path: String = field(&args, "projectPath", "project_path")?;
-            let tag: String = from_field(&args, "tag")?;
-            let release_name: String = field(&args, "releaseName", "release_name")?;
-            let custom_prompt: Option<String> = field_opt(&args, "customPrompt", "custom_prompt")?;
-            let model: Option<String> = from_field_opt(&args, "model")?;
-            let custom_profile_name: Option<String> =
-                field_opt(&args, "customProfileName", "custom_profile_name")?;
-            let reasoning_effort: Option<String> =
-                field_opt(&args, "reasoningEffort", "reasoning_effort")?;
-            let result = crate::projects::generate_release_post(
-                app.clone(),
-                project_path,
-                tag,
-                release_name,
-                custom_prompt,
-                model,
-                custom_profile_name,
-                reasoning_effort,
-            )
-            .await?;
-            to_value(result)
-        }
-
         // =====================================================================
         // GitHub Issues (additional)
         // =====================================================================

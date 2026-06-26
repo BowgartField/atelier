@@ -56,8 +56,6 @@ export interface MagicPrompts {
   investigate_workflow_run: string | null
   /** Prompt for generating release notes */
   release_notes: string | null
-  /** Prompt for generating short social release posts */
-  release_post: string | null
   /** Prompt for generating session names from the first message */
   session_naming: string | null
   /** System prompt for parallel execution (appended to every chat session when enabled) */
@@ -516,24 +514,6 @@ export const DEFAULT_RELEASE_NOTES_PROMPT = `Generate release notes for changes 
 - Write in past tense ("Added", "Fixed", "Improved").
 - Keep it concise and user-facing (skip internal implementation details).`
 
-/** Default prompt for generating short social release posts */
-export const DEFAULT_RELEASE_POST_PROMPT = `Write one short release announcement for Twitter/X, Mastodon, Bluesky, LinkedIn, and similar platforms.
-
-Release: {release_name}
-Tag: {tag}
-GitHub release link: {release_url}
-
-Release notes:
-{release_body}
-
-Instructions:
-- Be a bit more generous than a terse tweet, but keep the full post under 280 characters including the GitHub release link.
-- Include the exact GitHub release link.
-- Put each feature, fix, or improvement on its own line.
-- Mention the most user-facing changes or theme.
-- Keep it clear, upbeat, and not hype-heavy.
-- Do not use markdown headings.`
-
 /** Default prompt for generating session names */
 export const DEFAULT_SESSION_NAMING_PROMPT = `<task>Generate a short, human-friendly name for this chat session based on the user's request.</task>
 
@@ -696,7 +676,6 @@ export const DEFAULT_MAGIC_PROMPTS: MagicPrompts = {
   resolve_conflicts: null,
   investigate_workflow_run: null,
   release_notes: null,
-  release_post: null,
   session_naming: null,
   parallel_execution: null,
   global_system_prompt: null,
@@ -720,7 +699,6 @@ export interface MagicPromptModels {
   context_summary_model: MagicPromptModel
   resolve_conflicts_model: MagicPromptModel
   release_notes_model: MagicPromptModel
-  release_post_model: MagicPromptModel
   session_naming_model: MagicPromptModel
   investigate_security_alert_model: MagicPromptModel
   investigate_advisory_model: MagicPromptModel
@@ -742,7 +720,6 @@ export interface MagicPromptReasoningEfforts {
   context_summary_effort: MagicPromptReasoningEffort
   resolve_conflicts_effort: MagicPromptReasoningEffort
   release_notes_effort: MagicPromptReasoningEffort
-  release_post_effort: MagicPromptReasoningEffort
   session_naming_effort: MagicPromptReasoningEffort
   investigate_security_alert_effort: MagicPromptReasoningEffort
   investigate_advisory_effort: MagicPromptReasoningEffort
@@ -761,7 +738,6 @@ export const DEFAULT_MAGIC_PROMPT_MODELS: MagicPromptModels = {
   context_summary_model: 'claude-opus-4-8[1m]',
   resolve_conflicts_model: 'claude-opus-4-8[1m]',
   release_notes_model: 'sonnet',
-  release_post_model: 'sonnet',
   session_naming_model: 'sonnet',
   investigate_security_alert_model: 'claude-opus-4-8[1m]',
   investigate_advisory_model: 'claude-opus-4-8[1m]',
@@ -782,7 +758,6 @@ function makeMagicPromptModelsPreset(
     context_summary_model: model,
     resolve_conflicts_model: model,
     release_notes_model: model,
-    release_post_model: model,
     session_naming_model: model,
     investigate_security_alert_model: model,
     investigate_advisory_model: model,
@@ -810,7 +785,6 @@ export const OPENCODE_DEFAULT_MAGIC_PROMPT_MODELS: MagicPromptModels = {
   context_summary_model: 'opencode/gpt-5.3-codex',
   resolve_conflicts_model: 'opencode/gpt-5.3-codex',
   release_notes_model: 'opencode/gpt-5.3-codex',
-  release_post_model: 'opencode/gpt-5.3-codex',
   session_naming_model: 'opencode/gpt-5.3-codex',
   investigate_security_alert_model: 'opencode/gpt-5.3-codex',
   investigate_advisory_model: 'opencode/gpt-5.3-codex',
@@ -833,7 +807,6 @@ export const DEFAULT_MAGIC_PROMPT_EFFORTS: MagicPromptReasoningEfforts = {
   context_summary_effort: null,
   resolve_conflicts_effort: null,
   release_notes_effort: null,
-  release_post_effort: null,
   session_naming_effort: null,
   investigate_security_alert_effort: null,
   investigate_advisory_effort: null,
@@ -881,7 +854,6 @@ export const CODEX_DEFAULT_MAGIC_PROMPT_EFFORTS: MagicPromptReasoningEfforts = {
   context_summary_effort: 'medium',
   resolve_conflicts_effort: 'medium',
   release_notes_effort: 'low',
-  release_post_effort: 'low',
   session_naming_effort: 'low',
   investigate_security_alert_effort: 'medium',
   investigate_advisory_effort: 'medium',
@@ -909,7 +881,6 @@ export interface MagicPromptProviders {
   context_summary_provider: string | null
   resolve_conflicts_provider: string | null
   release_notes_provider: string | null
-  release_post_provider: string | null
   session_naming_provider: string | null
   investigate_security_alert_provider: string | null
   investigate_advisory_provider: string | null
@@ -928,7 +899,6 @@ export const DEFAULT_MAGIC_PROMPT_PROVIDERS: MagicPromptProviders = {
   context_summary_provider: null,
   resolve_conflicts_provider: null,
   release_notes_provider: null,
-  release_post_provider: null,
   session_naming_provider: null,
   investigate_security_alert_provider: null,
   investigate_advisory_provider: null,
@@ -951,7 +921,6 @@ export interface MagicPromptBackends {
   context_summary_backend: string | null
   resolve_conflicts_backend: string | null
   release_notes_backend: string | null
-  release_post_backend: string | null
   session_naming_backend: string | null
   investigate_security_alert_backend: string | null
   investigate_advisory_backend: string | null
@@ -970,7 +939,6 @@ export const DEFAULT_MAGIC_PROMPT_BACKENDS: MagicPromptBackends = {
   context_summary_backend: null,
   resolve_conflicts_backend: null,
   release_notes_backend: null,
-  release_post_backend: null,
   session_naming_backend: null,
   investigate_security_alert_backend: null,
   investigate_advisory_backend: null,
@@ -989,7 +957,6 @@ function makeBackendsPreset(backend: string): MagicPromptBackends {
     context_summary_backend: backend,
     resolve_conflicts_backend: backend,
     release_notes_backend: backend,
-    release_post_backend: backend,
     session_naming_backend: backend,
     investigate_security_alert_backend: backend,
     investigate_advisory_backend: backend,

@@ -15,7 +15,6 @@ const mocks = vi.hoisted(() => {
   }
   return {
     setMagicModalOpen: vi.fn(),
-    setReleaseNotesModalMode: vi.fn(),
     selectWorktree: vi.fn(),
     invokeMock: vi.fn(),
     invalidateQueries: vi.fn(),
@@ -46,7 +45,6 @@ interface UiState {
   setUpdatePrModalOpen: ReturnType<typeof vi.fn>
   setReviewCommentsModalOpen: ReturnType<typeof vi.fn>
   setReleaseNotesModalOpen: ReturnType<typeof vi.fn>
-  setReleaseNotesModalMode: ReturnType<typeof vi.fn>
   setLinkedProjectsModalOpen: ReturnType<typeof vi.fn>
 }
 
@@ -72,7 +70,6 @@ vi.mock('@/store/ui-store', () => ({
         setUpdatePrModalOpen: vi.fn(),
         setReviewCommentsModalOpen: vi.fn(),
         setReleaseNotesModalOpen: vi.fn(),
-        setReleaseNotesModalMode: mocks.setReleaseNotesModalMode,
         setLinkedProjectsModalOpen: vi.fn(),
       }
       return selector ? selector(state) : state
@@ -82,7 +79,6 @@ vi.mock('@/store/ui-store', () => ({
         setUpdatePrModalOpen: vi.fn(),
         setReviewCommentsModalOpen: vi.fn(),
         setReleaseNotesModalOpen: vi.fn(),
-        setReleaseNotesModalMode: mocks.setReleaseNotesModalMode,
         setLinkedProjectsModalOpen: vi.fn(),
       }),
     }
@@ -528,14 +524,10 @@ describe('MagicModal manual PR link', () => {
     )
   })
 
-  it('opens release post generation from the magic release section', async () => {
-    const user = userEvent.setup()
+  it('does not show the removed release post action', () => {
     render(<MagicModal />)
 
-    await user.click(screen.getByRole('button', { name: /release post/i }))
-
-    expect(mocks.setReleaseNotesModalMode).toHaveBeenCalledWith('post')
-    expect(mocks.setMagicModalOpen).toHaveBeenCalledWith(false)
+    expect(screen.queryByRole('button', { name: /release post/i })).toBeNull()
   })
 
   it('reverts the last commit only after confirmation', async () => {

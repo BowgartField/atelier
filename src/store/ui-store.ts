@@ -27,8 +27,6 @@ export type PreferencePane =
 export type OnboardingStartStep = 'claude' | 'gh' | null
 
 export type WorktreePrimarySurface = 'chat' | 'terminal'
-export type ReleaseNotesModalMode = 'notes' | 'post'
-
 export type NewSessionModeOrigin = 'chat' | 'modal' | 'canvas'
 export type NewSessionModeIntent = 'picker' | 'default'
 
@@ -84,7 +82,6 @@ interface UIState {
   newWorktreeModalOpen: boolean
   newWorktreeModalDefaultTab: 'quick' | 'issues' | 'prs' | 'security' | null
   releaseNotesModalOpen: boolean
-  releaseNotesModalMode: ReleaseNotesModalMode
   updatePrModalOpen: boolean
   reviewCommentsModalOpen: boolean
   workflowRunsModalOpen: boolean
@@ -173,7 +170,6 @@ interface UIState {
     tab: 'quick' | 'issues' | 'prs' | 'security' | null
   ) => void
   setReleaseNotesModalOpen: (open: boolean) => void
-  setReleaseNotesModalMode: (mode: ReleaseNotesModalMode) => void
   setUpdatePrModalOpen: (open: boolean) => void
   setReviewCommentsModalOpen: (open: boolean) => void
   setWorkflowRunsModalOpen: (
@@ -268,7 +264,6 @@ export const useUIStore = create<UIState>()(
       newWorktreeModalOpen: false,
       newWorktreeModalDefaultTab: null,
       releaseNotesModalOpen: false,
-      releaseNotesModalMode: 'notes',
       updatePrModalOpen: false,
       reviewCommentsModalOpen: false,
       workflowRunsModalOpen: false,
@@ -519,16 +514,6 @@ export const useUIStore = create<UIState>()(
               : { releaseNotesModalOpen: open },
           undefined,
           'setReleaseNotesModalOpen'
-        ),
-
-      setReleaseNotesModalMode: mode =>
-        set(
-          state =>
-            state.releaseNotesModalMode === mode
-              ? state
-              : { releaseNotesModalMode: mode },
-          undefined,
-          'setReleaseNotesModalMode'
         ),
 
       setUpdatePrModalOpen: open =>

@@ -16,7 +16,6 @@ fn command_should_run_on_blocking_pool(command: &str) -> bool {
             | "create_pr_with_ai_content"
             | "run_review_with_ai"
             | "generate_release_notes"
-            | "generate_release_post"
             | "execute_summarization"
             | "install_claude_cli"
             | "install_codex_cli"

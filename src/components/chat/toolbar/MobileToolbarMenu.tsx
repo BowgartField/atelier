@@ -13,7 +13,6 @@ import {
   GitPullRequestArrow,
   Link2,
   MessageSquare,
-  Megaphone,
   RefreshCw,
   Undo2,
   Wand2,
@@ -125,7 +124,6 @@ export function MobileToolbarMenu({
             K
           </span>
         </DropdownMenuItem>
-
 
         <DropdownMenuSeparator />
 
@@ -278,7 +276,6 @@ export function MobileToolbarMenu({
         <DropdownMenuItem
           onClick={() => {
             setMenuOpen(false)
-            useUIStore.getState().setReleaseNotesModalMode('notes')
             useUIStore.getState().setReleaseNotesModalOpen(true)
           }}
         >
@@ -291,24 +288,6 @@ export function MobileToolbarMenu({
             )}
           >
             G
-          </span>
-        </DropdownMenuItem>
-        <DropdownMenuItem
-          onClick={() => {
-            setMenuOpen(false)
-            useUIStore.getState().setReleaseNotesModalMode('post')
-            useUIStore.getState().setReleaseNotesModalOpen(true)
-          }}
-        >
-          <Megaphone className="h-4 w-4" />
-          Release Post
-          <span
-            className={cn(
-              'ml-auto text-xs text-muted-foreground bg-muted px-1.5 py-0.5 rounded',
-              isMobile && 'hidden'
-            )}
-          >
-            X
           </span>
         </DropdownMenuItem>
         <DropdownMenuItem
