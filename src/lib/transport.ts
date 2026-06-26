@@ -145,6 +145,16 @@ export async function listen<T>(
   return wsTransport.listen<T>(event, handler)
 }
 
+/**
+ * Request buffered terminal events from the backend. Used by browser-mode
+ * terminal reattachment after a full page refresh, when in-memory sequence
+ * tracking was lost but the Rust PTY and replay buffer are still alive.
+ */
+export function requestTerminalReplay(terminalId: string, lastSeq = 0): void {
+  if (isNativeApp()) return
+  wsTransport.requestTerminalReplay(terminalId, lastSeq)
+}
+
 // ---------------------------------------------------------------------------
 // Initial data preloading (used in browser mode)
 // ---------------------------------------------------------------------------
@@ -751,6 +761,30 @@ class WsTransport {
         this.connect()
       }
     })
+  }
+
+  /** Request terminal replay and keep this terminal tracked for reconnects. */
+  requestTerminalReplay(terminalId: string, lastSeq = 0): void {
+    this._activeTerminals.add(terminalId)
+    const currentLastSeq = this._lastSeqByTerminal.get(terminalId)
+    const effectiveLastSeq =
+      currentLastSeq == null ? lastSeq : Math.max(lastSeq, currentLastSeq)
+    this._lastSeqByTerminal.set(terminalId, effectiveLastSeq)
+
+    const payload = JSON.stringify({
+      type: 'terminal_replay',
+      terminal_id: terminalId,
+      last_seq: effectiveLastSeq,
+    })
+
+    if (this.ws?.readyState === WebSocket.OPEN) {
+      this.ws.send(payload)
+      return
+    }
+
+    if (this._connectEnabled) {
+      this.connect()
+    }
   }
 
   /** Register an event listener. Returns an unlisten function. */

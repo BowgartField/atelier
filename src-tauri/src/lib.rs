@@ -2097,6 +2097,34 @@ pub struct UIState {
     #[serde(default)]
     pub modal_terminal_height: Option<f64>,
 
+    /// Terminal instances persisted per worktree for web refresh reconnect
+    #[serde(default)]
+    pub terminal_instances: std::collections::HashMap<String, Vec<TerminalInstancePersisted>>,
+
+    /// Active terminal id per worktree
+    #[serde(default)]
+    pub terminal_active_ids: std::collections::HashMap<String, String>,
+
+    /// Terminal panel open state per worktree
+    #[serde(default)]
+    pub terminal_panel_open: std::collections::HashMap<String, bool>,
+
+    /// Global terminal panel expanded/collapsed state
+    #[serde(default)]
+    pub terminal_visible: Option<bool>,
+
+    /// Terminal panel height percentage
+    #[serde(default)]
+    pub terminal_height: Option<f64>,
+
+    /// Session terminal id per session for full-screen terminal surfaces
+    #[serde(default)]
+    pub session_terminal_ids: std::collections::HashMap<String, String>,
+
+    /// Session primary surface per session
+    #[serde(default)]
+    pub session_primary_surface: std::collections::HashMap<String, String>,
+
     /// Browser tabs persisted per worktree (worktreeId → list of {id, url, title})
     #[serde(default)]
     pub browser_tabs: std::collections::HashMap<String, Vec<BrowserTabPersisted>>,
@@ -2169,6 +2197,18 @@ pub struct LastOpenedEntry {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TerminalInstancePersisted {
+    pub id: String,
+    #[serde(default)]
+    pub command: Option<String>,
+    #[serde(default)]
+    pub command_args: Option<Vec<String>>,
+    pub label: String,
+    #[serde(default)]
+    pub kind: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BrowserTabPersisted {
     pub id: String,
     pub url: String,
@@ -2202,6 +2242,13 @@ impl Default for UIState {
             modal_terminal_pinned: None,
             modal_terminal_width: None,
             modal_terminal_height: None,
+            terminal_instances: std::collections::HashMap::new(),
+            terminal_active_ids: std::collections::HashMap::new(),
+            terminal_panel_open: std::collections::HashMap::new(),
+            terminal_visible: None,
+            terminal_height: None,
+            session_terminal_ids: std::collections::HashMap::new(),
+            session_primary_surface: std::collections::HashMap::new(),
             browser_tabs: std::collections::HashMap::new(),
             browser_active_tab_ids: std::collections::HashMap::new(),
             browser_side_pane_open: std::collections::HashMap::new(),
