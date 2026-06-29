@@ -972,6 +972,11 @@ export function useMainWindowEventListeners() {
                     queryKey: ['preferences'],
                   })
                   break
+                case 'remote-servers':
+                  queryClient.invalidateQueries({
+                    queryKey: ['remote-servers'],
+                  })
+                  break
                 case 'ui-state':
                   queryClient.invalidateQueries({
                     queryKey: ['ui-state'],

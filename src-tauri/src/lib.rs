@@ -57,6 +57,7 @@ mod opinionated;
 mod pi_cli;
 mod platform;
 mod projects;
+mod remote;
 mod terminal;
 
 // Validation functions
@@ -278,6 +279,8 @@ pub struct AppPreferences {
     pub sync_zoom_levels: bool, // Keep desktop and mobile zoom levels in sync
     #[serde(default)]
     pub custom_cli_profiles: Vec<CustomCliProfile>, // Custom CLI settings profiles (e.g., OpenRouter, MiniMax)
+    #[serde(default)]
+    pub remote_servers: Vec<remote::RemoteServerConfig>,
     #[serde(default)]
     pub default_provider: Option<String>, // Default provider profile name (None = Anthropic direct)
     #[serde(default)]
@@ -2172,6 +2175,7 @@ impl Default for AppPreferences {
             mobile_zoom_level: default_zoom_level(),
             sync_zoom_levels: default_sync_zoom_levels(),
             custom_cli_profiles: Vec::new(),
+            remote_servers: Vec::new(),
             default_provider: None,
             favorite_models: Vec::new(),
             fast_mode_models: Vec::new(),
@@ -4560,6 +4564,15 @@ pub fn run() {
             load_preferences,
             save_preferences,
             patch_preferences,
+            remote::add_remote_server,
+            remote::update_remote_server,
+            remote::remove_remote_server,
+            remote::list_remote_servers,
+            remote::test_remote_server,
+            remote::provision_remote_server,
+            remote::connect_remote_server,
+            remote::disconnect_remote_server,
+            remote::get_remote_server_status,
             set_window_vibrancy,
             save_cli_profile,
             delete_cli_profile,
@@ -4992,6 +5005,8 @@ pub fn run() {
                 eprintln!("[TERMINAL CLEANUP] RunEvent::Exit received");
                 let killed = terminal::cleanup_all_terminals();
                 eprintln!("[TERMINAL CLEANUP] Killed {killed} terminal(s)");
+                let closed_tunnels = remote::cleanup_all_tunnels();
+                eprintln!("[REMOTE CLEANUP] Closed {closed_tunnels} SSH tunnel(s)");
                 if has_running_sessions {
                     log::warn!(
                         "RunEvent::Exit while sessions are running; skipping OpenCode shutdown"
@@ -5029,6 +5044,10 @@ pub fn run() {
                 eprintln!("[TERMINAL CLEANUP] RunEvent::ExitRequested received");
                 let killed = terminal::cleanup_all_terminals();
                 eprintln!("[TERMINAL CLEANUP] Killed {killed} terminal(s) on ExitRequested");
+                let closed_tunnels = remote::cleanup_all_tunnels();
+                eprintln!(
+                    "[REMOTE CLEANUP] Closed {closed_tunnels} SSH tunnel(s) on ExitRequested"
+                );
                 match opencode_server::shutdown_managed_server() {
                     Ok(true) => eprintln!(
                         "[OPENCODE CLEANUP] Stopped managed OpenCode server on ExitRequested"
@@ -5066,6 +5085,10 @@ pub fn run() {
                     eprintln!("[TERMINAL CLEANUP] Window {label} close requested");
                     let killed = terminal::cleanup_all_terminals();
                     eprintln!("[TERMINAL CLEANUP] Killed {killed} terminal(s) on CloseRequested");
+                    let closed_tunnels = remote::cleanup_all_tunnels();
+                    eprintln!(
+                        "[REMOTE CLEANUP] Closed {closed_tunnels} SSH tunnel(s) on CloseRequested"
+                    );
                     match opencode_server::shutdown_managed_server() {
                         Ok(true) => eprintln!(
                             "[OPENCODE CLEANUP] Stopped managed OpenCode server on CloseRequested"

@@ -7,6 +7,7 @@ const RESPONSIVE_FILES = [
   'src/components/preferences/panes/AppearancePane.tsx',
   'src/components/preferences/panes/TerminalPane.tsx',
   'src/components/preferences/panes/WebAccessPane.tsx',
+  'src/components/preferences/panes/RemoteServersPane.tsx',
   'src/components/preferences/panes/ExperimentalPane.tsx',
   'src/components/preferences/panes/ProvidersPane.tsx',
 ]

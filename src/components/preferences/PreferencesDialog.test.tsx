@@ -82,6 +82,10 @@ vi.mock('./panes/WebAccessPane', () => ({
   WebAccessPane: () => <div>Web access pane</div>,
 }))
 
+vi.mock('./panes/RemoteServersPane', () => ({
+  RemoteServersPane: () => <div>Remote servers pane</div>,
+}))
+
 describe('PreferencesDialog', () => {
   beforeEach(() => {
     globalThis.ResizeObserver = class ResizeObserver {
@@ -157,6 +161,7 @@ describe('PreferencesDialog', () => {
       'Opinionated',
       'Providers',
       'Web Access',
+      'Remote Servers',
       'MCP Servers',
       'Integrations',
       'Usage',

@@ -23,6 +23,7 @@ export type PreferencePane =
   | 'integrations'
   | 'experimental'
   | 'web-access'
+  | 'remote-servers'
   | 'opinionated'
 
 export type OnboardingStartStep = 'claude' | 'gh' | null

@@ -15,6 +15,7 @@ const nativeOnlyEntryIds = [
   'general-troubleshooting',
   'web-access-server',
   'web-access-authentication',
+  'remote-servers-management',
 ]
 
 const setTauriInternals = (enabled: boolean) => {
@@ -78,6 +79,9 @@ describe('preferences search index', () => {
     expect(searchPreferenceEntries('github login')[0]?.pane).toBe('github')
     expect(searchPreferenceEntries('coderabbit login')[0]?.pane).toBe(
       'coderabbit'
+    )
+    expect(searchPreferenceEntries('ssh cloud server')[0]?.pane).toBe(
+      'remote-servers'
     )
   })
 

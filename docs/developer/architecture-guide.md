@@ -164,6 +164,7 @@ Additional systems (no dedicated docs yet):
 
 - **Background Tasks** - Git/PR polling with focus-aware intervals (`src-tauri/src/background_tasks/`); Auto Fix issue polling/planning/yolo handoff and scheduler active-hours window via `chrono` local time with midnight-crossing support (`src-tauri/src/auto_fix/`)
 - **HTTP Server** - Embedded Axum server + WebSocket for headless/web mode (`src-tauri/src/http_server/`)
+- **[Remote Servers](./remote-servers.md)** - SSH provisioning, verified Jean service installation, tunnel registry, and health checks (`src-tauri/src/remote/`)
 - **Diagnostics** - CPU/memory monitoring panel (`src-tauri/src/diagnostics/`)
 - **MCP** - Model Context Protocol server integration with per-project overrides (`src/services/mcp.ts`)
 - **Model Catalog** - CDN-driven model lists and reasoning capabilities with bundled offline fallback ([model-catalog.md](./model-catalog.md))
@@ -321,6 +322,12 @@ src-tauri/src/
 │   ├── websocket.rs       # WebSocket for real-time events
 │   ├── dispatch.rs        # Request routing to Tauri commands
 │   └── auth.rs            # Bearer token authentication
+├── remote/                # Remote Jean server management
+│   ├── commands.rs        # CRUD, test, provision, connect, and status commands
+│   ├── ssh.rs             # System ssh/scp wrappers and ControlMaster
+│   ├── provision.rs       # Signed artifact install and systemd service
+│   ├── tunnel.rs          # SSH local-forward process registry
+│   └── types.rs           # Persisted configs and command response types
 ├── terminal/              # Built-in terminal emulator
 │   ├── commands.rs        # Tauri commands (create, write, resize)
 │   ├── pty.rs             # Platform PTY implementation

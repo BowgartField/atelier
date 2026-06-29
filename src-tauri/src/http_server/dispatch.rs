@@ -106,6 +106,59 @@ pub async fn dispatch_command(
             emit_cache_invalidation(app, &["preferences"]);
             Ok(Value::Null)
         }
+        "add_remote_server" => {
+            let config = from_field(&args, "config")?;
+            let result = crate::remote::add_remote_server(app.clone(), config).await?;
+            emit_cache_invalidation(app, &["remote-servers", "preferences"]);
+            to_value(result)
+        }
+        "update_remote_server" => {
+            let server_id: String = field(&args, "serverId", "server_id")?;
+            let config = from_field(&args, "config")?;
+            let result =
+                crate::remote::update_remote_server(app.clone(), server_id, config).await?;
+            emit_cache_invalidation(app, &["remote-servers", "preferences"]);
+            to_value(result)
+        }
+        "remove_remote_server" => {
+            let server_id: String = field(&args, "serverId", "server_id")?;
+            crate::remote::remove_remote_server(app.clone(), server_id).await?;
+            emit_cache_invalidation(app, &["remote-servers", "preferences"]);
+            Ok(Value::Null)
+        }
+        "list_remote_servers" => {
+            let result = crate::remote::list_remote_servers(app.clone()).await?;
+            to_value(result)
+        }
+        "test_remote_server" => {
+            let server_id: String = field(&args, "serverId", "server_id")?;
+            let result = crate::remote::test_remote_server(app.clone(), server_id).await?;
+            emit_cache_invalidation(app, &["remote-servers"]);
+            to_value(result)
+        }
+        "provision_remote_server" => {
+            let server_id: String = field(&args, "serverId", "server_id")?;
+            let result = crate::remote::provision_remote_server(app.clone(), server_id).await?;
+            emit_cache_invalidation(app, &["remote-servers", "preferences"]);
+            to_value(result)
+        }
+        "connect_remote_server" => {
+            let server_id: String = field(&args, "serverId", "server_id")?;
+            let result = crate::remote::connect_remote_server(app.clone(), server_id).await?;
+            emit_cache_invalidation(app, &["remote-servers"]);
+            to_value(result)
+        }
+        "disconnect_remote_server" => {
+            let server_id: String = field(&args, "serverId", "server_id")?;
+            crate::remote::disconnect_remote_server(server_id).await?;
+            emit_cache_invalidation(app, &["remote-servers"]);
+            Ok(Value::Null)
+        }
+        "get_remote_server_status" => {
+            let server_id: String = field(&args, "serverId", "server_id")?;
+            let result = crate::remote::get_remote_server_status(app.clone(), server_id).await?;
+            to_value(result)
+        }
         "set_window_vibrancy" => {
             let enabled: bool = from_field(&args, "enabled")?;
             crate::set_window_vibrancy(app.clone(), enabled).await?;

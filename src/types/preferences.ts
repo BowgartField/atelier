@@ -1,6 +1,7 @@
 import type { ThinkingLevel, EffortLevel, ExecutionMode } from './chat'
 import { DEFAULT_KEYBINDINGS, type KeybindingsMap } from './keybindings'
 import { getServerPlatform, isServerWindows } from '../lib/platform'
+import type { RemoteServerConfig } from './remote'
 
 export type CodexGoalExecutionMode = Extract<ExecutionMode, 'build' | 'yolo'>
 
@@ -1107,6 +1108,7 @@ export interface AppPreferences {
   mobile_zoom_level?: number // Mobile zoom level percentage (50-200, default 90)
   sync_zoom_levels?: boolean // Keep desktop and mobile zoom levels in sync (default true)
   custom_cli_profiles: CustomCliProfile[] // Custom CLI settings profiles (e.g., OpenRouter, MiniMax)
+  remote_servers: RemoteServerConfig[] // Remote Jean backends reached through SSH tunnels
   default_provider: string | null // Default provider profile name (null = Anthropic direct)
   favorite_models: string[] // Favourited model keys ("backend:model") shown at top of picker
   fast_mode_models: string[] // Model keys ("backend:baseModel") with fast tier last enabled
@@ -2002,6 +2004,7 @@ export const defaultPreferences: AppPreferences = {
   mobile_zoom_level: ZOOM_LEVEL_DEFAULT,
   sync_zoom_levels: true,
   custom_cli_profiles: [],
+  remote_servers: [],
   default_provider: null,
   favorite_models: [],
   fast_mode_models: [],

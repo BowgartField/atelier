@@ -192,6 +192,15 @@ const paneEntries: PreferenceSearchEntry[] = [
     keywords: ['http', 'server', 'token', 'port', 'network'],
     anchorId: 'pref-pane-web-access',
   },
+  {
+    id: 'pane-remote-servers',
+    pane: 'remote-servers',
+    paneTitle: 'Remote Servers',
+    type: 'pane',
+    title: 'Remote Servers',
+    keywords: ['ssh', 'cloud server', 'remote backend', 'tunnel'],
+    anchorId: 'pref-pane-remote-servers',
+  },
 ]
 
 const sectionEntries: PreferenceSearchEntry[] = [
@@ -649,6 +658,23 @@ const sectionEntries: PreferenceSearchEntry[] = [
     anchorId: 'pref-web-access-section-authentication',
     fallbackAnchorId: 'pref-pane-web-access',
   },
+  {
+    id: 'remote-servers-management',
+    pane: 'remote-servers',
+    paneTitle: 'Remote Servers',
+    type: 'section',
+    title: 'Remote Server Management',
+    sectionTitle: 'Remote Servers',
+    keywords: [
+      'ssh server',
+      'add remote server',
+      'provision jean',
+      'connect tunnel',
+      'cloud box',
+    ],
+    anchorId: 'pref-remote-servers-section-list',
+    fallbackAnchorId: 'pref-pane-remote-servers',
+  },
 ]
 
 const nativeOnlySectionIds = new Set([
@@ -662,6 +688,7 @@ const nativeOnlySectionIds = new Set([
   'general-troubleshooting',
   'web-access-server',
   'web-access-authentication',
+  'remote-servers-management',
 ])
 
 const getVisibleSectionEntries = (includeNativeOnlySections: boolean) =>

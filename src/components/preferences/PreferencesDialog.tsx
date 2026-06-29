@@ -14,6 +14,7 @@ import {
   Rabbit,
   Sparkles,
   Terminal,
+  ServerCog,
   type LucideIcon,
 } from 'lucide-react'
 import {
@@ -80,6 +81,7 @@ import { IntegrationsPane } from './panes/IntegrationsPane'
 import { ExperimentalPane } from './panes/ExperimentalPane'
 import { WebAccessPane } from './panes/WebAccessPane'
 import { OpinionatedPane } from './panes/OpinionatedPane'
+import { RemoteServersPane } from './panes/RemoteServersPane'
 import {
   searchPreferenceEntries,
   type PreferenceSearchEntry,
@@ -214,6 +216,13 @@ const navigationEntries: (NavigationItem | NavigationSeparator)[] = [
   },
   {
     type: 'item',
+    id: 'remote-servers',
+    name: 'Remote Servers',
+    icon: ServerCog,
+    desktopOnly: true,
+  },
+  {
+    type: 'item',
     id: 'mcp-servers',
     name: 'MCP Servers',
     icon: Plug,
@@ -266,6 +275,7 @@ const paneIconMap: Record<PreferencePane, LucideIcon> = {
   integrations: Puzzle,
   experimental: FlaskConical,
   'web-access': Globe,
+  'remote-servers': ServerCog,
 }
 
 const getPaneTitle = (pane: PreferencePane): string => {
@@ -310,6 +320,8 @@ const getPaneTitle = (pane: PreferencePane): string => {
       return 'Opinionated'
     case 'web-access':
       return 'Web Access'
+    case 'remote-servers':
+      return 'Remote Servers'
     default:
       return 'General'
   }
@@ -918,6 +930,14 @@ export function PreferencesDialog() {
               {activePane === 'web-access' && (
                 <div id="pref-pane-web-access" className="min-w-0 max-w-full">
                   <WebAccessPane />
+                </div>
+              )}
+              {activePane === 'remote-servers' && (
+                <div
+                  id="pref-pane-remote-servers"
+                  className="min-w-0 max-w-full"
+                >
+                  <RemoteServersPane />
                 </div>
               )}
             </div>
