@@ -475,6 +475,7 @@ export function BackendModelPickerContent({
             <Input
               ref={searchInputRef}
               value={search}
+              spellCheck={false}
               onChange={event => setSearch(event.target.value)}
               onKeyDown={event => {
                 if (event.key === 'Escape') {
