@@ -10,6 +10,49 @@ fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
+/// Resolve SSH config host aliases in a git remote URL.
+///
+/// Local ~/.ssh/config may define aliases like `github.com-myaccount` that
+/// map to `github.com`. The remote server doesn't have this config, so we
+/// resolve the alias with `ssh -G` before passing the URL over SSH.
+fn resolve_ssh_url_aliases(url: &str) -> String {
+    // Only handle SSH-style git URLs: git@<host>:<path>
+    let rest = match url.strip_prefix("git@") {
+        Some(rest) => rest,
+        None => return url.to_string(),
+    };
+    let Some(colon_pos) = rest.find(':') else {
+        return url.to_string();
+    };
+    let host = &rest[..colon_pos];
+    let path = &rest[colon_pos + 1..];
+
+    // Ask ssh for the effective config (resolves Host → Hostname)
+    let output = match std::process::Command::new("ssh").args(["-G", host]).output() {
+        Ok(o) if o.status.success() => o,
+        _ => return url.to_string(),
+    };
+
+    let config = String::from_utf8_lossy(&output.stdout);
+    let mut real_hostname = host.to_string();
+    let mut real_user = String::from("git");
+
+    for line in config.lines() {
+        let lower = line.to_ascii_lowercase();
+        if let Some(val) = lower.strip_prefix("hostname ") {
+            real_hostname = val.trim().to_string();
+        } else if let Some(val) = lower.strip_prefix("user ") {
+            real_user = val.trim().to_string();
+        }
+    }
+
+    if real_hostname != host {
+        format!("{real_user}@{real_hostname}:{path}")
+    } else {
+        url.to_string()
+    }
+}
+
 fn get_git_remote_url(project_path: &str) -> Result<String, String> {
     let output = silent_command("git")
         .args(["-C", project_path, "remote", "get-url", "origin"])
@@ -71,18 +114,23 @@ pub async fn clone_project_to_remote(
         return Ok(existing.clone());
     }
 
-    // 4. Get project git remote URL
+    // 4. Get project git remote URL and resolve any local SSH config aliases
     let project_path = project.path.clone();
-    let remote_url = tokio::task::spawn_blocking(move || get_git_remote_url(&project_path))
-        .await
-        .map_err(|e| format!("Git remote URL task failed: {e}"))??;
+    let remote_url = tokio::task::spawn_blocking(move || {
+        let url = get_git_remote_url(&project_path)?;
+        Ok::<_, String>(resolve_ssh_url_aliases(&url))
+    })
+    .await
+    .map_err(|e| format!("Git remote URL task failed: {e}"))??;
 
     // 5. Determine remote_path
     let resolved_remote_path = remote_path.unwrap_or_else(|| format!("~/jean/{}", project.name));
 
-    // 6. Run SSH exec to clone or fetch
+    // 6. Run SSH exec to clone or fetch.
+    // GIT_SSH_COMMAND accepts new host keys so github.com (and others) don't
+    // need to be pre-populated in the remote's known_hosts.
     let clone_command = format!(
-        "set -eu\nif [ -d {path}/.git ]; then\n  git -C {path} fetch --all --prune\nelse\n  mkdir -p \"$(dirname {path})\"\n  git clone {url} {path}\nfi",
+        "set -eu\nexport GIT_SSH_COMMAND='ssh -o StrictHostKeyChecking=accept-new'\nif [ -d {path}/.git ]; then\n  git -C {path} fetch --all --prune\nelse\n  mkdir -p \"$(dirname {path})\"\n  git clone {url} {path}\nfi",
         path = shell_quote(&resolved_remote_path),
         url = shell_quote(&remote_url),
     );
