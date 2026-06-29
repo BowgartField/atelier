@@ -10,19 +10,27 @@ fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
+struct ResolvedSshUrl {
+    url: String,
+    /// Identity file from ~/.ssh/config for the original host alias (local path).
+    identity_file: Option<String>,
+}
+
 /// Resolve SSH config host aliases in a git remote URL.
 ///
 /// Local ~/.ssh/config may define aliases like `github.com-myaccount` that
 /// map to `github.com`. The remote server doesn't have this config, so we
 /// resolve the alias with `ssh -G` before passing the URL over SSH.
-fn resolve_ssh_url_aliases(url: &str) -> String {
+/// Also returns the IdentityFile so callers can ensure it's in the local
+/// SSH agent (needed for agent forwarding to work on the remote).
+fn resolve_ssh_url_aliases(url: &str) -> ResolvedSshUrl {
     // Only handle SSH-style git URLs: git@<host>:<path>
     let rest = match url.strip_prefix("git@") {
         Some(rest) => rest,
-        None => return url.to_string(),
+        None => return ResolvedSshUrl { url: url.to_string(), identity_file: None },
     };
     let Some(colon_pos) = rest.find(':') else {
-        return url.to_string();
+        return ResolvedSshUrl { url: url.to_string(), identity_file: None };
     };
     let host = &rest[..colon_pos];
     let path = &rest[colon_pos + 1..];
@@ -30,12 +38,13 @@ fn resolve_ssh_url_aliases(url: &str) -> String {
     // Ask ssh for the effective config (resolves Host → Hostname)
     let output = match std::process::Command::new("ssh").args(["-G", host]).output() {
         Ok(o) if o.status.success() => o,
-        _ => return url.to_string(),
+        _ => return ResolvedSshUrl { url: url.to_string(), identity_file: None },
     };
 
     let config = String::from_utf8_lossy(&output.stdout);
     let mut real_hostname = host.to_string();
     let mut real_user = String::from("git");
+    let mut identity_file: Option<String> = None;
 
     for line in config.lines() {
         let lower = line.to_ascii_lowercase();
@@ -43,14 +52,59 @@ fn resolve_ssh_url_aliases(url: &str) -> String {
             real_hostname = val.trim().to_string();
         } else if let Some(val) = lower.strip_prefix("user ") {
             real_user = val.trim().to_string();
+        } else if let Some(val) = lower.strip_prefix("identityfile ") {
+            // Take only the first identityfile listed
+            if identity_file.is_none() {
+                let raw = val.trim();
+                // Expand ~ ourselves since this runs in the Tauri process
+                let expanded = if let Some(rest) = raw.strip_prefix("~/") {
+                    dirs::home_dir()
+                        .map(|h| h.join(rest).to_string_lossy().to_string())
+                        .unwrap_or_else(|| raw.to_string())
+                } else {
+                    raw.to_string()
+                };
+                identity_file = Some(expanded);
+            }
         }
     }
 
-    if real_hostname != host {
+    let resolved_url = if real_hostname != host {
         format!("{real_user}@{real_hostname}:{path}")
     } else {
         url.to_string()
+    };
+
+    ResolvedSshUrl { url: resolved_url, identity_file }
+}
+
+/// Ensure an SSH identity file is loaded into the local ssh-agent so it can
+/// be forwarded to the remote server during git clone.
+/// Silent on failure — agent forwarding may still work if the key is already
+/// loaded via another mechanism (e.g. macOS Keychain agent).
+fn ensure_key_in_agent(identity_file: &str) {
+    // Check if key is already in agent
+    let listed = std::process::Command::new("ssh-add")
+        .arg("-l")
+        .output()
+        .ok();
+    if let Some(out) = listed {
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        // ssh-add -l prints fingerprints; check by filename heuristic
+        if stdout.contains(identity_file) {
+            return;
+        }
     }
+    // Attempt to add; --apple-use-keychain loads passphrase from macOS Keychain
+    // when available (no-op flag on non-macOS ssh-add versions).
+    let _ = std::process::Command::new("ssh-add")
+        .args(["--apple-use-keychain", identity_file])
+        .output()
+        .or_else(|_| {
+            std::process::Command::new("ssh-add")
+                .arg(identity_file)
+                .output()
+        });
 }
 
 fn get_git_remote_url(project_path: &str) -> Result<String, String> {
@@ -114,11 +168,16 @@ pub async fn clone_project_to_remote(
         return Ok(existing.clone());
     }
 
-    // 4. Get project git remote URL and resolve any local SSH config aliases
+    // 4. Get project git remote URL, resolve local SSH config aliases, and
+    //    ensure the identity key is in the local agent for forwarding.
     let project_path = project.path.clone();
     let remote_url = tokio::task::spawn_blocking(move || {
         let url = get_git_remote_url(&project_path)?;
-        Ok::<_, String>(resolve_ssh_url_aliases(&url))
+        let resolved = resolve_ssh_url_aliases(&url);
+        if let Some(ref key) = resolved.identity_file {
+            ensure_key_in_agent(key);
+        }
+        Ok::<_, String>(resolved.url)
     })
     .await
     .map_err(|e| format!("Git remote URL task failed: {e}"))??;
