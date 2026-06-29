@@ -14,10 +14,12 @@ This is large. Plan is phased; Phase 1 alone is shippable value (one remote box,
 - **3b** Jean **auto-provisions** the server: check/install OpenSSH server, install Jean as a service, start it headless. Jean does **not** manage server OS updates.
 - **4a** AI CLIs authenticate **on the server** (user runs `claude login` etc. via the remote terminal).
 
-## Critical feasibility constraint (DECIDED: xvfb)
-`jean --headless` still calls Tauri `.build()`, which initializes GTK/WebKitGTK on Linux (`Cargo.toml` pins `webkit2gtk`/`gtk`) — it needs a display even though the window closes immediately. On a display-less cloud box it will fail. **Decision: install `xvfb` on the server and run the service under `xvfb-run -a`.** This is not user-visible and reuses the existing `--headless` mode with ~zero backend changes.
-
-**Forward-compat:** Jean upstream is improving headless mode (may drop the GTK/display dependency). Keep the service launch command behind a **single config point** (`provision::jean_launch_command()`) returning the full exec line, so when a true GUI-free headless lands, removing `xvfb-run` (and the xvfb install step) is a one-line change with no other code touched. The GUI-free server binary (decouple from `tauri::AppHandle` across 39 files / 359 commands / 218 emits) stays out of scope — upstream headless work is expected to make it unnecessary.
+## Headless runtime
+Jean's current headless entrypoint clears the window configuration, but Tauri's
+Linux event loop still initializes GTK first. Provisioning therefore runs the
+signed AppImage through `xvfb-run` until the server is decoupled from
+`tauri::Builder`. The standalone `jean-server` entrypoint has the same GTK
+initialization requirement.
 
 ---
 
@@ -52,10 +54,10 @@ New Rust module `src-tauri/src/remote/` :
   - Use a per-server **ControlMaster** socket (`-o ControlPath=<appdata>/ssh/<id>.sock -o ControlPersist`) so subsequent calls multiplex one auth'd connection.
 - `provision.rs` — idempotent setup over `exec`:
   1. Detect distro / privilege (sudo).
-  2. Ensure OpenSSH server present (it must be, since we're already SSH'd in — really this is "ensure sshd + xvfb + deps").
-  3. Install `xvfb` + WebKitGTK runtime deps.
+  2. Ensure OpenSSH server present (it must be, since we're already SSH'd in — really this is "ensure sshd + runtime deps").
+  3. Install Xvfb and WebKitGTK/GTK runtime deps.
   4. Download Jean Linux artifact to the server. Resolve the release manifest matching the desktop's exact version, verify its updater minisign signature with the public key from `tauri.conf.json`, and extract the `.tar.gz`/AppImage with `tar`+`flate2`. Source: GitHub releases (`coollabsio/jean`). Pick artifact by remote arch (`uname -m`).
-  5. Generate an auth **token**, write a **systemd unit** that runs `xvfb-run -a <jean> --headless --host 127.0.0.1 --port <P> --token <T>`; `systemctl enable --now`.
+  5. Generate an auth **token**, write a **systemd unit** that runs `xvfb-run -a <jean> --headless --host 127.0.0.1 --port <P> --token <T>`; `systemctl enable --now`, then wait for the authenticated API endpoint.
 - `tunnel.rs` — manage `ssh -N -L 127.0.0.1:<localPort>:127.0.0.1:<P>` as a tracked child in a registry (mirror `terminal/registry.rs`). Optional `-R <remote>:127.0.0.1:<local>` reverse forwards for testing remote services locally. Health check: poll `http://127.0.0.1:<localPort>/...` with the token.
 - Tauri commands (register in **both** `lib.rs generate_handler!` and `http_server/dispatch.rs`): `add_remote_server`, `update_remote_server`, `remove_remote_server`, `list_remote_servers`, `test_remote_server`, `provision_remote_server`, `connect_remote_server` (open tunnel, return `{localPort, token}`), `disconnect_remote_server`, `get_remote_server_status`.
 
@@ -92,17 +94,17 @@ Phase-2 acceptance: open a remote project → its worktree list, a chat session,
 ## Out of scope (MVP)
 - Server OS/Jean auto-updates (user-managed, per 3b).
 - Pure-Rust SSH, SFTP file browser, multi-user servers.
-- Compiling a true no-webview headless Jean (xvfb is the MVP workaround).
+- A true headless runtime decoupled from Tauri's GTK event loop.
 - Encrypted-at-rest password vault (flag as security follow-up).
 
 ## Risks
-- **xvfb hard requirement** — verify a real cloud box runs `xvfb-run -a jean --headless` successfully before building UI on top.
+- **Virtual display dependency** — remove Xvfb only after a server binary starts successfully with both `DISPLAY` and `WAYLAND_DISPLAY` unset.
 - **Version skew** — client and remote headless Jean must speak the same dispatch protocol; pin/verify versions on connect.
 - **Secret handling** — SSH password / token storage in `preferences.json` is a security concern; prefer key-based auth and OS keychain later.
 - **Routing leakage** — a remote-project call that forgets its `_backendHandle` silently hits the local backend; add a dev assertion when a remote project is active.
 
 ## Verification
-1. **Headless feasibility (do first):** on a throwaway Linux VM, manually `apt install xvfb`, copy a Jean AppImage, run `xvfb-run -a ./Jean.AppImage --headless --host 127.0.0.1 --port 5599 --token test`; `curl` the health endpoint with the token. If this fails, stop and revisit (Cargo headless feature).
+1. **Headless feasibility (do first):** on a throwaway Linux VM, copy a Jean AppImage, run `xvfb-run -a ./Jean.AppImage --headless --host 127.0.0.1 --port 5599 --token test`, then check the authenticated API endpoint.
 2. **Phase 1:** add a server in DB, `test_remote_server` green, `provision_remote_server` installs + starts the systemd service (check `systemctl status`), `connect_remote_server` opens the tunnel, curl the tunneled port locally.
 3. **Phase 2:** open a remote project, start a terminal → commands execute on the server (`hostname` shows the box); start a chat session → AI CLI runs remote; confirm a local session in parallel is unaffected.
 4. **Phase 3:** `git clone` a repo onto the server via UI; reverse-forward a remote dev server and hit it from the local browser; kill the tunnel and confirm auto-reconnect + stream replay.

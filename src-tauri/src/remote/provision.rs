@@ -113,13 +113,13 @@ if command -v apt-get >/dev/null 2>&1; then
   if ! apt-cache show "$WEBKIT_PACKAGE" >/dev/null 2>&1; then
     WEBKIT_PACKAGE="libwebkit2gtk-4.0-37"
   fi
-  $SUDO env DEBIAN_FRONTEND=noninteractive apt-get install -y xvfb libgtk-3-0 "$WEBKIT_PACKAGE"
+  $SUDO env DEBIAN_FRONTEND=noninteractive apt-get install -y curl xvfb libgtk-3-0 "$WEBKIT_PACKAGE"
 elif command -v dnf >/dev/null 2>&1; then
-  $SUDO dnf install -y xorg-x11-server-Xvfb gtk3 webkit2gtk4.1
+  $SUDO dnf install -y curl xorg-x11-server-Xvfb gtk3 webkit2gtk4.1
 elif command -v yum >/dev/null 2>&1; then
-  $SUDO yum install -y xorg-x11-server-Xvfb gtk3 webkit2gtk4.1
+  $SUDO yum install -y curl xorg-x11-server-Xvfb gtk3 webkit2gtk4.1
 elif command -v pacman >/dev/null 2>&1; then
-  $SUDO pacman -Sy --noconfirm xorg-server-xvfb gtk3 webkit2gtk-4.1
+  $SUDO pacman -Sy --noconfirm curl xorg-server-xvfb gtk3 webkit2gtk-4.1
 else
   echo "Unsupported Linux package manager" >&2
   exit 65
@@ -270,6 +270,26 @@ WantedBy=multi-user.target
     )
 }
 
+fn service_health_check_command(remote_port: u16, token: &str) -> String {
+    let url = shell_quote(&format!(
+        "http://127.0.0.1:{remote_port}/api/auth?token={token}"
+    ));
+    format!(
+        r#"set -eu
+for attempt in $(seq 1 40); do
+  if curl --fail --silent --max-time 2 {url} >/dev/null; then
+    echo active
+    exit 0
+  fi
+  sleep 0.25
+done
+systemctl status {SERVICE_NAME} --no-pager >&2 || true
+journalctl -u {SERVICE_NAME} -n 20 --no-pager >&2 || true
+echo "Jean remote API did not become ready" >&2
+exit 1"#
+    )
+}
+
 fn install_artifact_and_service(
     app: &AppHandle,
     server: &RemoteServerConfig,
@@ -296,7 +316,8 @@ $SUDO install -m 0755 {remote_temp} {binary_path}
 printf '%s' {version} | $SUDO tee {install_dir}/VERSION >/dev/null
 printf '%s' {unit_base64} | base64 -d | $SUDO tee /etc/systemd/system/{service_name} >/dev/null
 $SUDO systemctl daemon-reload
-$SUDO systemctl enable --now {service_name}
+$SUDO systemctl enable {service_name}
+$SUDO systemctl restart {service_name}
 rm -f {remote_temp}
 "#,
         install_dir = REMOTE_INSTALL_DIR,
@@ -447,26 +468,26 @@ pub async fn provision(
                 "Verifying remote service",
                 90,
             );
-            let active_output = ssh::exec(
+            let health_output = ssh::exec(
                 &app_for_install,
                 &server_for_install,
-                &format!("systemctl is-active {SERVICE_NAME}"),
+                &service_health_check_command(server_for_install.remote_port, &token_for_install),
             )?;
-            emit_output(&app_for_install, &server_for_install.id, &active_output);
-            if !active_output.status.success() {
-                let stderr = String::from_utf8_lossy(&active_output.stderr)
+            emit_output(&app_for_install, &server_for_install.id, &health_output);
+            if !health_output.status.success() {
+                let stderr = String::from_utf8_lossy(&health_output.stderr)
                     .trim()
                     .to_string();
                 return Err(if stderr.is_empty() {
                     format!(
                         "Service verification failed with status {}",
-                        active_output.status
+                        health_output.status
                     )
                 } else {
                     format!("Service verification failed: {stderr}")
                 });
             }
-            let active = String::from_utf8_lossy(&active_output.stdout)
+            let active = String::from_utf8_lossy(&health_output.stdout)
                 .trim()
                 .to_string();
             if active != "active" {
@@ -507,11 +528,20 @@ mod tests {
     use crate::remote::types::{RemoteServerAuth, RemoteServerStatus};
 
     #[test]
-    fn launch_command_is_the_single_xvfb_boundary() {
+    fn launch_command_wraps_appimage_with_virtual_display() {
         assert_eq!(
             jean_launch_command(5599, "test-token"),
             "/usr/bin/xvfb-run -a /opt/jean-remote/jean.AppImage --headless --host 127.0.0.1 --port 5599 --token test-token"
         );
+    }
+
+    #[test]
+    fn service_health_check_waits_for_authenticated_api() {
+        let command = service_health_check_command(5599, "test-token");
+        assert!(command.contains(
+            "curl --fail --silent --max-time 2 'http://127.0.0.1:5599/api/auth?token=test-token'"
+        ));
+        assert!(command.contains("journalctl -u jean-remote.service"));
     }
 
     #[test]

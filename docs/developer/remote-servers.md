@@ -62,11 +62,17 @@ The backend emits `remote-server:provision-progress` and
 the current step and command output without waiting for the final mutation
 result.
 
-`provision::jean_launch_command()` is the single Xvfb compatibility boundary:
+The current Tauri runtime still initializes GTK before the headless window
+configuration is applied, so the AppImage runs behind an Xvfb compatibility
+boundary:
 
 ```text
 xvfb-run -a jean.AppImage --headless --host 127.0.0.1 --port P --token T
 ```
+
+Provisioning waits for the authenticated `/api/auth` endpoint before reporting
+success. A transient `systemctl is-active` result is not sufficient because a
+crashing service may already be queued for automatic restart.
 
 The service binds only to remote loopback. It is reachable from the desktop only
 through:
