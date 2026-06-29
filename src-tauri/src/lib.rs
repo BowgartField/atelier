@@ -841,6 +841,29 @@ mod tests {
     }
 
     #[test]
+    fn headless_rejects_disabled_token_preference_on_wildcard_host() {
+        let prefs = AppPreferences {
+            http_server_token_required: false,
+            ..Default::default()
+        };
+        let overrides = super::HttpServerOverrides {
+            host: Some("0.0.0.0".to_string()),
+            port: None,
+            token: None,
+            no_token: false,
+            allow_unsafe_no_token: false,
+        };
+
+        let bind_host = resolve_headless_bind_host(&prefs, &overrides.host);
+        let token_required = resolve_headless_token_required(&prefs, &overrides);
+        let err =
+            validate_headless_security(&bind_host, !token_required, overrides.allow_unsafe_no_token)
+                .unwrap_err();
+
+        assert!(err.contains("Refusing to disable token authentication"));
+    }
+
+    #[test]
     fn migrate_default_claude_model_keeps_standard_non_1m_models() {
         assert_eq!(super::migrate_default_claude_model("claude-opus-4-8"), None);
         assert_eq!(super::migrate_default_claude_model("claude-opus-4-7"), None);
@@ -3061,7 +3084,7 @@ async fn start_http_server_headless(
 
     validate_headless_security(
         &bind_host,
-        overrides.no_token,
+        !token_required,
         overrides.allow_unsafe_no_token,
     )?;
 
@@ -3658,10 +3681,10 @@ fn is_wildcard_bind_host(host: &str) -> bool {
 
 fn validate_headless_security(
     bind_host: &str,
-    no_token: bool,
+    token_auth_disabled: bool,
     allow_unsafe_no_token: bool,
 ) -> Result<(), String> {
-    if no_token && is_wildcard_bind_host(bind_host) && !allow_unsafe_no_token {
+    if token_auth_disabled && is_wildcard_bind_host(bind_host) && !allow_unsafe_no_token {
         return Err(
             "Refusing to disable token authentication while binding to all interfaces. Use a token, bind to 127.0.0.1, or pass --allow-unsafe-no-token.".to_string(),
         );

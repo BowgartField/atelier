@@ -47,11 +47,11 @@ frontend code changes.
 | `--host <addr>` | `JEAN_HOST` | saved preference, normally `127.0.0.1` |
 | `--port <port>` | `JEAN_PORT` | `3456` |
 | `--token <token>` | `JEAN_TOKEN` | saved/generated token |
-| `--no-token` | `JEAN_NO_TOKEN=1` | token required |
+| `--no-token` | `JEAN_NO_TOKEN=1` | off |
 | `--allow-unsafe-no-token` | `JEAN_ALLOW_UNSAFE_NO_TOKEN=1` | off |
 | n/a | `JEAN_ALLOWED_ORIGINS` | same-origin only |
 
-`--token` and `--no-token` are mutually exclusive. Jean rejects `--no-token` with `--host 0.0.0.0` or `--host ::` unless `--allow-unsafe-no-token` is also set.
+By default a token is required (using `--token`, `JEAN_TOKEN`, or an auto-generated one); pass `--no-token` to disable it. `--token` and `--no-token` are mutually exclusive. Jean rejects `--no-token` with `--host 0.0.0.0` or `--host ::` unless `--allow-unsafe-no-token` is also set.
 
 ## Health checks
 
@@ -78,11 +78,10 @@ Wants=network-online.target
 [Service]
 Type=simple
 User=jean
-Environment=JEAN_HEADLESS=1
 Environment=JEAN_HOST=127.0.0.1
 Environment=JEAN_PORT=3456
 Environment=JEAN_TOKEN=change-me-long-random-token
-ExecStart=/usr/local/bin/jean --headless
+ExecStart=/usr/local/bin/jean-server
 Restart=on-failure
 RestartSec=5
 
