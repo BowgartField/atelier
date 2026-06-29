@@ -2,8 +2,11 @@ import { memo, useState, useCallback } from 'react'
 import { usePreferences } from '@/services/preferences'
 import type { ToolCall, Question, QuestionAnswer } from '@/types/chat'
 import {
+  getAskUserQuestions,
   hasQuestionAnswerOutput,
   isAskUserQuestion,
+  normalizeCodexQuestions,
+  normalizeQuestionMultipleField,
   isPlanToolCall,
 } from '@/types/chat'
 import { AskUserQuestion } from './AskUserQuestion'
@@ -18,9 +21,14 @@ function mergeAskUserQuestions(tools: ToolCall[]): Question[] {
   const merged: Question[] = []
 
   for (const tool of tools) {
-    const questions =
-      (tool.input as { questions?: Question[] })?.questions ?? []
-    for (const q of questions) {
+    const questions = getAskUserQuestions(tool.input) ?? []
+    const normalizedQuestions =
+      tool.name === 'request_user_input'
+        ? normalizeCodexQuestions(questions)
+        : normalizeQuestionMultipleField(
+            questions as (Question & { multiple?: boolean })[]
+          )
+    for (const q of normalizedQuestions) {
       // Use header if present, otherwise use question text as fallback key
       const key = q.header ?? q.question
       if (!seenHeaders.has(key)) {
@@ -94,8 +102,7 @@ export const ToolCallsDisplay = memo(function ToolCallsDisplay({
   // Separate special tools from regular tools
   // Note: plan approval tools are handled separately outside this component (after content)
   // Note: Edit tools are handled by EditedFilesDisplay at the bottom of the message
-  const isQuestionTool = (t: ToolCall) =>
-    isAskUserQuestion(t) || t.name === 'question'
+  const isQuestionTool = (t: ToolCall) => isAskUserQuestion(t)
   const questionTools = toolCalls.filter(isQuestionTool)
   const otherTools = toolCalls.filter(
     t => !isQuestionTool(t) && !isPlanToolCall(t)

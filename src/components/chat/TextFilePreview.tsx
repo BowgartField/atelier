@@ -162,8 +162,9 @@ export function TextFilePreview({
                 <TooltipTrigger asChild>
                   <button
                     type="button"
+                    aria-label={`Remove ${textFile.filename}`}
                     onClick={e => handleRemove(e, textFile)}
-                    className="absolute -top-1.5 -right-1.5 p-0.5 bg-destructive text-destructive-foreground rounded-full opacity-100 md:opacity-0 md:group-hover:opacity-100 transition-opacity shadow-sm hover:bg-destructive/90 z-10"
+                    className="absolute -top-1.5 -right-1.5 p-0.5 bg-destructive text-white rounded-full opacity-100 transition-opacity shadow-sm hover:bg-destructive/90 z-10"
                   >
                     <X className="h-3 w-3" />
                   </button>
@@ -180,7 +181,7 @@ export function TextFilePreview({
         open={!!openFileId}
         onOpenChange={open => !open && handleDialogClose()}
       >
-        <DialogContent className="!w-screen !h-dvh !max-w-screen !max-h-none !rounded-none p-0 sm:!w-[calc(100vw-4rem)] sm:!max-w-[calc(100vw-4rem)] sm:!h-auto sm:max-h-[85vh] sm:!rounded-lg sm:p-4 bg-background/95 backdrop-blur-sm">
+        <DialogContent className="!w-screen !h-dvh !max-w-screen !max-h-none !rounded-none p-0 sm:!w-[calc(100vw-4rem)] sm:!max-w-[calc(100vw-4rem)] sm:!h-auto sm:max-h-[85vh] sm:!rounded-lg sm:p-4 bg-background/95">
           <DialogTitle className="text-sm font-medium flex items-center gap-2">
             <FileText className="h-4 w-4" />
             {openFile?.filename}

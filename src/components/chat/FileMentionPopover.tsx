@@ -15,9 +15,12 @@ import {
   CommandItem,
   CommandList,
 } from '@/components/ui/command'
+import { Kbd, KbdGroup } from '@/components/ui/kbd'
 import { Popover, PopoverContent, PopoverAnchor } from '@/components/ui/popover'
 import { useWorktreeFiles, fileQueryKeys } from '@/services/files'
 import type { WorktreeFile, PendingFile } from '@/types/chat'
+import { useProjects } from '@/services/projects'
+import { isFolder } from '@/types/projects'
 import { cn } from '@/lib/utils'
 import { generateId } from '@/lib/uuid'
 import { getExtensionColor } from '@/lib/file-colors'
@@ -27,11 +30,15 @@ export interface FileMentionPopoverHandle {
   moveUp: () => void
   moveDown: () => void
   selectCurrent: () => void
+  selectPreviousScope: () => void
+  selectNextScope: () => void
 }
 
 interface FileMentionPopoverProps {
   /** Worktree path for file listing */
   worktreePath: string | null
+  /** Current project ID, used to show linked projects as selectable scopes */
+  currentProjectId?: string | null
   /** Whether the popover is open */
   open: boolean
   /** Callback when popover should close */
@@ -48,8 +55,16 @@ interface FileMentionPopoverProps {
   handleRef?: React.RefObject<FileMentionPopoverHandle | null>
 }
 
+interface FileMentionScope {
+  id: string
+  name: string
+  rootPath: string
+  isCurrent: boolean
+}
+
 export function FileMentionPopover({
   worktreePath,
+  currentProjectId,
   open,
   onOpenChange,
   onSelectFile,
@@ -59,18 +74,72 @@ export function FileMentionPopover({
   handleRef,
 }: FileMentionPopoverProps) {
   const queryClient = useQueryClient()
-  const { data: files = [] } = useWorktreeFiles(worktreePath)
+  const { data: projects = [] } = useProjects()
+  const [selectedRootPath, setSelectedRootPath] = useState<string | null>(
+    worktreePath
+  )
+  const { data: files = [] } = useWorktreeFiles(selectedRootPath)
   const listRef = useRef<HTMLDivElement>(null)
+  const scopeListRef = useRef<HTMLDivElement>(null)
+  // File row index only. Project scopes live outside the command list so
+  // 3+ linked projects never push file results out of view.
   const [selectedIndex, setSelectedIndex] = useState(0)
+
+  const currentProject = useMemo(
+    () => projects.find(p => p.id === currentProjectId) ?? null,
+    [projects, currentProjectId]
+  )
+
+  const scopes = useMemo<FileMentionScope[]>(() => {
+    const currentScopes: FileMentionScope[] = worktreePath
+      ? [
+          {
+            id: currentProject?.id ?? 'current',
+            name: currentProject?.name ?? 'Current worktree',
+            rootPath: worktreePath,
+            isCurrent: true,
+          },
+        ]
+      : []
+
+    const linkedIds = new Set(currentProject?.linked_project_ids ?? [])
+    const linkedScopes = projects
+      .filter(p => linkedIds.has(p.id) && !isFolder(p) && p.path)
+      .map(p => ({
+        id: p.id,
+        name: p.name,
+        rootPath: p.path,
+        isCurrent: false,
+      }))
+
+    return [...currentScopes, ...linkedScopes]
+  }, [currentProject, projects, worktreePath])
+
+  const selectedScope = useMemo(
+    () => scopes.find(scope => scope.rootPath === selectedRootPath) ?? null,
+    [scopes, selectedRootPath]
+  )
+
+  const selectedScopeIndex = useMemo(
+    () => scopes.findIndex(scope => scope.rootPath === selectedRootPath),
+    [scopes, selectedRootPath]
+  )
+
+  useEffect(() => {
+    if (open) {
+      setSelectedRootPath(worktreePath)
+      setSelectedIndex(0)
+    }
+  }, [open, worktreePath])
 
   // Refetch file list each time the popover opens so newly added files appear
   useEffect(() => {
-    if (open && worktreePath) {
+    if (open && selectedRootPath) {
       queryClient.invalidateQueries({
-        queryKey: fileQueryKeys.worktreeFiles(worktreePath),
+        queryKey: fileQueryKeys.worktreeFiles(selectedRootPath),
       })
     }
-  }, [open, worktreePath, queryClient])
+  }, [open, selectedRootPath, queryClient])
 
   // Filter files based on search query (fuzzy match)
   const filteredFiles = useMemo(
@@ -84,6 +153,24 @@ export function FileMentionPopover({
     Math.max(0, filteredFiles.length - 1)
   )
 
+  const handleScopeSelect = useCallback((scope: FileMentionScope) => {
+    setSelectedRootPath(scope.rootPath)
+    setSelectedIndex(0)
+  }, [])
+
+  const handleScopeCycle = useCallback(
+    (direction: -1 | 1) => {
+      if (scopes.length === 0) return
+
+      const currentIndex = selectedScopeIndex >= 0 ? selectedScopeIndex : 0
+      const nextIndex =
+        (currentIndex + direction + scopes.length) % scopes.length
+      const nextScope = scopes[nextIndex]
+      if (nextScope) handleScopeSelect(nextScope)
+    },
+    [handleScopeSelect, scopes, selectedScopeIndex]
+  )
+
   const handleSelect = useCallback(
     (file: WorktreeFile) => {
       const pendingFile: PendingFile = {
@@ -91,11 +178,18 @@ export function FileMentionPopover({
         relativePath: file.relative_path,
         extension: file.extension,
         isDirectory: file.is_dir,
+        ...(selectedScope && !selectedScope.isCurrent
+          ? {
+              sourceRootPath: selectedScope.rootPath,
+              sourceProjectId: selectedScope.id,
+              sourceProjectName: selectedScope.name,
+            }
+          : {}),
       }
       onSelectFile(pendingFile)
       onOpenChange(false)
     },
-    [onSelectFile, onOpenChange]
+    [onSelectFile, onOpenChange, selectedScope]
   )
 
   // Expose navigation methods via ref for parent to call
@@ -105,15 +199,20 @@ export function FileMentionPopover({
         setSelectedIndex(i => Math.max(i - 1, 0))
       },
       moveDown: () => {
-        setSelectedIndex(i => Math.min(i + 1, filteredFiles.length - 1))
+        setSelectedIndex(i =>
+          Math.min(i + 1, Math.max(0, filteredFiles.length - 1))
+        )
       },
       selectCurrent: () => {
-        if (filteredFiles[clampedSelectedIndex]) {
-          handleSelect(filteredFiles[clampedSelectedIndex])
+        const file = filteredFiles[clampedSelectedIndex]
+        if (file) {
+          handleSelect(file)
         }
       },
+      selectPreviousScope: () => handleScopeCycle(-1),
+      selectNextScope: () => handleScopeCycle(1),
     }
-  }, [filteredFiles, clampedSelectedIndex, handleSelect])
+  }, [filteredFiles, clampedSelectedIndex, handleSelect, handleScopeCycle])
 
   // Scroll selected item into view
   useEffect(() => {
@@ -125,6 +224,20 @@ export function FileMentionPopover({
     )
     selectedItem?.scrollIntoView({ block: 'nearest' })
   }, [clampedSelectedIndex])
+
+  // Scroll selected project scope into view when cycling with keyboard.
+  useEffect(() => {
+    const scopeList = scopeListRef.current
+    if (!open || !scopeList || selectedScopeIndex < 0) return
+
+    const selectedScopeItem = scopeList.querySelector(
+      `[data-scope-index="${selectedScopeIndex}"]`
+    )
+    selectedScopeItem?.scrollIntoView({
+      block: 'nearest',
+      inline: 'nearest',
+    })
+  }, [open, selectedScopeIndex])
 
   if (!open || !anchorPosition) return null
 
@@ -146,16 +259,79 @@ export function FileMentionPopover({
         align="start"
         collisionPadding={0}
         side="top"
-        sideOffset={12}
+        sideOffset={20}
         onOpenAutoFocus={e => e.preventDefault()}
         onCloseAutoFocus={e => e.preventDefault()}
       >
+        <div className="space-y-2 border-b px-3 py-2">
+          <div className="flex min-h-5 items-center justify-between gap-3">
+            <span className="text-xs font-medium text-muted-foreground">
+              File links
+            </span>
+            {scopes.length > 1 && (
+              <KbdGroup
+                className="gap-0.5"
+                aria-label="Use Control Shift Left or Right to switch scope"
+              >
+                <Kbd className="h-4 min-w-4 px-1 text-[10px]">Ctrl</Kbd>
+                <Kbd className="h-4 min-w-4 px-1 text-[10px]">Shift</Kbd>
+                <Kbd className="h-4 min-w-4 px-1 text-[10px]">←</Kbd>
+                <Kbd className="h-4 min-w-4 px-1 text-[10px]">→</Kbd>
+              </KbdGroup>
+            )}
+          </div>
+
+          {scopes.length > 0 && (
+            <div className="space-y-1.5">
+              <div
+                ref={scopeListRef}
+                className="flex gap-1.5 overflow-x-auto pb-0.5"
+                aria-label="Project scope selector"
+              >
+                {scopes.map((scope, index) => {
+                  const isActiveScope = scope.rootPath === selectedRootPath
+                  const label = scope.isCurrent
+                    ? `${scope.name} current`
+                    : scope.name
+
+                  return (
+                    <button
+                      key={`${scope.id}:${scope.rootPath}`}
+                      type="button"
+                      title={scope.name}
+                      data-scope-index={index}
+                      aria-label={`Search files in ${label}`}
+                      aria-pressed={isActiveScope}
+                      onClick={() => handleScopeSelect(scope)}
+                      className={cn(
+                        'flex max-w-[11rem] shrink-0 items-center gap-2 rounded-lg border px-3 py-1.5 text-sm font-medium transition-colors',
+                        isActiveScope
+                          ? 'border-primary/55 bg-primary/15 text-primary shadow-sm'
+                          : 'border-transparent bg-muted/40 text-muted-foreground hover:bg-muted/70 hover:text-foreground'
+                      )}
+                    >
+                      <FolderIcon className="h-4 w-4 shrink-0" />
+                      <span className="truncate">{scope.name}</span>
+                    </button>
+                  )
+                })}
+              </div>
+            </div>
+          )}
+        </div>
         <Command shouldFilter={false}>
-          <CommandList ref={listRef} className="max-h-[200px]">
+          <CommandList
+            ref={listRef}
+            className="min-h-[280px] max-h-[min(360px,60vh)]"
+          >
             {filteredFiles.length === 0 ? (
-              <CommandEmpty>No files found</CommandEmpty>
+              <CommandEmpty>
+                {scopes.length === 0
+                  ? 'No files found'
+                  : 'No files found in selected project'}
+              </CommandEmpty>
             ) : (
-              <CommandGroup>
+              <CommandGroup heading="Files">
                 {filteredFiles.map((file, index) => {
                   const isSelected = index === clampedSelectedIndex
                   return (
@@ -172,7 +348,7 @@ export function FileMentionPopover({
                       )}
                     >
                       {file.is_dir ? (
-                        <FolderIcon className="h-4 w-4 shrink-0 text-blue-400" />
+                        <FolderIcon className="h-4 w-4 shrink-0 text-muted-foreground/80" />
                       ) : (
                         <FileIcon
                           className={cn(

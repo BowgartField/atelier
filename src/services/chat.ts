@@ -1,9 +1,15 @@
 import { useCallback, useEffect } from 'react'
-import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
+import {
+  useQuery,
+  useMutation,
+  useQueryClient,
+  type QueryClient,
+} from '@tanstack/react-query'
 import { invoke } from '@/lib/transport'
 import { toast } from 'sonner'
 import { logger } from '@/lib/logger'
 import { generateId } from '@/lib/uuid'
+import { disposeTerminal } from '@/lib/terminal-instances'
 import {
   beginSessionStateHydration,
   endSessionStateHydration,
@@ -30,6 +36,9 @@ import { preferencesQueryKeys } from '@/services/preferences'
 import type { AppPreferences } from '@/types/preferences'
 import { useChatStore } from '@/store/chat-store'
 import { useUIStore } from '@/store/ui-store'
+import { useTerminalStore } from '@/store/terminal-store'
+import { isNativeTerminalBackend } from '@/lib/native-cli-session'
+import { getResumeArgs } from '@/components/chat/session-card-utils'
 import type { ReviewResponse, Worktree } from '@/types/projects'
 
 /** Default number of recent runs loaded on initial session fetch. */
@@ -43,6 +52,140 @@ function isWsDisconnectError(error: unknown): boolean {
   return msg.includes('WebSocket disconnected')
 }
 
+export function cleanupSessionTerminalForRemovedSession(
+  worktreeId: string,
+  sessionId: string
+): string | undefined {
+  const terminalId = useUIStore
+    .getState()
+    .clearSessionTerminalSurface(sessionId)
+  if (!terminalId) return undefined
+
+  invoke('stop_terminal', { terminalId }).catch(() => {
+    // Terminal may already be stopped.
+  })
+  disposeTerminal(terminalId)
+  useTerminalStore.getState().removeTerminal(worktreeId, terminalId)
+
+  return terminalId
+}
+
+/**
+ * Optimistically drop a session from the ['all-sessions'] cache so the
+ * finished-session bell (UnreadBell / useUnreadCount) updates instantly when a
+ * session is closed or archived. Invalidation still runs afterwards to
+ * reconcile with the backend.
+ */
+export function removeSessionFromAllSessionsCache(
+  queryClient: QueryClient,
+  sessionId: string
+): void {
+  queryClient.setQueryData(['all-sessions'], old => {
+    const data = old as { entries?: { sessions?: Session[] }[] } | undefined
+    if (!data?.entries) return old
+    return {
+      ...data,
+      entries: data.entries.map(entry => ({
+        ...entry,
+        sessions: (entry.sessions ?? []).filter(s => s.id !== sessionId),
+      })),
+    }
+  })
+}
+
+/**
+ * Whether a session can be reconnected — i.e. it's a native CLI terminal
+ * session with a known way to relaunch (a backend resume id, or its persisted
+ * terminal command). Used to gate the "Reconnect" menu item.
+ */
+export function canReconnectSession(session: Session): boolean {
+  if (session.primary_surface !== 'terminal') return false
+  if (getResumeArgs(session)) return true
+  return !isNativeTerminalBackend(session.backend) && !!session.terminal_command
+}
+
+/**
+ * Relaunch a native CLI session's terminal. Used by the session header
+ * "Reconnect" action when the live terminal connection is lost (e.g. dropped
+ * websocket over web access).
+ *
+ * Prefers the backend resume args (`claude --resume <id>`, `codex resume <id>`,
+ * …) when a resume id was captured; otherwise falls back to the session's
+ * persisted terminal command + args (how it was originally launched, which for
+ * sessions opened from native history already includes the resume flags).
+ *
+ * Kills/disposes the old terminal (if any) then spawns a fresh one and reveals
+ * the terminal surface.
+ *
+ * `options.openModal` pops the floating terminal drawer (default true — what the
+ * manual "Reconnect" action wants). The startup auto-restore passes false
+ * because the full-screen `FullScreenTerminalSurface` renders inline.
+ * `options.showToast` controls the "Reconnecting…" toast (default true); the
+ * auto-restore silences it to avoid noise on every relaunch.
+ * `options.markOpened` controls whether reconnecting refreshes the session's
+ * last-opened timestamp (default true for manual reconnect; false for silent
+ * startup restore).
+ */
+export async function reconnectNativeCliSession(
+  session: Session,
+  worktreeId: string,
+  options?: { openModal?: boolean; showToast?: boolean; markOpened?: boolean }
+): Promise<void> {
+  const {
+    openModal = true,
+    showToast = true,
+    markOpened = true,
+  } = options ?? {}
+  const resume = getResumeArgs(session)
+  const launch =
+    resume ??
+    (!isNativeTerminalBackend(session.backend)
+      ? {
+          command: session.terminal_command ?? '',
+          args: session.terminal_command_args ?? [],
+        }
+      : null)
+  if (!launch?.command) {
+    if (showToast) toast.error('No command available to reconnect this session')
+    return
+  }
+
+  const terminalStore = useTerminalStore.getState()
+  const uiStore = useUIStore.getState()
+
+  const oldTerminalId = uiStore.sessionTerminalIds[session.id]
+  if (oldTerminalId) {
+    await invoke('stop_terminal', { terminalId: oldTerminalId }).catch(() => {
+      // Terminal may already be stopped.
+    })
+    await disposeTerminal(oldTerminalId).catch(() => {
+      // Terminal UI may already be disposed.
+    })
+    terminalStore.removeTerminal(worktreeId, oldTerminalId)
+  }
+
+  const newTerminalId = terminalStore.addTerminal(
+    worktreeId,
+    launch.command,
+    session.terminal_label ?? session.name,
+    {
+      kind: 'session',
+      commandArgs: launch.args,
+      activate: false,
+      openPanel: false,
+    }
+  )
+
+  uiStore.setSessionPrimarySurface(session.id, 'terminal')
+  uiStore.setSessionTerminalId(session.id, newTerminalId)
+  if (openModal) terminalStore.setModalTerminalOpen(worktreeId, true)
+  useChatStore.getState().setActiveSession(worktreeId, session.id, {
+    markOpened,
+  })
+
+  if (showToast) toast.success('Reconnecting session…')
+}
+
 // Query keys for chat
 export const chatQueryKeys = {
   all: ['chat'] as const,
@@ -54,6 +197,30 @@ export const chatQueryKeys = {
     [...chatQueryKeys.all, 'sessions', worktreeId] as const,
   session: (sessionId: string) =>
     [...chatQueryKeys.all, 'session', sessionId] as const,
+  nativeCliSessions: (
+    worktreePath: string,
+    backend: string,
+    searchQuery: string,
+    resultLimit: number
+  ) =>
+    [
+      ...chatQueryKeys.all,
+      'native-cli-sessions',
+      backend,
+      worktreePath,
+      searchQuery,
+      resultLimit,
+    ] as const,
+}
+
+export interface NativeCliHistorySession {
+  backend: NonNullable<Session['backend']>
+  id: string
+  title: string
+  cwd: string
+  updatedAt: number
+  resumeArgs: string[]
+  sourcePath: string
 }
 
 // ============================================================================
@@ -147,6 +314,49 @@ export function useSessions(
   })
 }
 
+export function useNativeCliSessions(
+  worktreePath: string | null,
+  backend: NonNullable<Session['backend']> | null,
+  options?: { enabled?: boolean; searchQuery?: string; resultLimit?: number }
+) {
+  const searchQuery = options?.searchQuery?.trim() ?? ''
+  const resultLimit = options?.resultLimit ?? (searchQuery ? 100 : 5)
+
+  return useQuery({
+    queryKey: chatQueryKeys.nativeCliSessions(
+      worktreePath ?? '',
+      backend ?? '',
+      searchQuery,
+      resultLimit
+    ),
+    queryFn: async (): Promise<NativeCliHistorySession[]> => {
+      if (!isTauri() || !worktreePath || !backend) return []
+      try {
+        return await invoke<NativeCliHistorySession[]>(
+          'list_native_cli_sessions',
+          {
+            worktreePath,
+            backend,
+            searchQuery,
+            resultLimit,
+          }
+        )
+      } catch (error) {
+        logger.warn('Failed to load native CLI sessions', {
+          backend,
+          worktreePath,
+          searchQuery,
+          error,
+        })
+        return []
+      }
+    },
+    enabled: (options?.enabled ?? true) && !!worktreePath && !!backend,
+    staleTime: 1000 * 30,
+    gcTime: 1000 * 60 * 5,
+  })
+}
+
 /**
  * Prefetch sessions for a worktree (for startup loading).
  * This populates the query cache so indicators show immediately.
@@ -171,6 +381,7 @@ export async function prefetchSessions(
     const reviewingUpdates: Record<string, boolean> = {}
     const waitingUpdates: Record<string, boolean> = {}
     const executionModeUpdates: Record<string, ExecutionMode> = {}
+    const primarySurfaceUpdates: Record<string, 'chat' | 'terminal'> = {}
     const labelUpdates: Record<string, LabelData> = {}
     const reviewResultsUpdates: Record<string, ReviewResponse> = {}
     const answeredQuestionsUpdates: Record<string, Set<string>> = {}
@@ -184,19 +395,23 @@ export async function prefetchSessions(
         reviewingUpdates[session.id] = true
       }
       // Only restore waiting state if the session's last run is actually active,
-      // OR if it's a completed plan-mode run (Codex/Opencode plan mode intentionally
-      // sets waiting_for_input after the run completes)
+      // OR if it's a completed run parked for user input (plan approval, or an
+      // AskUserQuestion that ends the run with waiting_for_input_type === 'question')
       const canBeWaiting =
         !session.last_run_status ||
         session.last_run_status === 'running' ||
         session.last_run_status === 'resumable' ||
         (session.last_run_status === 'completed' &&
-          session.waiting_for_input_type === 'plan')
+          (session.waiting_for_input_type === 'plan' ||
+            session.waiting_for_input_type === 'question'))
       if (session.waiting_for_input && canBeWaiting) {
         waitingUpdates[session.id] = true
       }
       if (session.selected_execution_mode) {
         executionModeUpdates[session.id] = session.selected_execution_mode
+      }
+      if (session.primary_surface) {
+        primarySurfaceUpdates[session.id] = session.primary_surface
       }
       if (session.label) {
         labelUpdates[session.id] = session.label
@@ -259,6 +474,14 @@ export async function prefetchSessions(
         ...currentState.executionModes,
         ...executionModeUpdates,
       }
+    }
+    if (Object.keys(primarySurfaceUpdates).length > 0) {
+      useUIStore.setState(state => ({
+        sessionPrimarySurface: {
+          ...state.sessionPrimarySurface,
+          ...primarySurfaceUpdates,
+        },
+      }))
     }
     if (Object.keys(labelUpdates).length > 0) {
       storeUpdates.sessionLabels = {
@@ -377,7 +600,19 @@ export function useSession(
         const cached = queryClient.getQueryData<Session>(
           chatQueryKeys.session(sessionId)
         )
-        if (cached && cached.messages.length > session.messages.length) {
+        const cachedStart = cached?.loaded_run_start_index
+        const freshStart = session.loaded_run_start_index ?? 0
+        const cachedIncludesCancelledAssistant = cached?.messages.some(
+          message => message.role === 'assistant' && message.cancelled
+        )
+        const shouldPreserveCachedMessages =
+          cached &&
+          cached.messages.length > session.messages.length &&
+          !cachedIncludesCancelledAssistant &&
+          (useChatStore.getState().sendingSessionIds[sessionId] ||
+            (typeof cachedStart === 'number' && cachedStart < freshStart))
+
+        if (cached && shouldPreserveCachedMessages) {
           logger.warn(
             '[useSession] preserving cached messages over fresh fetch',
             {
@@ -500,10 +735,22 @@ export function useCreateSession() {
       worktreeId,
       worktreePath,
       name,
+      backend,
+      primarySurface,
+      terminalCommand,
+      terminalCommandArgs,
+      terminalLabel,
+      nativeSessionId,
     }: {
       worktreeId: string
       worktreePath: string
       name?: string
+      backend?: NonNullable<Session['backend']>
+      primarySurface?: Session['primary_surface']
+      terminalCommand?: string | null
+      terminalCommandArgs?: string[]
+      terminalLabel?: string
+      nativeSessionId?: string
     }): Promise<Session> => {
       if (!isTauri()) {
         throw new Error('Not in Tauri context')
@@ -514,6 +761,12 @@ export function useCreateSession() {
         worktreeId,
         worktreePath,
         name,
+        backend,
+        primarySurface,
+        terminalCommand,
+        terminalCommandArgs,
+        terminalLabel,
+        nativeSessionId,
       })
       logger.info('Session created', { sessionId: session.id })
       return session
@@ -777,8 +1030,13 @@ export function useCloseSession() {
         queryKey: chatQueryKeys.session(sessionId),
       })
 
+      // Drop from the finished-session bell (reads from ['all-sessions']).
+      removeSessionFromAllSessionsCache(queryClient, sessionId)
+      queryClient.invalidateQueries({ queryKey: ['all-sessions'] })
+
       // Clear all session-scoped state
       useChatStore.getState().clearSessionState(sessionId)
+      cleanupSessionTerminalForRemovedSession(worktreeId, sessionId)
 
       // Switch to the new active session — but only if the caller hasn't already
       // picked a neighbor (e.g. SessionChatModal sets it based on visual tab order)
@@ -842,8 +1100,13 @@ export function useArchiveSession() {
       // Invalidate archived sessions query so it shows up immediately
       queryClient.invalidateQueries({ queryKey: ['all-archived-sessions'] })
 
+      // Drop from the finished-session bell (reads from ['all-sessions']).
+      removeSessionFromAllSessionsCache(queryClient, sessionId)
+      queryClient.invalidateQueries({ queryKey: ['all-sessions'] })
+
       // Clear all session-scoped state
       useChatStore.getState().clearSessionState(sessionId)
+      cleanupSessionTerminalForRemovedSession(worktreeId, sessionId)
 
       // Switch to the new active session — but only if the caller hasn't already
       // picked a neighbor (e.g. SessionChatModal sets it based on visual tab order)
@@ -1382,6 +1645,8 @@ export function useSendMessage() {
       chromeEnabled?: boolean
       customProfileName?: string
       backend?: string
+      /** Set by the queue processor — its onError requeues the original message */
+      fromQueue?: boolean
     }): Promise<ChatMessage> => {
       if (!isTauri()) {
         throw new Error('Not in Tauri context')
@@ -1455,7 +1720,7 @@ export function useSendMessage() {
         model,
         execution_mode: executionMode,
         thinking_level:
-          backend === 'cursor'
+          backend === 'cursor' || backend === 'grok'
             ? undefined
             : effortLevel
               ? undefined
@@ -1556,7 +1821,8 @@ export function useSendMessage() {
         queryKey: chatQueryKeys.sessions(worktreeId),
       })
     },
-    onError: (error, { sessionId, worktreeId }, context) => {
+    onError: (error, variables, context) => {
+      const { sessionId, worktreeId } = variables
       // Check for cancellation - Tauri errors may not be Error instances
       // so we check both the stringified error and the message property
       const errorStr = String(error)
@@ -1582,6 +1848,33 @@ export function useSendMessage() {
       if (isCancellation) {
         logger.debug('Message cancelled', { sessionId })
         // Don't rollback - the chat:cancelled event handler preserves the partial response
+        return
+      }
+
+      // Benign race: another queue consumer (backend drain / another client)
+      // started a run for this session first. A run IS active, so keep the
+      // sending state and skip the error banner/toast. The losing message is
+      // requeued: the queue processor's per-call onError handles queued
+      // messages; for direct submits we restore the input draft so the typed
+      // text isn't lost.
+      if (isDuplicateSendError(error)) {
+        logger.warn('Duplicate send rejected — another run is active', {
+          sessionId,
+          fromQueue: variables.fromQueue ?? false,
+        })
+        if (!variables.fromQueue) {
+          const { inputDrafts, setInputDraft } = useChatStore.getState()
+          if (!inputDrafts[sessionId]?.trim()) {
+            setInputDraft(sessionId, variables.message)
+          }
+        }
+        // Drop the optimistic user message by refetching authoritative state
+        queryClient.invalidateQueries({
+          queryKey: chatQueryKeys.session(sessionId),
+        })
+        queryClient.invalidateQueries({
+          queryKey: chatQueryKeys.sessions(worktreeId),
+        })
         return
       }
 
@@ -1990,6 +2283,62 @@ export function useSetSessionThinkingLevel() {
 }
 
 /**
+ * Hook to set the selected effort level for a session
+ */
+export function useSetSessionEffortLevel() {
+  const queryClient = useQueryClient()
+
+  return useMutation({
+    mutationFn: async ({
+      worktreeId,
+      worktreePath,
+      sessionId,
+      effortLevel,
+    }: {
+      worktreeId: string
+      worktreePath: string
+      sessionId: string
+      effortLevel: EffortLevel
+    }): Promise<void> => {
+      if (!isTauri()) {
+        throw new Error('Not in Tauri context')
+      }
+
+      logger.debug('Setting session effort level', {
+        sessionId,
+        effortLevel,
+      })
+      await invoke('set_session_effort_level', {
+        worktreeId,
+        worktreePath,
+        sessionId,
+        effortLevel,
+      })
+      logger.info('Session effort level saved')
+    },
+    onSuccess: (_, { sessionId, worktreeId }) => {
+      queryClient.invalidateQueries({
+        queryKey: chatQueryKeys.session(sessionId),
+      })
+      queryClient.invalidateQueries({
+        queryKey: chatQueryKeys.sessions(worktreeId),
+      })
+    },
+    onError: error => {
+      if (isWsDisconnectError(error)) return
+      const message =
+        error instanceof Error
+          ? error.message
+          : typeof error === 'string'
+            ? error
+            : 'Unknown error occurred'
+      logger.error('Failed to save effort level selection', { error })
+      toast.error('Failed to save effort level', { description: message })
+    },
+  })
+}
+
+/**
  * Hook to set the selected model for a worktree (legacy)
  * @deprecated Use useSetSessionModel instead
  */
@@ -2313,6 +2662,112 @@ export function persistRemoveQueued(
   }).catch(err => {
     logger.error('Failed to persist remove queued', { err, sessionId })
   })
+}
+
+/**
+ * Atomically move a specific queued message to the front of the persisted queue.
+ * Returns false when the message is no longer queued (another client dequeued
+ * or removed it) — callers must abort their send-now flow in that case.
+ */
+export async function persistMoveQueuedFront(
+  worktreeId: string,
+  worktreePath: string,
+  sessionId: string,
+  messageId: string
+): Promise<boolean> {
+  return invoke<boolean>('move_queued_message_front', {
+    worktreeId,
+    worktreePath,
+    sessionId,
+    messageId,
+  })
+}
+
+/**
+ * Inject a user message into a running Codex turn via app-server `turn/steer`.
+ * Throws when the turn already ended or steering is unavailable — callers
+ * fall back to cancel+send.
+ */
+export async function steerCodexTurn(
+  worktreeId: string,
+  sessionId: string,
+  message: string,
+  queuedMessage?: QueuedMessage
+): Promise<void> {
+  await invoke('steer_codex_turn', {
+    worktreeId,
+    sessionId,
+    message,
+    queuedMessage,
+  })
+}
+
+/**
+ * Inject a text-only user message into a running OpenCode session via
+ * OpenCode's `prompt_async` endpoint. Throws when the OpenCode session is not
+ * available or the async prompt request fails — callers fall back to queue or
+ * cancel+send.
+ */
+export async function steerOpencodeTurn(
+  worktreeId: string,
+  worktreePath: string,
+  sessionId: string,
+  message: string
+): Promise<void> {
+  await invoke('steer_opencode_turn', {
+    worktreeId,
+    worktreePath,
+    sessionId,
+    message,
+  })
+}
+
+/**
+ * Inject a user message into a running Pi RPC turn via Jean's detached Pi host.
+ * Throws when the host is gone or steering is unavailable — callers fall back
+ * to cancel+send.
+ */
+export async function steerPiTurn(
+  worktreeId: string,
+  sessionId: string,
+  message: string
+): Promise<void> {
+  await invoke('steer_pi_turn', { worktreeId, sessionId, message })
+}
+
+/**
+ * Re-insert a message at the FRONT of the persisted queue (sequenced enqueue +
+ * move-to-front). Used when a send lost the race against another queue
+ * consumer and must be retried once the active run completes.
+ */
+export async function persistRequeueFront(
+  worktreeId: string,
+  worktreePath: string,
+  sessionId: string,
+  message: QueuedMessage
+): Promise<void> {
+  await invoke('enqueue_message', {
+    worktreeId,
+    worktreePath,
+    sessionId,
+    message,
+  })
+  await invoke('move_queued_message_front', {
+    worktreeId,
+    worktreePath,
+    sessionId,
+    messageId: message.id,
+  })
+}
+
+/**
+ * True when send_chat_message rejected because another consumer (backend
+ * queue drain, another client, or a concurrent local send) already started
+ * a run for the session. Benign race — the message should be requeued.
+ */
+export function isDuplicateSendError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error ?? '')
+  return message.includes('already has an active request')
 }
 
 /**

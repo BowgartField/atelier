@@ -17,6 +17,12 @@ import type {
   ReviewFinding,
 } from '@/types/chat'
 import { MessageItem } from './MessageItem'
+import { getAssistantDurationMs } from './time-utils'
+import {
+  capturePrependScrollAnchor,
+  restorePrependScrollAnchor,
+  type PrependScrollAnchor,
+} from './message-scroll-anchor'
 
 /** Number of messages to render initially (from the end) */
 const INITIAL_VISIBLE_COUNT = 10
@@ -84,8 +90,6 @@ interface VirtualizedMessageListProps {
   onQuestionSkip: (toolCallId: string) => void
   /** Callback when user clicks a file path */
   onFileClick: (path: string) => void
-  /** Callback when user clicks an edited file badge (opens diff modal) */
-  onEditedFileClick: (path: string) => void
   /** Callback when user fixes a finding */
   onFixFinding: (finding: ReviewFinding, suggestion?: string) => Promise<void>
   /** Callback when user fixes all findings */
@@ -153,7 +157,6 @@ export const VirtualizedMessageList = memo(
         onQuestionAnswer,
         onQuestionSkip,
         onFileClick,
-        onEditedFileClick,
         onFixFinding,
         onFixAllFindings,
         isQuestionAnswered,
@@ -174,12 +177,22 @@ export const VirtualizedMessageList = memo(
     ) {
       const messageRefs = useRef<Map<number, HTMLDivElement>>(new Map())
       const isLoadingMoreRef = useRef(false)
-      // Captured scroll height taken just before requesting an older-runs load.
-      // Used to restore scroll position after the prepended messages render.
-      const pendingPrependScrollHeightRef = useRef<number | null>(null)
+      // Captured visible-message anchor taken just before requesting an
+      // older-runs load. Used to restore scroll position after prepended
+      // messages render, without relying on fragile scrollHeight deltas.
+      const pendingPrependAnchorRef = useRef<PrependScrollAnchor | null>(null)
       // Messages length captured at request time, used to compute how many
       // messages the backend actually prepended (varies per response).
       const pendingPrependMessagesLengthRef = useRef<number | null>(null)
+
+      // Stable accessor for the full message list. Kept in a ref so the
+      // identity passed down to memoized rows never changes — computing
+      // "subsequent edits" stays lazy without busting per-row memoization.
+      const messagesRef = useRef(messages)
+      useEffect(() => {
+        messagesRef.current = messages
+      }, [messages])
+      const getMessages = useCallback(() => messagesRef.current, [])
 
       // Track how many messages to render (from the end)
       const [visibleCount, setVisibleCount] = useState(INITIAL_VISIBLE_COUNT)
@@ -240,9 +253,10 @@ export const VirtualizedMessageList = memo(
           hasOlderOnDisk &&
           !isLoadingOlder &&
           onLoadOlderRuns &&
-          pendingPrependScrollHeightRef.current === null
+          pendingPrependMessagesLengthRef.current === null
         ) {
-          pendingPrependScrollHeightRef.current = container.scrollHeight
+          pendingPrependAnchorRef.current =
+            capturePrependScrollAnchor(container)
           pendingPrependMessagesLengthRef.current = messages.length
           onLoadOlderRuns()
         }
@@ -258,32 +272,35 @@ export const VirtualizedMessageList = memo(
       // After backend prepend completes, expand visibleCount so the freshly-
       // prepended messages actually render, then anchor scrollTop so the user's
       // previously-visible message stays at the same viewport position.
-      // useLayoutEffect + flushSync ensures the expand and scroll adjustment
-      // happen in a single paint — no flash, no stale delta.
+      // useLayoutEffect restores the captured anchor before paint so loading
+      // older messages does not visibly jump the viewport.
       useLayoutEffect(() => {
         const container = scrollContainerRef.current
-        const before = pendingPrependScrollHeightRef.current
+        const anchor = pendingPrependAnchorRef.current
         const prevLen = pendingPrependMessagesLengthRef.current
-        if (!container || before === null || prevLen === null) return
+        if (!container || prevLen === null) return
         if (isLoadingOlder) return
 
         const prepended = messages.length - prevLen
-        pendingPrependScrollHeightRef.current = null
-        pendingPrependMessagesLengthRef.current = null
-
-        if (prepended <= 0) return
-
-        // Synchronously expand the visible window so prepended messages render
-        // this frame — without flushSync, scrollHeight below would be stale.
-        flushSync(() => {
-          setVisibleCount(prev => prev + prepended)
-        })
-
-        const delta = container.scrollHeight - before
-        if (delta > 0) {
-          container.scrollTop += delta
+        if (prepended <= 0) {
+          pendingPrependAnchorRef.current = null
+          pendingPrependMessagesLengthRef.current = null
+          return
         }
-      }, [scrollContainerRef, isLoadingOlder, messages.length])
+
+        const desiredVisibleCount = Math.min(
+          messages.length,
+          prevLen + prepended
+        )
+        if (visibleCount < desiredVisibleCount) {
+          setVisibleCount(desiredVisibleCount)
+          return
+        }
+
+        pendingPrependAnchorRef.current = null
+        pendingPrependMessagesLengthRef.current = null
+        restorePrependScrollAnchor(container, anchor)
+      }, [scrollContainerRef, isLoadingOlder, messages.length, visibleCount])
 
       // Detect scroll to top
       useEffect(() => {
@@ -348,6 +365,7 @@ export const VirtualizedMessageList = memo(
       useEffect(() => {
         if (
           shouldScrollToBottom &&
+          pendingPrependMessagesLengthRef.current === null &&
           messages.length > prevMessageCountRef.current
         ) {
           const lastEl = messageRefs.current.get(messages.length - 1)
@@ -384,27 +402,16 @@ export const VirtualizedMessageList = memo(
               message.role === 'assistant' &&
               (hasFollowUpMap.get(globalIndex) ?? false)
 
-            // Show completed duration on the last assistant message (from store),
-            // or fall back to timestamp-based computation for persisted messages (after reload)
-            let durationMs: number | null = null
-            if (
-              message.role === 'assistant' &&
-              globalIndex === messages.length - 1 &&
+            const durationMs = getAssistantDurationMs(
+              messages,
+              globalIndex,
               completedDurationMs
-            ) {
-              durationMs = completedDurationMs
-            } else if (message.role === 'assistant' && globalIndex > 0) {
-              const prevMessage = messages[globalIndex - 1]
-              if (prevMessage?.role === 'user') {
-                const deltaSecs = message.timestamp - prevMessage.timestamp
-                if (deltaSecs > 0 && deltaSecs < 3600)
-                  durationMs = deltaSecs * 1000
-              }
-            }
+            )
 
             return (
               <div
                 key={message.id}
+                data-message-anchor-id={message.id}
                 ref={el => {
                   if (el) messageRefs.current.set(globalIndex, el)
                   else messageRefs.current.delete(globalIndex)
@@ -415,6 +422,7 @@ export const VirtualizedMessageList = memo(
               >
                 <MessageItem
                   message={message}
+                  getMessages={getMessages}
                   messageIndex={globalIndex}
                   totalMessages={totalMessages}
                   lastPlanMessageIndex={lastPlanMessageIndex}
@@ -442,7 +450,6 @@ export const VirtualizedMessageList = memo(
                   onQuestionAnswer={onQuestionAnswer}
                   onQuestionSkip={onQuestionSkip}
                   onFileClick={onFileClick}
-                  onEditedFileClick={onEditedFileClick}
                   onFixFinding={onFixFinding}
                   onFixAllFindings={onFixAllFindings}
                   isQuestionAnswered={isQuestionAnswered}

@@ -31,12 +31,25 @@ export function useTerminal({
 }: UseTerminalOptions) {
   const containerRef = useRef<HTMLDivElement | null>(null)
   const attachedRef = useRef(false)
+  const attachedTerminalIdRef = useRef<string | null>(null)
 
   const initTerminal = useCallback(
     async (container: HTMLDivElement) => {
-      if (attachedRef.current) {
-        // Already attached to this container
+      const attachedTerminalId = attachedTerminalIdRef.current
+      if (attachedRef.current && attachedTerminalId === terminalId) {
+        // Already attached to this terminal/container.
         return
+      }
+
+      if (attachedRef.current) {
+        // The host component can be reused for a different terminal ID. Make
+        // sure the previous terminal's DOM is detached first so a newly opened
+        // terminal never displays stale scrollback from the old session.
+        if (attachedTerminalId) {
+          detachFromContainer(attachedTerminalId)
+        }
+        attachedRef.current = false
+        attachedTerminalIdRef.current = null
       }
 
       containerRef.current = container
@@ -55,6 +68,7 @@ export function useTerminal({
       await attachToContainer(terminalId, container)
 
       attachedRef.current = true
+      attachedTerminalIdRef.current = terminalId
     },
     [terminalId, worktreeId, worktreePath, command, commandArgs]
   )
@@ -72,8 +86,12 @@ export function useTerminal({
   useEffect(() => {
     return () => {
       if (attachedRef.current) {
-        detachFromContainer(terminalId)
+        const attachedTerminalId = attachedTerminalIdRef.current
+        if (attachedTerminalId) {
+          detachFromContainer(attachedTerminalId)
+        }
         attachedRef.current = false
+        attachedTerminalIdRef.current = null
       }
     }
   }, [terminalId])

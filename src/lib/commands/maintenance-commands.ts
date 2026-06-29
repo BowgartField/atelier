@@ -8,6 +8,7 @@ interface CleanupResult {
   deleted_worktrees: number
   deleted_sessions: number
   deleted_contexts: number
+  deleted_orphan_indexes?: number
 }
 
 export const maintenanceCommands: AppCommand[] = [
@@ -43,6 +44,7 @@ export const maintenanceCommands: AppCommand[] = [
           result.deleted_worktrees +
           result.deleted_sessions +
           (result.deleted_contexts ?? 0) +
+          (result.deleted_orphan_indexes ?? 0) +
           combinedDeleted
 
         if (total > 0) {
@@ -60,6 +62,11 @@ export const maintenanceCommands: AppCommand[] = [
           if (result.deleted_contexts > 0) {
             parts.push(
               `${result.deleted_contexts} context${result.deleted_contexts === 1 ? '' : 's'}`
+            )
+          }
+          if ((result.deleted_orphan_indexes ?? 0) > 0) {
+            parts.push(
+              `${result.deleted_orphan_indexes} orphaned session index file${result.deleted_orphan_indexes === 1 ? '' : 's'}`
             )
           }
           if (combinedDeleted > 0) {

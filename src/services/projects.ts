@@ -5,10 +5,12 @@ import { listen, type UnlistenFn } from '@/lib/transport'
 import { toast } from 'sonner'
 import { logger } from '@/lib/logger'
 import { disposeAllWorktreeTerminals } from '@/lib/terminal-instances'
+import { toastActionLabel } from '@/lib/toast-action-label'
 import type {
   Project,
   Worktree,
   DetectPrResponse,
+  LinkWorktreePrResponse,
   WorktreeCreatingEvent,
   WorktreeCreatedEvent,
   WorktreeCreateErrorEvent,
@@ -31,7 +33,7 @@ import type { AppPreferences } from '@/types/preferences'
 import type { AdvisoryContext } from '@/types/github'
 import { hasBackend } from '@/lib/environment'
 import { openExternal, preOpenWindow } from '@/lib/platform'
-import { consumeWorktreeSilentReady } from '@/services/worktree-silent-ready'
+import { shouldSuppressAutoFixConflictNotification } from './worktree-conflict-events'
 
 // Check if a backend is available (Tauri IPC or WebSocket)
 // Kept as `isTauri` for backward compatibility across the codebase
@@ -459,6 +461,7 @@ export function useCreateWorktree() {
       advisoryContext,
       linearContext,
       customName,
+      origin,
       background: _background,
     }: {
       projectId: string
@@ -521,6 +524,8 @@ export function useCreateWorktree() {
       }
       /** Custom worktree name (used when retrying after path conflict) */
       customName?: string
+      /** Origin/category for the worktree */
+      origin?: Worktree['origin']
       /** When true, skip auto-navigation (CMD+Click from new session modal) */
       background?: boolean
     }): Promise<Worktree> => {
@@ -546,10 +551,12 @@ export function useCreateWorktree() {
         advisoryContext,
         linearContext,
         customName,
+        origin,
       })
       return worktree
     },
     onSuccess: (worktree, { projectId, background: isBackground }) => {
+      const shouldAutoOpen = !isBackground
       // Check if this worktree was already resolved by an event handler
       // (e.g. unarchive_worktree emits worktree:unarchived which sets status: 'ready')
       const existing = queryClient.getQueryData<Worktree[]>(
@@ -594,7 +601,7 @@ export function useCreateWorktree() {
       // Auto-expand the project and select the new worktree
       const { expandProject, selectWorktree } = useProjectsStore.getState()
       expandProject(projectId)
-      if (!isBackground) {
+      if (shouldAutoOpen) {
         selectWorktree(pendingWorktree.id)
         toast.loading('Setting up worktree...', {
           id: `worktree-creating-${pendingWorktree.id}`,
@@ -642,11 +649,13 @@ export function useCreateWorktreeFromExistingBranch() {
       securityContext,
       advisoryContext,
       background: _background,
+      autoOpenInJean,
     }: {
       projectId: string
       branchName: string
       /** When true, skip auto-navigation (CMD+Click from new session modal) */
       background?: boolean
+      autoOpenInJean?: boolean
       issueContext?: {
         number: number
         title: string
@@ -707,6 +716,7 @@ export function useCreateWorktreeFromExistingBranch() {
           prContext,
           securityContext,
           advisoryContext,
+          autoOpenInJean: autoOpenInJean ?? !_background,
         }
       )
       return { ...worktree, status: 'pending' as const }
@@ -783,7 +793,8 @@ export function useCreateWorktreeKeybinding() {
 /** Shared post-ready logic for both new and unarchived worktrees */
 function handleWorktreeReady(
   worktree: Worktree,
-  queryClient: ReturnType<typeof useQueryClient>
+  queryClient: ReturnType<typeof useQueryClient>,
+  autoOpenInJean = true
 ) {
   // Update cache
   const readyWorktree = { ...worktree, status: 'ready' as const }
@@ -802,13 +813,19 @@ function handleWorktreeReady(
     readyWorktree
   )
 
-  // Skip auto-navigation for background-created worktrees (CMD+Click)
-  const isBackground = useUIStore.getState().consumePendingBackgroundCreation()
+  // Skip auto-navigation for MCP/background-created worktrees. Only consume the
+  // CMD+Click background counter for interactive worktree creations so unrelated
+  // MCP events cannot steal it.
+  const isBackground = autoOpenInJean
+    ? useUIStore.getState().consumePendingBackgroundCreation()
+    : true
+  const shouldAutoOpen = autoOpenInJean && !isBackground
 
-  // Select in sidebar
+  // Keep the project visible, but only select the new worktree for interactive
+  // creations. MCP create_worktree defaults to autoOpenInJean=false.
   const { expandProject, selectWorktree } = useProjectsStore.getState()
   expandProject(worktree.project_id)
-  if (!isBackground) {
+  if (shouldAutoOpen) {
     selectWorktree(worktree.id)
   }
 
@@ -837,7 +854,7 @@ function handleWorktreeReady(
       })
   }
 
-  if (!isBackground) {
+  if (shouldAutoOpen) {
     const uiStore = useUIStore.getState()
 
     // If a session modal is already open on the project canvas (for example the
@@ -921,33 +938,35 @@ export function useWorktreeEvents() {
       listen<WorktreeCreatingEvent>('worktree:creating', event => {
         const {
           id,
-          project_id,
+          projectId,
           name,
           path,
           branch,
-          pr_number,
-          issue_number,
-          security_alert_number,
-          advisory_ghsa_id,
+          prNumber,
+          issueNumber,
+          securityAlertNumber,
+          advisoryGhsaId,
+          origin,
         } = event.payload
         logger.info('Worktree creating (background started)', { id, name })
 
         // Add pending worktree to cache so it appears instantly on all clients
         queryClient.setQueryData<Worktree[]>(
-          projectsQueryKeys.worktrees(project_id),
+          projectsQueryKeys.worktrees(projectId),
           old => {
             // Skip if this worktree already exists (e.g. on the originating client)
             if (old?.some(w => w.id === id)) return old
             const pending: Worktree = {
               id,
-              project_id,
+              project_id: projectId,
               name,
               path,
               branch,
-              pr_number,
-              issue_number,
-              security_alert_number,
-              advisory_ghsa_id,
+              pr_number: prNumber,
+              issue_number: issueNumber,
+              security_alert_number: securityAlertNumber,
+              advisory_ghsa_id: advisoryGhsaId,
+              origin,
               created_at: Math.floor(Date.now() / 1000),
               status: 'pending' as const,
               session_type: 'worktree' as Worktree['session_type'],
@@ -959,17 +978,17 @@ export function useWorktreeEvents() {
 
         // Auto-expand the project so the new worktree is visible in sidebar
         const { expandProject } = useProjectsStore.getState()
-        expandProject(project_id)
+        expandProject(projectId)
 
         // Start timeout recovery in case worktree:created/error events are never received
-        startPendingTimeout(id, project_id)
+        startPendingTimeout(id, projectId)
       })
     )
 
     // Listen for successful creation (fires before setup script runs)
     unlistenPromises.push(
       listen<WorktreeCreatedEvent>('worktree:created', event => {
-        const { worktree } = event.payload
+        const { worktree, autoOpenInJean } = event.payload
         logger.info('Worktree created (background complete)', {
           id: worktree.id,
           name: worktree.name,
@@ -978,47 +997,10 @@ export function useWorktreeEvents() {
         // Update cache FIRST, then clear timeout — ensures the safety timeout
         // survives if the cache update is a no-op (e.g. cache was invalidated
         // between worktree:creating and worktree:created events).
-        handleWorktreeReady(worktree, queryClient)
+        handleWorktreeReady(worktree, queryClient, autoOpenInJean)
         clearPendingTimeout(worktree.id)
 
-        if (consumeWorktreeSilentReady(worktree.id)) {
-          return
-        }
-
-        const openWorktreeAction = {
-          label: 'Open',
-          onClick: () => {
-            const { selectWorktree, selectProject } =
-              useProjectsStore.getState()
-            selectProject(worktree.project_id)
-            selectWorktree(worktree.id)
-            // Clear active worktree so we land on ProjectCanvasView (not bare
-            // ChatWindow), then open the session modal with the full header.
-            const { clearActiveWorktree } = useChatStore.getState()
-            clearActiveWorktree()
-            // Use both mechanisms: markWorktreeForAutoOpenSession for when the
-            // canvas is mounting (lazy-loaded), and a deferred event dispatch
-            // for when it's already mounted. The auto-open effect consumes the
-            // mark, so only one will take effect.
-            useUIStore.getState().markWorktreeForAutoOpenSession(worktree.id)
-            setTimeout(() => {
-              window.dispatchEvent(
-                new CustomEvent('open-worktree-modal', {
-                  detail: {
-                    worktreeId: worktree.id,
-                    worktreePath: worktree.path,
-                  },
-                })
-              )
-            }, 0)
-          },
-        }
-
-        toast.success(`Worktree ready: ${worktree.name}`, {
-          id: `worktree-creating-${worktree.id}`,
-          duration: 5000,
-          action: openWorktreeAction,
-        })
+        toast.dismiss(`worktree-creating-${worktree.id}`)
       })
     )
 
@@ -1189,7 +1171,7 @@ export function useWorktreeEvents() {
                 ? teardown_output.slice(0, 200) + '…'
                 : teardown_output,
             action: {
-              label: 'View Output',
+              label: toastActionLabel('View Output'),
               onClick: () =>
                 window.dispatchEvent(
                   new CustomEvent('show-teardown-output', {
@@ -1223,7 +1205,7 @@ export function useWorktreeEvents() {
           description: error,
           duration: Infinity,
           action: {
-            label: 'View Output',
+            label: toastActionLabel('View Output'),
             onClick: () =>
               window.dispatchEvent(
                 new CustomEvent('show-teardown-output', {
@@ -1321,6 +1303,14 @@ export function useWorktreeEvents() {
     // Listen for path exists conflicts — show error toast instead of auto-creating
     unlistenPromises.push(
       listen<WorktreePathExistsEvent>('worktree:path_exists', event => {
+        if (shouldSuppressAutoFixConflictNotification(event.payload)) {
+          logger.info('Suppressing auto-fix worktree path conflict toast', {
+            path: event.payload.path,
+            suggestedName: event.payload.suggested_name,
+          })
+          return
+        }
+
         const { path, archived_worktree_id, archived_worktree_name } =
           event.payload
 
@@ -1348,6 +1338,14 @@ export function useWorktreeEvents() {
     // Listen for branch exists conflicts — dispatch DOM event for BranchConflictDialog
     unlistenPromises.push(
       listen<WorktreeBranchExistsEvent>('worktree:branch_exists', event => {
+        if (shouldSuppressAutoFixConflictNotification(event.payload)) {
+          logger.info('Suppressing auto-fix worktree branch conflict dialog', {
+            branch: event.payload.branch,
+            suggestedName: event.payload.suggested_name,
+          })
+          return
+        }
+
         const { branch } = event.payload
         logger.warn('Branch conflict', { branch })
         window.dispatchEvent(
@@ -1456,6 +1454,10 @@ export function useDeleteWorktree() {
           )
         }
       )
+
+      // Drop the worktree's sessions from the finished-session bell, which
+      // reads from ['all-sessions'].
+      queryClient.invalidateQueries({ queryKey: ['all-sessions'] })
 
       // Cleanup terminal instances for this worktree
       disposeAllWorktreeTerminals(worktreeId)
@@ -2098,6 +2100,7 @@ export function useOpenWorktreeInEditor() {
 export interface PortEntry {
   port: number
   label: string
+  host?: string | null
 }
 
 /**
@@ -2395,6 +2398,29 @@ export async function saveWorktreePr(
 }
 
 /**
+ * Validate and link a GitHub PR to a worktree by number.
+ * Stores the same PR fields used by PR comments/review/push flows.
+ */
+export async function linkWorktreePr(
+  worktreeId: string,
+  worktreePath: string,
+  prNumber: number
+): Promise<LinkWorktreePrResponse> {
+  if (!isTauri()) {
+    throw new Error('Not in Tauri context')
+  }
+
+  logger.debug('Linking PR to worktree', { worktreeId, worktreePath, prNumber })
+  const result = await invoke<LinkWorktreePrResponse>('link_worktree_pr', {
+    worktreeId,
+    worktreePath,
+    prNumber,
+  })
+  logger.info('PR linked successfully', { worktreeId, prNumber })
+  return result
+}
+
+/**
  * Clear PR information from a worktree
  * Called when a PR is closed/merged and the user wants to remove the link.
  */
@@ -2505,6 +2531,7 @@ export function useUpdateProjectSettings() {
       worktreesDir,
       linearApiKey,
       linearTeamId,
+      autoFixSettings,
     }: {
       projectId: string
       name?: string
@@ -2517,6 +2544,7 @@ export function useUpdateProjectSettings() {
       worktreesDir?: string
       linearApiKey?: string
       linearTeamId?: string
+      autoFixSettings?: Project['auto_fix_settings']
       linkedProjectIds?: string[]
     }): Promise<Project> => {
       if (!isTauri()) {
@@ -2540,6 +2568,7 @@ export function useUpdateProjectSettings() {
         worktreesDir,
         linearApiKey,
         linearTeamId,
+        autoFixSettings,
         linkedProjectIds,
       })
       logger.info('Project settings updated', { project })
@@ -2633,6 +2662,12 @@ export function useReorderProjects() {
 /**
  * Hook to reorder worktrees within a project
  */
+interface ReorderWorktreesInput {
+  projectId: string
+  worktreeIds: string[]
+  switchToManualSort?: boolean
+}
+
 export function useReorderWorktrees() {
   const queryClient = useQueryClient()
 
@@ -2640,10 +2675,7 @@ export function useReorderWorktrees() {
     mutationFn: async ({
       projectId,
       worktreeIds,
-    }: {
-      projectId: string
-      worktreeIds: string[]
-    }): Promise<void> => {
+    }: ReorderWorktreesInput): Promise<void> => {
       if (!isTauri()) {
         throw new Error('Not in Tauri context')
       }
@@ -2652,7 +2684,7 @@ export function useReorderWorktrees() {
       await invoke('reorder_worktrees', { projectId, worktreeIds })
       logger.info('Worktrees reordered')
     },
-    onMutate: async ({ projectId, worktreeIds }) => {
+    onMutate: async ({ projectId, worktreeIds, switchToManualSort }) => {
       // Cancel outgoing refetches
       await queryClient.cancelQueries({
         queryKey: projectsQueryKeys.worktrees(projectId),
@@ -2665,17 +2697,24 @@ export function useReorderWorktrees() {
 
       // Optimistically update the cache
       if (previousWorktrees) {
-        const reorderedWorktrees = worktreeIds
-          .map((id, index) => {
-            const worktree = previousWorktrees.find(w => w.id === id)
-            // Base sessions keep order 0, others get index + 1
-            if (worktree) {
-              const newOrder = worktree.session_type === 'base' ? 0 : index + 1
-              return { ...worktree, order: newOrder }
-            }
-            return null
-          })
-          .filter((w): w is Worktree => w !== null)
+        const orderById = new Map<string, number>()
+        let nextOrder = 1
+        for (const worktreeId of worktreeIds) {
+          const worktree = previousWorktrees.find(w => w.id === worktreeId)
+          if (worktree && worktree.session_type !== 'base') {
+            orderById.set(worktreeId, nextOrder)
+            nextOrder += 1
+          }
+        }
+
+        const reorderedWorktrees = previousWorktrees.map(worktree => {
+          if (worktree.session_type === 'base') {
+            return { ...worktree, order: 0 }
+          }
+
+          const order = orderById.get(worktree.id) ?? worktree.order
+          return { ...worktree, order }
+        })
 
         queryClient.setQueryData<Worktree[]>(
           projectsQueryKeys.worktrees(projectId),
@@ -2683,7 +2722,16 @@ export function useReorderWorktrees() {
         )
       }
 
-      return { previousWorktrees, projectId }
+      const previousSortMode =
+        useProjectsStore.getState().projectCanvasSettings[projectId]
+          ?.worktreeSortMode
+      if (switchToManualSort && previousSortMode !== 'manual') {
+        useProjectsStore
+          .getState()
+          .setProjectCanvasWorktreeSortMode(projectId, 'manual')
+      }
+
+      return { previousWorktrees, projectId, previousSortMode }
     },
     onError: (error, _, context) => {
       // Rollback on error
@@ -2692,6 +2740,18 @@ export function useReorderWorktrees() {
           projectsQueryKeys.worktrees(context.projectId),
           context.previousWorktrees
         )
+      }
+      if (
+        context?.previousSortMode != null &&
+        useProjectsStore.getState().projectCanvasSettings[context.projectId]
+          ?.worktreeSortMode === 'manual'
+      ) {
+        useProjectsStore
+          .getState()
+          .setProjectCanvasWorktreeSortMode(
+            context.projectId,
+            context.previousSortMode
+          )
       }
       const message =
         error instanceof Error

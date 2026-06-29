@@ -1,7 +1,8 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { renderHook, waitFor } from '@testing-library/react'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
-import { createElement } from 'react'
+import { Fragment, createElement, isValidElement } from 'react'
+import { render, screen } from '@testing-library/react'
 import {
   gitStatusQueryKeys,
   setAppFocusState,
@@ -16,20 +17,54 @@ import {
   triggerImmediateRemotePoll,
   getGitDiff,
   useGitStatus,
+  useAppFocusTracking,
+  useWorktreePolling,
+  performGitPull,
   type WorktreePollingInfo,
 } from './git-status'
 
 const mockInvoke = vi.fn()
 const mockListen = vi.fn()
+let mockWsConnected = true
+const mockToast = {
+  loading: vi.fn(() => 'toast-1'),
+  success: vi.fn(),
+  warning: vi.fn(),
+  error: vi.fn(),
+  info: vi.fn(),
+}
+const mockSetWorktreeLoading = vi.fn()
+const mockClearWorktreeLoading = vi.fn()
+const mockIsWorktreeRunningNonPlan = vi.fn(() => false)
 
 vi.mock('@/lib/transport', () => ({
   invoke: (...args: unknown[]) => mockInvoke(...args),
   listen: (...args: unknown[]) => mockListen(...args),
+  useWsConnectionStatus: () => mockWsConnected,
 }))
 
 vi.mock('@/services/projects', () => ({
   isTauri: vi.fn(() => true),
   updateWorktreeCachedStatus: vi.fn(),
+}))
+
+vi.mock('@/lib/environment', async importOriginal => ({
+  ...(await importOriginal()),
+  isNativeApp: () => true,
+}))
+
+vi.mock('sonner', () => ({
+  toast: mockToast,
+}))
+
+vi.mock('@/store/chat-store', () => ({
+  useChatStore: {
+    getState: () => ({
+      setWorktreeLoading: mockSetWorktreeLoading,
+      clearWorktreeLoading: mockClearWorktreeLoading,
+      isWorktreeRunningNonPlan: mockIsWorktreeRunningNonPlan,
+    }),
+  },
 }))
 
 const createTestQueryClient = () =>
@@ -52,6 +87,13 @@ describe('git-status service', () => {
   beforeEach(async () => {
     queryClient = createTestQueryClient()
     vi.clearAllMocks()
+    Object.defineProperty(window, 'innerWidth', {
+      configurable: true,
+      value: 1024,
+    })
+    mockToast.loading.mockReturnValue('toast-1')
+    mockIsWorktreeRunningNonPlan.mockReturnValue(false)
+    mockWsConnected = true
     // Mock Tauri environment
     const { isTauri } = vi.mocked(await import('@/services/projects'))
     isTauri.mockReturnValue(true)
@@ -344,6 +386,43 @@ describe('git-status service', () => {
     })
   })
 
+  describe('performGitPull', () => {
+    it('runs conflict resolver only when the Resolve Conflicts toast action is clicked', async () => {
+      const onMergeConflict = vi.fn()
+      mockInvoke.mockRejectedValueOnce('Merge conflicts in:\nfile.txt')
+
+      await performGitPull({
+        worktreeId: 'wt-123',
+        worktreePath: '/path/to/repo',
+        baseBranch: 'main',
+        projectId: 'proj-1',
+        onMergeConflict,
+      })
+
+      expect(onMergeConflict).not.toHaveBeenCalled()
+      expect(mockToast.warning).toHaveBeenCalledWith(
+        'Pull resulted in merge conflicts',
+        expect.objectContaining({
+          id: 'toast-1',
+          duration: Infinity,
+          action: expect.objectContaining({ label: expect.anything() }),
+        })
+      )
+
+      const warningOptions = mockToast.warning.mock.calls.at(-1)?.[1] as {
+        action: { label: React.ReactNode; onClick: () => void }
+      }
+      expect(isValidElement(warningOptions.action.label)).toBe(true)
+      render(createElement(Fragment, null, warningOptions.action.label))
+      expect(screen.getByText('Resolve Conflicts')).toBeInTheDocument()
+      expect(screen.getByText('Alt+Enter')).toBeInTheDocument()
+
+      warningOptions.action.onClick()
+
+      expect(onMergeConflict).toHaveBeenCalledTimes(1)
+    })
+  })
+
   describe('useGitStatus', () => {
     it('returns null data when no worktree ID', async () => {
       const { result } = renderHook(() => useGitStatus(null), {
@@ -371,6 +450,55 @@ describe('git-status service', () => {
 
       expect(result.current.data?.behind_count).toBe(5)
       expect(result.current.data?.ahead_count).toBe(2)
+    })
+  })
+
+  describe('background polling hooks', () => {
+    it('swallows rejected focus state updates so global error toasts are not triggered', async () => {
+      mockInvoke.mockRejectedValue(new Error('Command timed out after 60s'))
+      const unhandledRejection = vi.fn()
+      window.addEventListener('unhandledrejection', unhandledRejection)
+
+      renderHook(() => useAppFocusTracking())
+
+      await new Promise(resolve => setTimeout(resolve, 0))
+
+      expect(unhandledRejection).not.toHaveBeenCalled()
+      expect(mockInvoke).toHaveBeenCalledWith('set_app_focus_state', {
+        focused: document.hasFocus(),
+      })
+
+      window.removeEventListener('unhandledrejection', unhandledRejection)
+    })
+
+    it('swallows rejected active worktree polling updates so global error toasts are not triggered', async () => {
+      mockInvoke.mockRejectedValue(new Error('Command timed out after 60s'))
+      const unhandledRejection = vi.fn()
+      window.addEventListener('unhandledrejection', unhandledRejection)
+
+      renderHook(() =>
+        useWorktreePolling({
+          worktreeId: 'wt-123',
+          worktreePath: '/path/to/worktree',
+          baseBranch: 'main',
+        })
+      )
+
+      await new Promise(resolve => setTimeout(resolve, 0))
+
+      expect(unhandledRejection).not.toHaveBeenCalled()
+      expect(mockInvoke).toHaveBeenCalledWith(
+        'set_active_worktree_for_polling',
+        {
+          worktreeId: 'wt-123',
+          worktreePath: '/path/to/worktree',
+          baseBranch: 'main',
+          prNumber: null,
+          prUrl: null,
+        }
+      )
+
+      window.removeEventListener('unhandledrejection', unhandledRejection)
     })
   })
 })

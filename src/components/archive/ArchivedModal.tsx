@@ -95,6 +95,7 @@ type DeleteConfirmType =
 interface CleanupResult {
   deleted_worktrees: number
   deleted_sessions: number
+  deleted_orphan_indexes?: number
 }
 
 export function ArchivedModal({ open, onOpenChange }: ArchivedModalProps) {
@@ -396,6 +397,11 @@ export function ArchivedModal({ open, onOpenChange }: ArchivedModalProps) {
       if (result.deleted_sessions > 0) {
         parts.push(
           `${result.deleted_sessions} session${result.deleted_sessions === 1 ? '' : 's'}`
+        )
+      }
+      if ((result.deleted_orphan_indexes ?? 0) > 0) {
+        parts.push(
+          `${result.deleted_orphan_indexes} orphaned session index file${result.deleted_orphan_indexes === 1 ? '' : 's'}`
         )
       }
 
@@ -739,7 +745,7 @@ export function ArchivedModal({ open, onOpenChange }: ArchivedModalProps) {
             <AlertDialogAction
               onClick={confirmDelete}
               disabled={isDeletingAll}
-              className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
+              className="bg-destructive text-white hover:bg-destructive/90"
             >
               {permanentlyDeleteWorktree.isPending ||
               deleteArchivedSession.isPending ||

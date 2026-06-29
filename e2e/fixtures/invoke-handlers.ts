@@ -15,11 +15,13 @@ const project = createProject()
 const worktree1 = createWorktree(project.id, {
   name: 'fuzzy-tiger',
   branch: 'fuzzy-tiger',
+  created_at: 2_000,
   order: 0,
 })
 const worktree2 = createWorktree(project.id, {
   name: 'calm-dolphin',
   branch: 'calm-dolphin',
+  created_at: 1_000,
   order: 1,
   path: '/tmp/e2e-test-project/.worktrees/calm-dolphin',
 })
@@ -29,6 +31,11 @@ const uiState = {
   ...mockUIState,
   active_project_id: project.id,
   expanded_project_ids: [project.id],
+  project_canvas_settings: {
+    [project.id]: {
+      worktree_sort_mode: 'manual',
+    },
+  },
 }
 
 /**

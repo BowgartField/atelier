@@ -1,7 +1,7 @@
 import { useMemo } from 'react'
 import { Play } from 'lucide-react'
 import { cn } from '@/lib/utils'
-import { useTerminalStore } from '@/store/terminal-store'
+import { isPanelTerminal, useTerminalStore } from '@/store/terminal-store'
 import { useTerminalListeningPorts } from '@/services/projects'
 import type { TerminalPortInfo } from '@/services/projects'
 import {
@@ -17,11 +17,15 @@ import {
 export function useWorktreeTerminalStatus(worktreeId: string) {
   const hasRunningTerminal = useTerminalStore(state => {
     const terminals = state.terminals[worktreeId] ?? []
-    return terminals.some(t => !!t.command && state.runningTerminals.has(t.id))
+    return terminals.some(
+      t => isPanelTerminal(t) && !!t.command && state.runningTerminals.has(t.id)
+    )
   })
   const hasFailedTerminal = useTerminalStore(state => {
     const terminals = state.terminals[worktreeId] ?? []
-    return terminals.some(t => !!t.command && state.failedTerminals.has(t.id))
+    return terminals.some(
+      t => isPanelTerminal(t) && !!t.command && state.failedTerminals.has(t.id)
+    )
   })
   const showTerminalIndicator = hasRunningTerminal || hasFailedTerminal
 
@@ -38,6 +42,7 @@ export function useWorktreeTerminalStatus(worktreeId: string) {
     const worktreeTerminals = terminals[worktreeId] ?? []
     const lines: string[] = []
     for (const t of worktreeTerminals) {
+      if (!isPanelTerminal(t)) continue
       if (!t.command) continue
       if (runningTerminals.has(t.id)) {
         const ports = (listeningPorts as TerminalPortInfo[])

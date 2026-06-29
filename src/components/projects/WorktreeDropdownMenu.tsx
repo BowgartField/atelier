@@ -12,7 +12,6 @@ import {
   Plus,
   Settings,
   ShieldAlert,
-  Sparkles,
   Terminal,
   Trash2,
   X,
@@ -42,7 +41,7 @@ import {
 import { Button } from '@/components/ui/button'
 import type { Worktree } from '@/types/projects'
 import { getEditorLabel, getTerminalLabel } from '@/types/preferences'
-import { ghCliQueryKeys } from '@/services/gh-cli'
+import { ghCliQueryKeys, useGhCliAuth } from '@/services/gh-cli'
 import {
   useDependabotAlerts,
   useGitHubIssues,
@@ -87,7 +86,6 @@ export function WorktreeDropdownMenu({
     showDeleteConfirm,
     setShowDeleteConfirm,
     isBase,
-    hasMessages,
     runScripts,
     preferences,
     handleRun,
@@ -97,8 +95,11 @@ export function WorktreeDropdownMenu({
     handleOpenInEditor,
     handleArchiveOrClose,
     handleDelete,
-    handleGenerateRecap,
   } = useWorktreeMenuActions({ worktree, projectId })
+  const isMobile = useIsMobile()
+  // On native desktop the auth query runs in App.tsx; on web/mobile access it doesn't.
+  // Trigger it here on mobile so counts populate without depending on cache.
+  useGhCliAuth({ enabled: isMobile })
   const authData = queryClient.getQueryData<GhAuthStatus>(ghCliQueryKeys.auth())
   const isGitHubAuthenticated = authData?.authenticated ?? false
   const { data: issueResult } = useGitHubIssues(projectPath, 'open', {
@@ -129,11 +130,11 @@ export function WorktreeDropdownMenu({
       .length ?? 0)
   const workflowRunCount = workflowRuns?.runs?.length ?? 0
   const failedWorkflowCount = workflowRuns?.failedCount ?? 0
-  const isMobile = useIsMobile()
   const hasDiff = uncommittedAdded > 0 || uncommittedRemoved > 0
   const hasBranchDiff = branchDiffAdded > 0 || branchDiffRemoved > 0
+  const showMobileGitHubItems = isMobile
   const hasGitHubStatusItems =
-    (isMobile && (issueCount > 0 || prCount > 0)) ||
+    showMobileGitHubItems ||
     securityCount > 0 ||
     workflowRunCount > 0 ||
     (isMobile && (hasDiff || hasBranchDiff))
@@ -189,13 +190,13 @@ export function WorktreeDropdownMenu({
             New Session
           </DropdownMenuItem>
 
-          {isNativeApp() && runScripts.length === 1 && (
+          {runScripts.length === 1 && (
             <DropdownMenuItem onClick={handleRun}>
               <Play className="mr-2 h-4 w-4" />
               Run
             </DropdownMenuItem>
           )}
-          {isNativeApp() && runScripts.length > 1 && (
+          {runScripts.length > 1 && (
             <DropdownMenuSub>
               <DropdownMenuSubTrigger>
                 <Play className="mr-4 h-4 w-4" />
@@ -224,13 +225,6 @@ export function WorktreeDropdownMenu({
             Project Settings
           </DropdownMenuItem>
 
-          {hasMessages && (
-            <DropdownMenuItem onClick={handleGenerateRecap}>
-              <Sparkles className="mr-2 h-4 w-4" />
-              Generate Recap
-            </DropdownMenuItem>
-          )}
-
           {hasGitHubStatusItems && <DropdownMenuSeparator />}
 
           {isMobile && hasDiff && (
@@ -256,28 +250,21 @@ export function WorktreeDropdownMenu({
             </DropdownMenuItem>
           )}
 
-          {isMobile && issueCount > 0 && (
+          {showMobileGitHubItems && (
             <DropdownMenuItem onClick={handleOpenIssues}>
               <CircleDot className="mr-2 h-4 w-4 text-green-600" />
-              {issueCount} Open Issue{issueCount === 1 ? '' : 's'}
+              {issueCount > 0 ? `${issueCount} Issues` : 'Issues'}
             </DropdownMenuItem>
           )}
 
-          {isMobile && prCount > 0 && (
+          {showMobileGitHubItems && (
             <DropdownMenuItem onClick={handleOpenPRs}>
               <GitPullRequestArrow className="mr-2 h-4 w-4 text-blue-600" />
-              {prCount} Open PR{prCount === 1 ? '' : 's'}
+              {prCount > 0 ? `${prCount} PRs` : 'PRs'}
             </DropdownMenuItem>
           )}
 
-          {securityCount > 0 && (
-            <DropdownMenuItem onClick={handleOpenSecurity}>
-              <ShieldAlert className="mr-2 h-4 w-4 text-orange-600" />
-              {securityCount} Security Alert{securityCount === 1 ? '' : 's'}
-            </DropdownMenuItem>
-          )}
-
-          {workflowRunCount > 0 && (
+          {(showMobileGitHubItems || workflowRunCount > 0) && (
             <DropdownMenuItem onClick={handleOpenWorkflowRuns}>
               {failedWorkflowCount > 0 ? (
                 <AlertCircle className="mr-2 h-4 w-4 text-red-600" />
@@ -285,8 +272,17 @@ export function WorktreeDropdownMenu({
                 <Activity className="mr-2 h-4 w-4" />
               )}
               {failedWorkflowCount > 0
-                ? `${failedWorkflowCount} Failed Workflow Run${failedWorkflowCount === 1 ? '' : 's'}`
-                : 'Workflow Runs'}
+                ? `${failedWorkflowCount} Failed Workflows`
+                : workflowRunCount > 0
+                  ? `${workflowRunCount} Workflows`
+                  : 'Workflows'}
+            </DropdownMenuItem>
+          )}
+
+          {(showMobileGitHubItems || securityCount > 0) && (
+            <DropdownMenuItem onClick={handleOpenSecurity}>
+              <ShieldAlert className="mr-2 h-4 w-4 text-orange-600" />
+              {securityCount > 0 ? `${securityCount} Security` : 'Security'}
             </DropdownMenuItem>
           )}
 
@@ -361,7 +357,7 @@ export function WorktreeDropdownMenu({
             <AlertDialogAction
               autoFocus
               onClick={handleDelete}
-              className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
+              className="bg-destructive text-white hover:bg-destructive/90"
             >
               Delete
               <kbd className="ml-1.5 text-xs opacity-70">↵</kbd>

@@ -126,4 +126,161 @@ describe('DesktopToolbarControls', () => {
 
     expect(onSetExecutionMode).toHaveBeenCalledWith('build')
   })
+
+  it('shows a desktop Magic button that opens the magic modal', async () => {
+    const user = userEvent.setup()
+    const onOpenMagicModal = vi.fn()
+
+    renderDesktopToolbarControls({ onOpenMagicModal })
+
+    await user.click(screen.getByRole('button', { name: /magic/i }))
+
+    expect(onOpenMagicModal).toHaveBeenCalledTimes(1)
+  })
+
+  it('shows a desktop Attachments button after Magic that opens file picker', async () => {
+    const user = userEvent.setup()
+    const onAttach = vi.fn()
+
+    renderDesktopToolbarControls({ onAttach })
+
+    const magicButton = screen.getByRole('button', { name: /magic/i })
+    const attachmentsButton = screen.getByRole('button', {
+      name: /attachments/i,
+    })
+
+    expect(
+      magicButton.compareDocumentPosition(attachmentsButton) &
+        Node.DOCUMENT_POSITION_FOLLOWING
+    ).toBeTruthy()
+
+    await user.click(attachmentsButton)
+
+    expect(onAttach).toHaveBeenCalledTimes(1)
+  })
+
+  it('keeps desktop Magic and settings controls usable while questions are pending', () => {
+    renderDesktopToolbarControls({ hasPendingQuestions: true })
+
+    expect(screen.getByRole('button', { name: /magic/i })).toBeEnabled()
+    expect(
+      screen.getByRole('button', { name: /choose backend and model/i })
+    ).toBeEnabled()
+    expect(screen.getByRole('button', { name: /medium/i })).toBeEnabled()
+    expect(screen.getByRole('button', { name: /^plan$/i })).toBeEnabled()
+  })
+
+  it('keeps Claude provider switcher available after messages exist', () => {
+    renderDesktopToolbarControls({
+      selectedBackend: 'claude',
+      selectedModel: 'sonnet',
+      selectedProvider: null,
+      customCliProfiles: [{ name: 'OpenRouter', settings_json: '{}' }],
+      providerLocked: true,
+      sessionHasMessages: true,
+      isCodex: false,
+    })
+
+    expect(
+      screen.getByRole('button', { name: /anthropic/i })
+    ).toBeInTheDocument()
+  })
+
+  it('hides reasoning control for Command Code on desktop', () => {
+    renderDesktopToolbarControls({
+      selectedBackend: 'commandcode',
+      selectedModel: 'commandcode/default',
+      isCodex: false,
+      useAdaptiveThinking: false,
+      hideThinkingLevel: false,
+    })
+
+    expect(
+      screen.queryByRole('button', { name: /think/i })
+    ).not.toBeInTheDocument()
+    expect(screen.queryByText('Effort')).not.toBeInTheDocument()
+  })
+
+  it('hides Claude-only Max and Ultracode effort for Codex', () => {
+    renderDesktopToolbarControls({
+      isCodex: true,
+      selectedBackend: 'codex',
+      useAdaptiveThinking: false,
+      selectedEffortLevel: 'max',
+      thinkingDropdownOpen: true,
+    })
+
+    expect(screen.getByText('xHigh')).toBeInTheDocument()
+    expect(screen.queryByText('Max')).not.toBeInTheDocument()
+    expect(screen.queryByText('Ultracode')).not.toBeInTheDocument()
+  })
+
+  it('shows PI effort options instead of Claude thinking on desktop', () => {
+    renderDesktopToolbarControls({
+      isCodex: false,
+      selectedBackend: 'pi',
+      selectedModel: 'pi/openai-codex/gpt-5.5',
+      selectedEffortLevel: 'xhigh',
+      useAdaptiveThinking: false,
+      selectedThinkingLevel: 'megathink',
+      thinkingDropdownOpen: true,
+    })
+
+    expect(
+      screen.getByRole('menuitemradio', { name: /xhigh/i })
+    ).toBeInTheDocument()
+    expect(
+      screen.getByRole('menuitemradio', { name: /minimal/i })
+    ).toBeInTheDocument()
+    expect(screen.queryByText('Megathink')).not.toBeInTheDocument()
+    expect(screen.queryByText('Max')).not.toBeInTheDocument()
+    expect(screen.queryByText('Ultracode')).not.toBeInTheDocument()
+  })
+
+  it('calls effort change handler when selecting an effort on desktop', async () => {
+    const user = userEvent.setup()
+    const handleEffortLevelChange = vi.fn()
+
+    renderDesktopToolbarControls({
+      isCodex: false,
+      selectedBackend: 'claude',
+      useAdaptiveThinking: true,
+      selectedEffortLevel: 'medium',
+      thinkingDropdownOpen: true,
+      handleEffortLevelChange,
+    })
+
+    const xHighItem = screen
+      .getAllByRole('menuitemradio', { name: /xhigh/i })
+      .find(item => item.textContent?.startsWith('xHigh'))
+    expect(xHighItem).toBeDefined()
+    if (!xHighItem) return
+    await user.click(xHighItem)
+
+    expect(handleEffortLevelChange).toHaveBeenCalledWith('xhigh')
+  })
+
+  it('keeps Max effort available for Claude adaptive thinking', () => {
+    renderDesktopToolbarControls({
+      isCodex: false,
+      selectedBackend: 'claude',
+      useAdaptiveThinking: true,
+      selectedEffortLevel: 'max',
+      thinkingDropdownOpen: true,
+    })
+
+    expect(screen.getAllByText('Max').length).toBeGreaterThan(0)
+  })
+
+  it('keeps Ultracode effort available for Claude adaptive thinking', () => {
+    renderDesktopToolbarControls({
+      isCodex: false,
+      selectedBackend: 'claude',
+      useAdaptiveThinking: true,
+      selectedEffortLevel: 'ultracode',
+      thinkingDropdownOpen: true,
+    })
+
+    expect(screen.getAllByText('Ultracode').length).toBeGreaterThan(0)
+  })
 })

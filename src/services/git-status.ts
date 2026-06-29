@@ -21,6 +21,8 @@ import type {
   Worktree,
 } from '@/types/projects'
 import type { GitDiff, CommitHistoryResult } from '@/types/git-diff'
+import { toastActionLabel } from '@/lib/toast-action-label'
+import { logger } from '@/lib/logger'
 
 // ============================================================================
 // Types
@@ -71,6 +73,10 @@ export interface WorktreePollingInfo {
 // ============================================================================
 // Commands
 // ============================================================================
+
+function logBackgroundPollingError(command: string, error: unknown) {
+  logger.debug('Background git polling command failed', { command, error })
+}
 
 /**
  * Set the application focus state for the background task manager.
@@ -270,8 +276,12 @@ export async function performGitPull(opts: GitPullOptions): Promise<void> {
             id: toastId,
             duration: Infinity,
             action: {
-              label: 'Resolve Conflicts',
+              label: toastActionLabel('Resolve Conflicts'),
               onClick: () => {
+                if (onMergeConflict) {
+                  onMergeConflict()
+                  return
+                }
                 window.dispatchEvent(
                   new CustomEvent('magic-command', {
                     detail: { command: 'resolve-conflicts' },
@@ -280,7 +290,6 @@ export async function performGitPull(opts: GitPullOptions): Promise<void> {
               },
             },
           })
-          onMergeConflict?.()
         } else {
           toast.error('Auto-stash failed', {
             id: toastId,
@@ -301,8 +310,12 @@ export async function performGitPull(opts: GitPullOptions): Promise<void> {
         id: toastId,
         duration: Infinity,
         action: {
-          label: 'Resolve Conflicts',
+          label: toastActionLabel('Resolve Conflicts'),
           onClick: () => {
+            if (onMergeConflict) {
+              onMergeConflict()
+              return
+            }
             window.dispatchEvent(
               new CustomEvent('magic-command', {
                 detail: { command: 'resolve-conflicts' },
@@ -311,7 +324,6 @@ export async function performGitPull(opts: GitPullOptions): Promise<void> {
           },
         },
       })
-      onMergeConflict?.()
       return
     }
 
@@ -687,13 +699,17 @@ export function useAppFocusTracking() {
 
     const handleFocus = () => {
       if (isMounted.current) {
-        setAppFocusState(true)
+        void setAppFocusState(true).catch(error =>
+          logBackgroundPollingError('set_app_focus_state', error)
+        )
       }
     }
 
     const handleBlur = () => {
       if (isMounted.current) {
-        setAppFocusState(false)
+        void setAppFocusState(false).catch(error =>
+          logBackgroundPollingError('set_app_focus_state', error)
+        )
       }
     }
 
@@ -702,7 +718,9 @@ export function useAppFocusTracking() {
     window.addEventListener('blur', handleBlur)
 
     // Set initial focus state
-    setAppFocusState(document.hasFocus())
+    void setAppFocusState(document.hasFocus()).catch(error =>
+      logBackgroundPollingError('set_app_focus_state', error)
+    )
 
     return () => {
       isMounted.current = false
@@ -752,7 +770,9 @@ export function useWorktreePolling(info: WorktreePollingInfo | null) {
       info?.prUrl !== prevInfo?.prUrl
 
     if (hasChanged) {
-      setActiveWorktreeForPolling(info)
+      void setActiveWorktreeForPolling(info).catch(error =>
+        logBackgroundPollingError('set_active_worktree_for_polling', error)
+      )
       prevInfoRef.current = info
     }
   }, [info, wsConnected])
@@ -761,7 +781,9 @@ export function useWorktreePolling(info: WorktreePollingInfo | null) {
   useEffect(() => {
     return () => {
       if (isTauri()) {
-        setActiveWorktreeForPolling(null)
+        void setActiveWorktreeForPolling(null).catch(error =>
+          logBackgroundPollingError('set_active_worktree_for_polling', error)
+        )
       }
     }
   }, [])

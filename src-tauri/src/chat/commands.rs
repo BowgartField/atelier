@@ -1,8 +1,12 @@
+use std::collections::HashSet;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
+use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use once_cell::sync::Lazy;
+use serde_json::Value;
 use tauri::{AppHandle, Manager};
 use uuid::Uuid;
 
@@ -16,17 +20,162 @@ use super::storage::{
 };
 use super::types::{
     AllSessionsEntry, AllSessionsResponse, Backend, ChatMessage, ClaudeContext, EffortLevel,
-    LabelData, MessageRole, RunStatus, Session, SessionDigest, ThinkingLevel, WorktreeIndex,
-    WorktreeSessions,
+    LabelData, MessageRole, RunStatus, Session, ThinkingLevel, WorktreeIndex, WorktreeSessions,
 };
 use crate::claude_cli::resolve_cli_binary;
 use crate::http_server::EmitExt;
-use crate::platform::silent_command;
 use crate::projects::github_issues::{
     add_issue_reference, add_pr_reference, get_session_issue_refs, get_session_pr_refs,
 };
 use crate::projects::storage::load_projects_data;
 use crate::projects::types::SessionType;
+
+const QUEUE_DEFAULT_ALLOWED_TOOLS: [&str; 4] = ["Bash(git:*)", "Read", "Glob", "Grep"];
+const IMAGE_ONLY_DEFAULT_PROMPT: &str = "Please check this image and tell me what is wrong.";
+const TEXT_ONLY_DEFAULT_PROMPT: &str = "Please check the attached text as reference.";
+const CODEX_DEFAULT_NOT_PLAN_MODE_PROMPT: &str = "\
+## Not Plan Mode
+
+- **VERY IMPORTANT: Keep Code Simple**: Do not over-engineer. Always implement the simplest maintainable solution. Avoid extra abstractions, frameworks, configuration, or future-proofing unless clearly required.
+- **Clickable References**: When output mentions issues, PRs, security advisories/alerts, Linear issues, or other external resources, include clickable links when available so users can open them directly.
+- After each finished task, please write a few bullet points on how to test the changes.
+- When multiple independent operations are needed, batch them into parallel tool calls. Launch independent Task subagents simultaneously rather than sequentially.
+- When specifying subagent_type for Task tool calls, always use the fully qualified name exactly as listed in the system prompt (e.g., \"code-simplifier:code-simplifier\", not just \"code-simplifier\"). If the agent type contains a colon, include the full namespace:name string.
+
+## Jean Worktree Policy
+
+- Do NOT create git worktrees manually (`git worktree add`, Superpowers `using-git-worktrees`, or similar) unless the user explicitly asks for a new worktree.
+- If a new worktree is explicitly required, use Jean's worktree features through Jean MCP/tools, not raw git worktree commands.
+- If already in a Jean worktree or base/main workspace, continue in the current workspace.";
+const CODEX_DEFAULT_PLAN_MODE_PROMPT: &str = "\
+## Plan Mode
+
+- You are in PLAN MODE. Do not implement yet.
+- Inspect the project as needed, then present the plan with the native Codex plan tool (`update_plan` / `CodexPlan`) so Jean can show the approval UI.
+- Every plan-mode response that contains or revises a plan must use `update_plan` / `CodexPlan`; do not provide a plain-text-only plan.
+- If questions block the plan, prefer Codex `request_user_input`; after the user answers, call `update_plan` / `CodexPlan` again with the revised plan.
+- Do not call implementation tools or make file changes until the user approves the plan.";
+const DEFAULT_PARALLEL_EXECUTION_PROMPT: &str = r#"In plan mode, structure plans so subagents can work simultaneously. In build/execute mode, use subagents in parallel for faster implementation.
+
+When launching multiple Task subagents, prefer sending them in a single message rather than sequentially. Group independent work items (e.g., editing separate files, researching unrelated questions) into parallel Task calls. Only sequence Tasks when one depends on another's output.
+
+Instruct each sub-agent to briefly outline its approach before implementing, so it can course-correct early without formal plan mode overhead.
+
+When specifying subagent_type for Task tool calls, always use the fully qualified name exactly as listed in the system prompt (e.g., "code-simplifier:code-simplifier", not just "code-simplifier"). If the agent type contains a colon, include the full namespace:name string."#;
+
+/// Sessions currently being drained by the backend queue processor.
+///
+/// The persisted queue is still the source of truth; this in-memory guard only
+/// prevents this process from spawning two backend drain loops for one session.
+static BACKEND_QUEUE_DRAINING: Lazy<Mutex<HashSet<String>>> =
+    Lazy::new(|| Mutex::new(HashSet::new()));
+
+/// Sessions with a `send_chat_message` call currently in flight.
+///
+/// The registry-based "actively managed" guard only catches duplicates after a
+/// process/turn is registered, leaving a window where two concurrent sends
+/// (frontend queue processor vs backend queue drain vs another client) both
+/// pass the check and spawn duplicate runs. This claim is taken atomically at
+/// `send_chat_message` entry and held for the whole call.
+static ACTIVE_SENDS: Lazy<Mutex<HashSet<String>>> = Lazy::new(|| Mutex::new(HashSet::new()));
+
+/// RAII claim on a session's send slot — released on drop (any return path).
+struct SendClaim(String);
+
+impl SendClaim {
+    fn try_acquire(session_id: &str) -> Option<Self> {
+        let mut active = ACTIVE_SENDS.lock().unwrap();
+        if active.insert(session_id.to_string()) {
+            Some(Self(session_id.to_string()))
+        } else {
+            None
+        }
+    }
+}
+
+impl Drop for SendClaim {
+    fn drop(&mut self) {
+        ACTIVE_SENDS.lock().unwrap().remove(&self.0);
+    }
+}
+
+fn should_forward_cancel_request(session_id: &str) -> bool {
+    ACTIVE_SENDS.lock().unwrap().contains(session_id)
+        || super::registry::is_session_actively_managed(session_id)
+}
+
+fn clear_stale_pending_cancel_before_send(session_id: &str) {
+    let has_active_send = ACTIVE_SENDS.lock().unwrap().contains(session_id);
+    if !has_active_send
+        && !super::registry::is_session_actively_managed(session_id)
+        && super::registry::clear_pending_cancel(session_id)
+    {
+        log::warn!("Cleared stale pending cancel before fresh send: {session_id}");
+    }
+}
+
+fn codex_execution_mode_instruction(execution_mode: Option<&str>) -> Option<&'static str> {
+    match execution_mode.unwrap_or("plan") {
+        "build" => Some(
+            "You are in BUILD MODE. Start implementing immediately. \
+             This current BUILD MODE instruction supersedes any earlier plan-mode \
+             instructions remembered from conversation history; treat the approved plan \
+             as authorization to implement now. \
+             Do NOT call update_plan/emit CodexPlan unless the user explicitly asks \
+             for a new plan. If a required decision is missing, use request_user_input \
+             instead of switching back to plan mode.",
+        ),
+        "yolo" => Some(
+            "You are in YOLO EXECUTION MODE. Start implementing immediately. \
+             This current YOLO EXECUTION MODE instruction supersedes any earlier plan-mode \
+             instructions remembered from conversation history; treat the approved plan \
+             as authorization to implement now. \
+             Do NOT call update_plan/emit CodexPlan unless the user explicitly asks \
+             for a new plan. Do not ask for confirmation before routine implementation steps. \
+             If a required decision is missing, use request_user_input instead of \
+             switching back to plan mode.",
+        ),
+        _ => None,
+    }
+}
+
+fn codex_default_global_system_prompt(execution_mode: Option<&str>) -> String {
+    match execution_mode.unwrap_or("plan") {
+        "build" | "yolo" => CODEX_DEFAULT_NOT_PLAN_MODE_PROMPT.to_string(),
+        _ => CODEX_DEFAULT_PLAN_MODE_PROMPT.to_string(),
+    }
+}
+
+fn is_codex_default_global_system_prompt(prompt: &str) -> bool {
+    let trimmed = prompt.trim();
+    if trimmed.is_empty() {
+        return true;
+    }
+
+    trimmed == crate::default_global_system_prompt().trim()
+        || trimmed == CODEX_DEFAULT_PLAN_MODE_PROMPT.trim()
+        || trimmed == CODEX_DEFAULT_NOT_PLAN_MODE_PROMPT.trim()
+        || (trimmed.contains("### 1. Plan Mode Default")
+            && trimmed.contains("Every Codex plan-mode response")
+            && trimmed.contains("Jean Worktree Policy"))
+}
+
+fn resolve_codex_global_system_prompt(
+    preferences_prompt: Option<&str>,
+    execution_mode: Option<&str>,
+) -> String {
+    preferences_prompt
+        .map(str::trim)
+        .filter(|prompt| !is_codex_default_global_system_prompt(prompt))
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| codex_default_global_system_prompt(execution_mode))
+}
+
+fn append_codex_execution_mode_instruction(parts: &mut Vec<String>, execution_mode: Option<&str>) {
+    if let Some(mode_instruction) = codex_execution_mode_instruction(execution_mode) {
+        parts.push(mode_instruction.to_string());
+    }
+}
 
 /// Resolve the default backend from preferences + project settings (sync).
 /// Falls back to Claude if preferences can't be loaded.
@@ -43,6 +192,9 @@ pub(crate) fn resolve_default_backend(app: &AppHandle, worktree_id: Option<&str>
         "codex" => Backend::Codex,
         "opencode" => Backend::Opencode,
         "cursor" => Backend::Cursor,
+        "pi" => Backend::Pi,
+        "commandcode" => Backend::Commandcode,
+        "grok" => Backend::Grok,
         _ => Backend::Claude,
     };
 
@@ -61,6 +213,9 @@ pub(crate) fn resolve_default_backend(app: &AppHandle, worktree_id: Option<&str>
                         "codex" => Backend::Codex,
                         "opencode" => Backend::Opencode,
                         "cursor" => Backend::Cursor,
+                        "pi" => Backend::Pi,
+                        "commandcode" => Backend::Commandcode,
+                        "grok" => Backend::Grok,
                         "claude" => Backend::Claude,
                         _ => resolved,
                     };
@@ -83,12 +238,77 @@ pub(crate) fn resolve_magic_prompt_backend(
         match b {
             "opencode" => return Backend::Opencode,
             "cursor" => return Backend::Cursor,
+            "pi" => return Backend::Pi,
+            "commandcode" => return Backend::Commandcode,
+            "grok" => return Backend::Grok,
             "codex" => return Backend::Codex,
             "claude" => return Backend::Claude,
             _ => {}
         }
     }
     resolve_default_backend(app, worktree_id)
+}
+
+fn infer_backend_from_model(model: &str, fallback: Backend) -> Backend {
+    if crate::is_cursor_model(model) {
+        Backend::Cursor
+    } else if crate::is_pi_model(model) {
+        Backend::Pi
+    } else if crate::is_opencode_model(model) {
+        Backend::Opencode
+    } else if model.starts_with("commandcode/") {
+        Backend::Commandcode
+    } else if crate::is_grok_model(model) {
+        Backend::Grok
+    } else if crate::is_codex_model(model) {
+        Backend::Codex
+    } else {
+        fallback
+    }
+}
+
+fn resume_id_for_persisted_claude_run<'a>(
+    backend: &Backend,
+    resume_id: &'a str,
+    has_assistant_payload: bool,
+) -> Option<&'a str> {
+    if *backend == Backend::Claude && !resume_id.is_empty() && has_assistant_payload {
+        Some(resume_id)
+    } else {
+        None
+    }
+}
+
+fn should_clear_stale_resumed_claude_session(
+    was_resuming: bool,
+    has_content: bool,
+    has_tool_calls: bool,
+    has_content_blocks: bool,
+    has_usage: bool,
+    _was_cancelled: bool,
+) -> bool {
+    was_resuming && !has_content && !has_tool_calls && !has_content_blocks && !has_usage
+}
+
+fn default_model_for_backend(
+    backend: &Backend,
+    preferences: &crate::AppPreferences,
+) -> Option<String> {
+    let model = match backend {
+        Backend::Codex => &preferences.selected_codex_model,
+        Backend::Opencode => &preferences.selected_opencode_model,
+        Backend::Cursor => &preferences.selected_cursor_model,
+        Backend::Pi => &preferences.selected_pi_model,
+        Backend::Commandcode => &preferences.selected_commandcode_model,
+        Backend::Grok => &preferences.selected_grok_model,
+        Backend::Claude => &preferences.selected_model,
+    };
+
+    if model.trim().is_empty() {
+        None
+    } else {
+        Some(model.clone())
+    }
 }
 
 /// Get current Unix timestamp in seconds
@@ -161,17 +381,7 @@ pub async fn get_sessions(
                 let count: u32 = metadata
                     .runs
                     .iter()
-                    .map(|run| {
-                        let is_undo_send = run.status == RunStatus::Cancelled
-                            && run.assistant_message_id.is_none();
-                        if is_undo_send {
-                            0
-                        } else if run.assistant_message_id.is_some() {
-                            2 // user + assistant
-                        } else {
-                            1 // just user (still running or cancelled without response)
-                        }
-                    })
+                    .map(super::types::RunEntry::rendered_message_count)
                     .sum();
                 session.message_count = Some(count);
             }
@@ -229,6 +439,94 @@ pub async fn get_sessions(
     }
 
     Ok(sessions)
+}
+
+/// List lightweight session summaries for a worktree without loading message history.
+#[tauri::command]
+pub async fn list_sessions_summary(
+    app: AppHandle,
+    worktree_id: String,
+    worktree_path: String,
+    include_archived: Option<bool>,
+) -> Result<serde_json::Value, String> {
+    let sessions = load_sessions(&app, &worktree_path, &worktree_id)?;
+    let include_archived = include_archived.unwrap_or(false);
+    let session_summaries: Vec<serde_json::Value> = sessions
+        .sessions
+        .into_iter()
+        .filter(|session| include_archived || session.archived_at.is_none())
+        .map(|session| {
+            serde_json::json!({
+                "id": session.id,
+                "name": session.name,
+                "order": session.order,
+                "backend": session.backend,
+                "selectedModel": session.selected_model,
+                "selectedProvider": session.selected_provider,
+                "selectedExecutionMode": session.selected_execution_mode,
+                "createdAt": session.created_at,
+                "updatedAt": session.updated_at,
+                "lastMessageAt": session.last_message_at,
+                "messageCount": session.message_count,
+                "archivedAt": session.archived_at,
+                "lastRunStatus": session.last_run_status,
+                "lastRunStartedAt": session.last_run_started_at,
+                "waitingForInput": session.waiting_for_input,
+                "waitingForInputType": session.waiting_for_input_type,
+            })
+        })
+        .collect();
+
+    Ok(serde_json::json!({
+        "worktreeId": worktree_id,
+        "activeSessionId": sessions.active_session_id,
+        "sessions": session_summaries,
+    }))
+}
+
+/// Get the latest run/session status for polling background work.
+#[tauri::command]
+pub async fn get_session_status(
+    app: AppHandle,
+    session_id: String,
+) -> Result<serde_json::Value, String> {
+    let metadata = load_metadata(&app, &session_id)?
+        .ok_or_else(|| format!("Unknown sessionId: {session_id}"))?;
+    let latest_run = metadata.runs.last();
+    let actively_managed = crate::chat::registry::is_session_actively_managed(&session_id);
+    let status = if actively_managed {
+        "running"
+    } else {
+        match latest_run.map(|run| &run.status) {
+            Some(RunStatus::Running) | Some(RunStatus::Resumable) => "resumable",
+            Some(RunStatus::Cancelled) => "cancelled",
+            Some(RunStatus::Crashed) => "error",
+            Some(RunStatus::Completed) | None => "idle",
+        }
+    };
+
+    Ok(serde_json::json!({
+        "sessionId": session_id,
+        "worktreeId": metadata.worktree_id,
+        "status": status,
+        "activelyManaged": actively_managed,
+        "backend": metadata.backend,
+        "selectedModel": metadata.selected_model,
+        "selectedProvider": metadata.selected_provider,
+        "selectedExecutionMode": metadata.selected_execution_mode,
+        "waitingForInput": metadata.waiting_for_input,
+        "waitingForInputType": metadata.waiting_for_input_type,
+        "latestRun": latest_run.map(|run| serde_json::json!({
+            "runId": run.run_id,
+            "status": run.status,
+            "startedAt": run.started_at,
+            "endedAt": run.ended_at,
+            "model": run.model,
+            "executionMode": run.execution_mode,
+            "cancelled": run.cancelled,
+            "recovered": run.recovered,
+        })),
+    }))
 }
 
 /// List all sessions across all worktrees and projects
@@ -366,25 +664,44 @@ pub async fn create_session(
     worktree_path: String,
     name: Option<String>,
     backend: Option<String>,
+    primary_surface: Option<String>,
+    terminal_command: Option<String>,
+    terminal_command_args: Option<Vec<String>>,
+    terminal_label: Option<String>,
+    native_session_id: Option<String>,
 ) -> Result<Session, String> {
     log::trace!("Creating new session for worktree: {worktree_id}");
+    if native_session_id.is_some() && primary_surface.as_deref() != Some("terminal") {
+        return Err("Native session IDs are only valid for terminal sessions".to_string());
+    }
+
+    let preferences = crate::load_preferences(app.clone()).await.ok();
 
     // Resolve backend: explicit param → project default → global preference → Claude
     let backend_enum = match backend.as_deref() {
         Some("codex") => Backend::Codex,
         Some("opencode") => Backend::Opencode,
         Some("cursor") => Backend::Cursor,
+        Some("pi") => Backend::Pi,
+        Some("commandcode") => Backend::Commandcode,
+        Some("grok") => Backend::Grok,
         Some("claude") => Backend::Claude,
         _ => {
             // No explicit backend — check project default, then global preference
             let mut resolved = Backend::Claude;
-            if let Ok(prefs) = crate::load_preferences(app.clone()).await {
+            if let Some(prefs) = preferences.as_ref() {
                 if prefs.default_backend == "codex" {
                     resolved = Backend::Codex;
                 } else if prefs.default_backend == "opencode" {
                     resolved = Backend::Opencode;
                 } else if prefs.default_backend == "cursor" {
                     resolved = Backend::Cursor;
+                } else if prefs.default_backend == "pi" {
+                    resolved = Backend::Pi;
+                } else if prefs.default_backend == "commandcode" {
+                    resolved = Backend::Commandcode;
+                } else if prefs.default_backend == "grok" {
+                    resolved = Backend::Grok;
                 }
             }
             // Check project-level override
@@ -403,6 +720,9 @@ pub async fn create_session(
                             "codex" => Backend::Codex,
                             "opencode" => Backend::Opencode,
                             "cursor" => Backend::Cursor,
+                            "pi" => Backend::Pi,
+                            "commandcode" => Backend::Commandcode,
+                            "grok" => Backend::Grok,
                             "claude" => Backend::Claude,
                             _ => resolved,
                         };
@@ -418,11 +738,23 @@ pub async fn create_session(
         let session_number = sessions.next_session_number();
         let session_name = name.unwrap_or_else(|| format!("Session {session_number}"));
 
-        let session = Session::new(
+        let mut session = Session::new(
             session_name,
             sessions.sessions.len() as u32,
             backend_enum.clone(),
         );
+        session.primary_surface = primary_surface.clone();
+        session.terminal_command = terminal_command.clone();
+        session.terminal_command_args = terminal_command_args.clone().unwrap_or_default();
+        session.terminal_label = terminal_label.clone();
+        if let Some(native_session_id) = native_session_id.as_deref() {
+            persist_salvaged_resume_id(&mut session, &backend_enum, native_session_id);
+        }
+        if primary_surface.as_deref() != Some("terminal") {
+            session.selected_model = preferences
+                .as_ref()
+                .and_then(|prefs| default_model_for_backend(&backend_enum, prefs));
+        }
         let session_id = session.id.clone();
 
         sessions.sessions.push(session.clone());
@@ -457,6 +789,513 @@ pub async fn create_session(
 
     emit_sessions_cache_invalidation(&app);
     Ok(session)
+}
+
+fn trigger_backend_queue_drain(
+    app: AppHandle,
+    worktree_id: String,
+    worktree_path: String,
+    session_id: String,
+) {
+    {
+        let mut draining = BACKEND_QUEUE_DRAINING.lock().unwrap();
+        if !draining.insert(session_id.clone()) {
+            log::trace!("[QueueDrain] already draining session={session_id}");
+            return;
+        }
+    }
+
+    tauri::async_runtime::spawn(async move {
+        drain_backend_queue(app, worktree_id, worktree_path, session_id.clone()).await;
+        BACKEND_QUEUE_DRAINING.lock().unwrap().remove(&session_id);
+    });
+}
+
+async fn drain_backend_queue(
+    app: AppHandle,
+    worktree_id: String,
+    worktree_path: String,
+    session_id: String,
+) {
+    loop {
+        if super::registry::is_session_actively_managed(&session_id) {
+            // A Codex turn may be running — steer queued messages into it
+            // instead of waiting for the run to finish (preference-gated).
+            drain_queue_into_codex_turn(&app, &worktree_id, &session_id).await;
+            drain_queue_into_opencode_turn(&app, &worktree_id, &worktree_path, &session_id).await;
+            drain_queue_into_pi_turn(&app, &worktree_id, &session_id).await;
+            log::trace!("[QueueDrain] session active, stop session={session_id}");
+            return;
+        }
+
+        let dequeue_result = with_existing_metadata_mut(&app, &session_id, |metadata| {
+            if metadata.waiting_for_input {
+                return (None, metadata.queued_messages.clone(), true);
+            }
+
+            let dequeued = if metadata.queued_messages.is_empty() {
+                None
+            } else {
+                Some(metadata.queued_messages.remove(0))
+            };
+            (dequeued, metadata.queued_messages.clone(), false)
+        });
+
+        let (queued, remaining_queue, waiting_for_input) = match dequeue_result {
+            Ok(result) => result,
+            Err(e) => {
+                log::warn!("[QueueDrain] failed to read queue session={session_id}: {e}");
+                return;
+            }
+        };
+
+        if waiting_for_input {
+            log::trace!("[QueueDrain] session waiting for input, stop session={session_id}");
+            return;
+        }
+
+        let Some(queued) = queued else {
+            log::trace!("[QueueDrain] queue empty session={session_id}");
+            return;
+        };
+
+        app.emit_all(
+            "queue:updated",
+            &serde_json::json!({ "sessionId": session_id, "queue": remaining_queue }),
+        )
+        .ok();
+
+        let queued_id = queued
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or("<unknown>")
+            .to_string();
+
+        let request = match queued_message_to_send_request(&app, &queued).await {
+            Ok(request) => request,
+            Err(e) => {
+                log::error!(
+                    "[QueueDrain] dropping malformed queued message session={session_id} message_id={queued_id}: {e}"
+                );
+                continue;
+            }
+        };
+
+        log::info!(
+            "[QueueDrain] processing queued message session={session_id} message_id={queued_id}"
+        );
+
+        if let Err(e) = send_chat_message(
+            app.clone(),
+            session_id.clone(),
+            worktree_id.clone(),
+            worktree_path.clone(),
+            request.message,
+            request.model,
+            request.execution_mode,
+            request.thinking_level,
+            request.effort_level,
+            request.parallel_execution_prompt,
+            request.ai_language,
+            request.allowed_tools,
+            request.mcp_config,
+            request.chrome_enabled,
+            request.custom_profile_name,
+            request.backend,
+        )
+        .await
+        {
+            // Lost a send race against another consumer (frontend queue
+            // processor or another client). Re-insert at the queue front so
+            // the message is NOT lost — the active run's completion re-triggers
+            // the drain and retries it.
+            if e.contains("already has an active request") {
+                log::warn!(
+                    "[QueueDrain] send race lost, requeueing at front session={session_id} message_id={queued_id}"
+                );
+                let requeued = with_existing_metadata_mut(&app, &session_id, |metadata| {
+                    metadata.queued_messages.insert(0, queued.clone());
+                    metadata.queued_messages.clone()
+                });
+                if let Ok(queue) = requeued {
+                    app.emit_all(
+                        "queue:updated",
+                        &serde_json::json!({ "sessionId": session_id, "queue": queue }),
+                    )
+                    .ok();
+                }
+                return;
+            }
+            log::error!(
+                "[QueueDrain] queued message failed session={session_id} message_id={queued_id}: {e}"
+            );
+        }
+    }
+}
+
+struct QueuedSendRequest {
+    message: String,
+    model: Option<String>,
+    execution_mode: Option<String>,
+    thinking_level: Option<ThinkingLevel>,
+    effort_level: Option<EffortLevel>,
+    parallel_execution_prompt: Option<String>,
+    ai_language: Option<String>,
+    allowed_tools: Option<Vec<String>>,
+    mcp_config: Option<String>,
+    chrome_enabled: Option<bool>,
+    custom_profile_name: Option<String>,
+    backend: Option<String>,
+}
+
+async fn queued_message_to_send_request(
+    app: &AppHandle,
+    queued: &Value,
+) -> Result<QueuedSendRequest, String> {
+    let message = build_queued_message_with_refs(queued)?;
+    if message.trim().is_empty() {
+        return Err("queued message is empty".to_string());
+    }
+
+    let model = json_string(queued, "model");
+    let provider = json_string(queued, "provider");
+
+    let thinking_level = match queued.get("thinkingLevel") {
+        Some(value) if !value.is_null() => Some(
+            serde_json::from_value::<ThinkingLevel>(value.clone())
+                .map_err(|e| format!("invalid thinkingLevel: {e}"))?,
+        ),
+        _ => None,
+    };
+    let effort_level = match queued.get("effortLevel") {
+        Some(value) if !value.is_null() => Some(
+            serde_json::from_value::<EffortLevel>(value.clone())
+                .map_err(|e| format!("invalid effortLevel: {e}"))?,
+        ),
+        _ => None,
+    };
+
+    let prefs = crate::load_preferences(app.clone()).await.ok();
+    let custom_profile_name = provider.filter(|provider| {
+        provider != "__anthropic__"
+            && prefs.as_ref().is_some_and(|p| {
+                p.custom_cli_profiles
+                    .iter()
+                    .any(|profile| profile.name == *provider)
+            })
+    });
+    let parallel_execution_prompt = prefs.as_ref().and_then(|p| {
+        if p.parallel_execution_prompt_enabled {
+            Some(
+                p.magic_prompts
+                    .parallel_execution
+                    .clone()
+                    .unwrap_or_else(|| DEFAULT_PARALLEL_EXECUTION_PROMPT.to_string()),
+            )
+        } else {
+            None
+        }
+    });
+    let ai_language = prefs
+        .as_ref()
+        .map(|p| p.ai_language.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let chrome_enabled = prefs.as_ref().map(|p| p.chrome_enabled);
+
+    let mut allowed_tools: Vec<String> = QUEUE_DEFAULT_ALLOWED_TOOLS
+        .iter()
+        .map(|tool| (*tool).to_string())
+        .collect();
+    if let Some(command_tools) = queued.get("commandAllowedTools").and_then(Value::as_array) {
+        for tool in command_tools.iter().filter_map(Value::as_str) {
+            if !allowed_tools.iter().any(|existing| existing == tool) {
+                allowed_tools.push(tool.to_string());
+            }
+        }
+    }
+
+    Ok(QueuedSendRequest {
+        message,
+        model,
+        execution_mode: json_string(queued, "executionMode"),
+        thinking_level,
+        effort_level,
+        parallel_execution_prompt,
+        ai_language,
+        allowed_tools: Some(allowed_tools),
+        mcp_config: json_string(queued, "mcpConfig"),
+        chrome_enabled,
+        custom_profile_name,
+        backend: json_string(queued, "backend"),
+    })
+}
+
+fn json_string(value: &Value, key: &str) -> Option<String> {
+    value
+        .get(key)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToString::to_string)
+}
+
+fn build_queued_message_with_refs(queued: &Value) -> Result<String, String> {
+    let mut message = queued
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+
+    let pending_files = queued
+        .get("pendingFiles")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    if !pending_files.is_empty() {
+        let refs = pending_files
+            .iter()
+            .map(|file| {
+                let path = queued_file_path(file)?;
+                let is_directory = file
+                    .get("isDirectory")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                Ok(if is_directory {
+                    format!(
+                        "[Directory: {path} - Use Glob and Read tools to explore this directory]"
+                    )
+                } else {
+                    format!("[File: {path} - Use the Read tool to view this file]")
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()?
+            .join("\n");
+        message = append_refs(message, refs);
+    }
+
+    let pending_skills = queued
+        .get("pendingSkills")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    if !pending_skills.is_empty() {
+        let refs = pending_skills
+            .iter()
+            .map(|skill| {
+                let path = skill
+                    .get("path")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| "pendingSkills item missing path".to_string())?;
+                Ok(format!(
+                    "[Skill: {path} - Read and use this skill to guide your response]"
+                ))
+            })
+            .collect::<Result<Vec<_>, String>>()?
+            .join("\n");
+        message = append_refs(message, refs);
+    }
+
+    let pending_images = queued
+        .get("pendingImages")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    if !pending_images.is_empty() {
+        if message.is_empty() {
+            message = IMAGE_ONLY_DEFAULT_PROMPT.to_string();
+        }
+        let refs = pending_images
+            .iter()
+            .map(|image| {
+                let path = image
+                    .get("path")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| "pendingImages item missing path".to_string())?;
+                Ok(format!(
+                    "[Image attached: {path} - Use the Read tool to view this image]"
+                ))
+            })
+            .collect::<Result<Vec<_>, String>>()?
+            .join("\n");
+        message = append_refs(message, refs);
+    }
+
+    let pending_text_files = queued
+        .get("pendingTextFiles")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    if !pending_text_files.is_empty() {
+        if message.is_empty() {
+            message = TEXT_ONLY_DEFAULT_PROMPT.to_string();
+        }
+        let refs = pending_text_files
+            .iter()
+            .map(|text_file| {
+                let path = text_file
+                    .get("path")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| "pendingTextFiles item missing path".to_string())?;
+                Ok(format!(
+                    "[Text file attached: {path} - Use the Read tool to view this file]"
+                ))
+            })
+            .collect::<Result<Vec<_>, String>>()?
+            .join("\n");
+        message = append_refs(message, refs);
+    }
+
+    Ok(message)
+}
+
+fn queued_file_path(file: &Value) -> Result<String, String> {
+    let relative_path = file
+        .get("relativePath")
+        .and_then(Value::as_str)
+        .or_else(|| file.get("path").and_then(Value::as_str))
+        .ok_or_else(|| "pendingFiles item missing relativePath/path".to_string())?;
+    if let Some(root) = file.get("sourceRootPath").and_then(Value::as_str) {
+        Ok(format!(
+            "{}/{}",
+            root.trim_end_matches('/'),
+            relative_path.trim_start_matches('/')
+        ))
+    } else {
+        Ok(relative_path.to_string())
+    }
+}
+
+fn queued_message_base_prompt(queued: &Value) -> String {
+    let mut message = queued
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    if message.is_empty()
+        && queued
+            .get("pendingImages")
+            .and_then(Value::as_array)
+            .is_some_and(|images| !images.is_empty())
+    {
+        message = IMAGE_ONLY_DEFAULT_PROMPT.to_string();
+    }
+    if message.is_empty()
+        && queued
+            .get("pendingTextFiles")
+            .and_then(Value::as_array)
+            .is_some_and(|files| !files.is_empty())
+    {
+        message = TEXT_ONLY_DEFAULT_PROMPT.to_string();
+    }
+    message
+}
+
+fn codex_steer_input_from_queued_message(queued: &Value) -> Result<Vec<Value>, String> {
+    let mut input = Vec::new();
+    let message = queued_message_base_prompt(queued);
+    if !message.trim().is_empty() {
+        input.push(serde_json::json!({
+            "type": "text",
+            "text": message,
+            "text_elements": [],
+        }));
+    }
+
+    for file in queued
+        .get("pendingFiles")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or(&[])
+    {
+        let path = queued_file_path(file)?;
+        let name = file
+            .get("relativePath")
+            .and_then(Value::as_str)
+            .or_else(|| file.get("path").and_then(Value::as_str))
+            .and_then(|path| path.rsplit('/').next())
+            .filter(|name| !name.is_empty())
+            .unwrap_or(&path);
+        input.push(serde_json::json!({
+            "type": "mention",
+            "name": name,
+            "path": path,
+        }));
+    }
+
+    for skill in queued
+        .get("pendingSkills")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or(&[])
+    {
+        let path = skill
+            .get("path")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "pendingSkills item missing path".to_string())?;
+        let name = skill
+            .get("name")
+            .and_then(Value::as_str)
+            .filter(|name| !name.is_empty())
+            .or_else(|| path.rsplit('/').next())
+            .unwrap_or("skill");
+        input.push(serde_json::json!({
+            "type": "skill",
+            "name": name,
+            "path": path,
+        }));
+    }
+
+    for image in queued
+        .get("pendingImages")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or(&[])
+    {
+        let path = image
+            .get("path")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "pendingImages item missing path".to_string())?;
+        input.push(serde_json::json!({
+            "type": "localImage",
+            "path": path,
+        }));
+    }
+
+    for text_file in queued
+        .get("pendingTextFiles")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or(&[])
+    {
+        let path = text_file
+            .get("path")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "pendingTextFiles item missing path".to_string())?;
+        let name = text_file
+            .get("filename")
+            .and_then(Value::as_str)
+            .filter(|name| !name.is_empty())
+            .or_else(|| path.rsplit('/').next())
+            .unwrap_or("attachment.txt");
+        input.push(serde_json::json!({
+            "type": "mention",
+            "name": name,
+            "path": path,
+        }));
+    }
+
+    if input.is_empty() {
+        return Err("queued message is empty".to_string());
+    }
+    Ok(input)
+}
+
+fn append_refs(message: String, refs: String) -> String {
+    if message.is_empty() {
+        refs
+    } else {
+        format!("{message}\n\n{refs}")
+    }
 }
 
 /// Rename a session tab
@@ -684,6 +1523,49 @@ fn delete_pasted_file(path: &str) {
             log::trace!("Deleted pasted file: {path}");
         }
     }
+}
+
+fn plan_mode_content_waits_for_approval(
+    backend: &Backend,
+    execution_mode: Option<&str>,
+    has_content: bool,
+    has_plan_tool: bool,
+) -> bool {
+    matches!(backend, Backend::Codex | Backend::Opencode | Backend::Grok)
+        && execution_mode == Some("plan")
+        && has_content
+        && !has_plan_tool
+}
+
+fn queued_prompt_skips_plan_wait(
+    has_queued_messages: bool,
+    has_question_tool: bool,
+    has_plan_wait: bool,
+) -> bool {
+    has_queued_messages && has_plan_wait && !has_question_tool
+}
+
+fn is_unavailable_tool_error(output: Option<&str>) -> bool {
+    output.is_some_and(|text| {
+        text.contains("No such tool available") || text.contains("not enabled in this context")
+    })
+}
+
+fn is_pending_blocking_tool_call(tc: &crate::chat::types::ToolCall) -> bool {
+    matches!(
+        tc.name.as_str(),
+        "AskUserQuestion" | "ExitPlanMode" | "CodexPlan" | "question"
+    ) && !is_unavailable_tool_error(tc.output.as_deref())
+}
+
+fn is_pending_question_tool_call(tc: &crate::chat::types::ToolCall) -> bool {
+    matches!(tc.name.as_str(), "AskUserQuestion" | "question")
+        && !is_unavailable_tool_error(tc.output.as_deref())
+}
+
+fn is_pending_plan_tool_call(tc: &crate::chat::types::ToolCall) -> bool {
+    matches!(tc.name.as_str(), "ExitPlanMode" | "CodexPlan")
+        && !is_unavailable_tool_error(tc.output.as_deref())
 }
 
 /// Close/delete a session tab
@@ -1042,6 +1924,8 @@ pub async fn restore_session_with_base(
         pr_push_remote: None,
         pr_push_branch: None,
         order: 0,
+        origin: None,
+        labels: Vec::new(),
         label: None,
         archived_at: None,
         last_opened_at: None,
@@ -1302,14 +2186,11 @@ pub async fn set_active_session(
 }
 
 /// Update the last_opened_at timestamp on a session's metadata.
-/// For non-Claude sessions that are waiting for input, also transition to review
-/// (viewing the session acts as acknowledgment).
-/// Returns true if the session was transitioned from waiting to review.
+/// View-only: never mutates waiting/review state — explicit user actions
+/// (approve/reject/answer) are the only path out of waiting.
 #[tauri::command]
-pub async fn set_session_last_opened(app: AppHandle, session_id: String) -> Result<bool, String> {
+pub async fn set_session_last_opened(app: AppHandle, session_id: String) -> Result<(), String> {
     log::trace!("Setting last_opened_at for session: {session_id}");
-
-    let mut transitioned = false;
 
     if let Ok(Some(mut metadata)) = load_metadata(&app, &session_id) {
         let now = SystemTime::now()
@@ -1317,29 +2198,10 @@ pub async fn set_session_last_opened(app: AppHandle, session_id: String) -> Resu
             .unwrap_or_default()
             .as_secs();
         metadata.last_opened_at = Some(now);
-
-        // Auto-transition plan-waiting non-Claude sessions to review.
-        // Question-waiting sessions must NOT be auto-transitioned (user must answer).
-        if metadata.waiting_for_input
-            && metadata.waiting_for_input_type.as_deref() == Some("plan")
-            && metadata.backend != super::types::Backend::Claude
-        {
-            metadata.waiting_for_input = false;
-            metadata.waiting_for_input_type = None;
-            metadata.is_reviewing = true;
-            metadata.pending_plan_message_id = None;
-            transitioned = true;
-            log::debug!("Auto-transitioned session {session_id} from waiting to review");
-        }
-
         save_metadata(&app, &metadata)?;
-
-        if transitioned {
-            emit_sessions_cache_invalidation(&app);
-        }
     }
 
-    Ok(transitioned)
+    Ok(())
 }
 
 /// Bulk-update last_opened_at for multiple sessions in a single call.
@@ -1372,6 +2234,23 @@ pub async fn set_sessions_last_opened_bulk(
 // Chat Commands (now session-based)
 // ============================================================================
 
+// Persist a salvaged resume/session ID onto the correct backend field.
+// Used by the thread-error/thread-panic recovery paths so the next send can
+// resume the conversation instead of starting fresh.
+fn persist_salvaged_resume_id(session: &mut Session, backend: &Backend, sid: &str) {
+    match backend {
+        Backend::Claude => session.claude_session_id = Some(sid.to_string()),
+        Backend::Codex => session.codex_thread_id = Some(sid.to_string()),
+        Backend::Opencode => session.opencode_session_id = Some(sid.to_string()),
+        Backend::Cursor => session.cursor_chat_id = Some(sid.to_string()),
+        Backend::Pi => session.pi_session_id = Some(sid.to_string()),
+        // Command Code has no native resume id; persist a sentinel so the next
+        // run continues the worktree conversation via `-c`.
+        Backend::Commandcode => session.commandcode_session_id = Some(sid.to_string()),
+        Backend::Grok => session.grok_session_id = Some(sid.to_string()),
+    }
+}
+
 /// Send a message to Claude and get a response
 ///
 /// This command:
@@ -1382,6 +2261,7 @@ pub async fn set_sessions_last_opened_bulk(
 /// 5. Adds the assistant response
 /// 6. Saves the updated session
 /// 7. Returns the assistant message
+
 #[tauri::command]
 #[allow(clippy::too_many_arguments)]
 pub async fn send_chat_message(
@@ -1413,6 +2293,19 @@ pub async fn send_chat_message(
     if worktree_path.is_empty() {
         return Err("Worktree path cannot be empty".to_string());
     }
+
+    clear_stale_pending_cancel_before_send(&session_id);
+
+    // Guard: atomically claim the session's send slot for the duration of this
+    // call. Closes the race window where two concurrent sends (queue processor
+    // vs backend drain vs another client) both pass the registry check below
+    // before either registers a process.
+    let Some(_send_claim) = SendClaim::try_acquire(&session_id) else {
+        log::warn!(
+            "[SendChat] REJECTED session={session_id} — concurrent send in flight (duplicate send)"
+        );
+        return Err("Session already has an active request".to_string());
+    };
 
     // Guard: reject if this session already has an active process being tailed.
     // Without this, a double-send (frontend race, page reload, etc.) creates
@@ -1607,20 +2500,15 @@ pub async fn send_chat_message(
         Some("codex") => Backend::Codex,
         Some("opencode") => Backend::Opencode,
         Some("cursor") => Backend::Cursor,
+        Some("pi") => Backend::Pi,
+        Some("commandcode") => Backend::Commandcode,
+        Some("grok") => Backend::Grok,
         Some("claude") => Backend::Claude,
         _ => session_backend.clone(),
     };
     // Override backend based on model string (safety net: model always wins)
     let effective_backend = if let Some(ref m) = model {
-        if crate::is_cursor_model(m) {
-            Backend::Cursor
-        } else if crate::is_opencode_model(m) {
-            Backend::Opencode
-        } else if crate::is_codex_model(m) {
-            Backend::Codex
-        } else {
-            effective_backend
-        }
+        infer_backend_from_model(m, effective_backend)
     } else {
         effective_backend
     };
@@ -1664,19 +2552,121 @@ pub async fn send_chat_message(
     let cursor_chat_id = sessions
         .find_session(&session_id)
         .and_then(|s| s.cursor_chat_id.clone());
+    let raw_pi_session_id = sessions
+        .find_session(&session_id)
+        .and_then(|s| s.pi_session_id.clone());
+    let grok_session_id = sessions
+        .find_session(&session_id)
+        .and_then(|s| s.grok_session_id.clone());
+    // Command Code has no native resume id; a non-empty sentinel marks that a
+    // prior Command Code turn completed in this worktree, so the next run can
+    // pass `-c` (cwd-scoped continue) to resume the conversation.
+    let commandcode_session_id = sessions
+        .find_session(&session_id)
+        .and_then(|s| s.commandcode_session_id.clone());
+    let pi_session_id = raw_pi_session_id
+        .as_deref()
+        .filter(|sid| *sid != session_id)
+        .map(ToOwned::to_owned);
+    if raw_pi_session_id.as_deref() == Some(session_id.as_str()) {
+        let _ = with_sessions_mut(&app, &worktree_path, &worktree_id, |sessions| {
+            if let Some(session) = sessions.find_session_mut(&session_id) {
+                session.pi_session_id = None;
+            }
+            Ok(())
+        });
+    }
+
+    let previous_metadata = load_metadata(&app, &session_id).ok().flatten();
+    let previous_backend = previous_metadata
+        .as_ref()
+        .and_then(super::handoff::latest_completed_backend);
+    let previous_custom_profile = previous_metadata
+        .as_ref()
+        .and_then(super::handoff::latest_completed_custom_profile);
+    let backend_handoff =
+        super::handoff::should_inject_handoff(previous_backend.as_ref(), &effective_backend);
+    // Resume Command Code by its native session id, but only when this session
+    // already ran a Command Code turn and we're not handing off from a different
+    // backend (handoff injects history into the prompt instead, so resuming the
+    // old conversation would double up).
+    let commandcode_resume_id: Option<String> = commandcode_session_id
+        .clone()
+        .filter(|_| effective_backend == Backend::Commandcode && !backend_handoff);
+    let claude_profile_changed = effective_backend == Backend::Claude
+        && claude_session_id.is_some()
+        && previous_custom_profile.as_deref() != custom_profile_name.as_deref();
+    let profile_handoff = super::handoff::should_inject_claude_profile_handoff(
+        &effective_backend,
+        previous_backend.as_ref(),
+        previous_custom_profile.as_deref(),
+        custom_profile_name.as_deref(),
+    );
+    let message_for_backend = if backend_handoff || profile_handoff {
+        let history = run_log::load_session_messages_window(&app, &session_id, Some(20), None)
+            .map(|loaded| super::handoff::format_handoff_history(&loaded.messages, 30_000))
+            .unwrap_or_default();
+
+        if let Some(previous_backend) = previous_backend.as_ref().filter(|_| !history.is_empty()) {
+            let template = crate::load_preferences(app.clone())
+                .await
+                .ok()
+                .and_then(|prefs| prefs.magic_prompts.provider_switch_handoff)
+                .filter(|prompt| !prompt.trim().is_empty())
+                .unwrap_or_else(crate::default_provider_switch_handoff_prompt);
+            let handoff_prompt = if profile_handoff {
+                super::handoff::build_claude_profile_handoff_prompt(
+                    &template,
+                    previous_custom_profile.as_deref(),
+                    custom_profile_name.as_deref(),
+                    &history,
+                )
+            } else {
+                super::handoff::build_handoff_prompt(
+                    &template,
+                    previous_backend,
+                    &effective_backend,
+                    &history,
+                )
+            };
+            log::info!(
+                "[SendChat] injecting hidden provider-switch handoff session={session_id} previous={previous_backend:?} current={effective_backend:?}"
+            );
+            super::handoff::prepend_hidden_handoff(&message, &handoff_prompt)
+        } else {
+            message.clone()
+        }
+    } else {
+        message.clone()
+    };
+    let claude_session_id = if claude_profile_changed {
+        None
+    } else {
+        claude_session_id
+    };
 
     // Cursor CLI doesn't support thinking/effort levels
-    let run_thinking_level = if effective_backend == Backend::Cursor {
+    let run_thinking_level = if matches!(
+        effective_backend,
+        Backend::Cursor | Backend::Pi | Backend::Commandcode
+    ) {
         None
     } else {
         thinking_level
             .as_ref()
             .map(|t| format!("{t:?}").to_lowercase())
     };
-    let run_effort_level = if effective_backend == Backend::Cursor {
-        None
-    } else {
-        effort_level.as_ref().and_then(|e| e.effort_value())
+    let run_effort_level = match effective_backend {
+        Backend::Cursor | Backend::Commandcode => None,
+        Backend::Pi => effort_level.as_ref().map(|e| match e {
+            EffortLevel::Off => "off",
+            EffortLevel::Minimal => "minimal",
+            EffortLevel::Low => "low",
+            EffortLevel::Medium => "medium",
+            EffortLevel::High => "high",
+            EffortLevel::Xhigh | EffortLevel::Max | EffortLevel::Ultracode => "xhigh",
+        }),
+        _ => effort_level.as_ref().and_then(|e| e.effort_value()),
     };
 
     // Start NDJSON run log for crash recovery
@@ -1693,6 +2683,7 @@ pub async fn send_chat_message(
         run_thinking_level.as_deref(),
         run_effort_level,
         Some(effective_backend.clone()),
+        custom_profile_name.as_deref(),
     )?;
 
     // Get file paths for detached execution
@@ -1700,8 +2691,9 @@ pub async fn send_chat_message(
     let output_file = run_log_writer.output_file_path()?;
     let run_id = run_log_writer.run_id().to_string();
 
-    // Write input file with the user message
-    run_log::write_input_file(&app, &session_id, &run_id, &message)?;
+    // Write input file with the effective backend prompt. Hidden handoff context
+    // is intentionally not stored as the visible user message in metadata.
+    run_log::write_input_file(&app, &session_id, &run_id, &message_for_backend)?;
 
     // Use passed parameter for parallel execution prompt (None = disabled)
     let parallel_execution_prompt = parallel_execution_prompt.filter(|p| !p.trim().is_empty());
@@ -1729,6 +2721,9 @@ pub async fn send_chat_message(
                     }
                     Backend::Opencode => {}
                     Backend::Cursor => {}
+                    Backend::Pi => {}
+                    Backend::Commandcode => {}
+                    Backend::Grok => {}
                 }
             }
         }
@@ -1756,6 +2751,8 @@ pub async fn send_chat_message(
         tool_calls: Vec<super::types::ToolCall>,
         content_blocks: Vec<super::types::ContentBlock>,
         cancelled: bool,
+        /// True when the backend produced an approval-ready plan.
+        waiting_for_plan: bool,
         /// Whether a chat:error event was emitted during execution
         error_emitted: bool,
         usage: Option<super::types::UsageData>,
@@ -1776,6 +2773,9 @@ pub async fn send_chat_message(
     let thread_run_id = run_id.clone();
     let thread_opencode_session_id = opencode_session_id.clone();
     let thread_cursor_chat_id = cursor_chat_id.clone();
+    let thread_pi_session_id = pi_session_id.clone();
+    let thread_grok_session_id = grok_session_id.clone();
+    let thread_commandcode_resume_id = commandcode_resume_id.clone();
     let thread_model = model.clone();
     let thread_execution_mode = execution_mode.clone();
     let thread_thinking_level = thinking_level.clone();
@@ -1783,9 +2783,15 @@ pub async fn send_chat_message(
     let thread_allowed_tools = allowed_tools_for_cli.clone();
     let thread_parallel_prompt = parallel_execution_prompt.clone();
     let thread_ai_language = ai_language.clone();
-    let thread_mcp_config = mcp_config.clone();
+    let thread_mcp_config = if effective_backend == Backend::Claude {
+        super::jean_mcp::merge_into_mcp_config(&app, &session_id, mcp_config.as_deref())
+            .await
+            .or_else(|| mcp_config.clone())
+    } else {
+        mcp_config.clone()
+    };
     let thread_custom_profile = custom_profile_name.clone();
-    let thread_message = message.clone();
+    let thread_message = message_for_backend.clone();
     let thread_backend = effective_backend.clone();
     let thread_codex_search = codex_search_enabled;
     let thread_codex_multi_agent = codex_multi_agent_enabled;
@@ -1800,6 +2806,10 @@ pub async fn send_chat_message(
             log::info!("[SendChat] EXIT session={session_id} reason=pre_cancelled_opencode");
             if let Err(e) = run_log_writer.cancel(None, None) {
                 log::warn!("Failed to cancel run log for pre-cancelled OpenCode session: {e}");
+            }
+            // Remove the input file so the hidden handoff/history payload isn't retained on disk.
+            if let Err(e) = run_log::delete_input_file(&app, &session_id, &run_id) {
+                log::warn!("Failed to delete input file for pre-cancelled OpenCode session: {e}");
             }
             return Err("Request cancelled".to_string());
         }
@@ -1868,11 +2878,14 @@ pub async fn send_chat_message(
                         Ok((pid, response)) => {
                             log::trace!("execute_claude_detached succeeded (PID: {pid})");
 
-                            if response.content.is_empty()
-                                && response.usage.is_none()
-                                && !response.cancelled
-                                && claude_session_id_for_call.is_some()
-                            {
+                            if should_clear_stale_resumed_claude_session(
+                                claude_session_id_for_call.is_some(),
+                                !response.content.is_empty(),
+                                !response.tool_calls.is_empty(),
+                                !response.content_blocks.is_empty(),
+                                response.usage.is_some(),
+                                response.cancelled,
+                            ) {
                                 log::warn!(
                                     "Empty response while resuming session {}, clearing stale session ID",
                                     claude_session_id_for_call.as_deref().unwrap_or("")
@@ -1900,6 +2913,7 @@ pub async fn send_chat_message(
                                     tool_calls: response.tool_calls,
                                     content_blocks: response.content_blocks,
                                     cancelled: response.cancelled,
+                                    waiting_for_plan: false,
                                     error_emitted: false,
                                     usage: response.usage,
                                     backend: Backend::Claude,
@@ -1954,14 +2968,16 @@ pub async fn send_chat_message(
                 log::trace!("About to call execute_codex_via_server...");
 
                 // Map EffortLevel to Codex reasoning effort values
-                // Codex has no "max"; cap at xhigh.
+                // Codex has no "max" or "ultracode"; cap at xhigh.
                 let codex_reasoning_effort: Option<String> =
                     thread_effort_level.as_ref().and_then(|e| match e {
+                        super::types::EffortLevel::Minimal => Some("low".to_string()),
                         super::types::EffortLevel::Low => Some("low".to_string()),
                         super::types::EffortLevel::Medium => Some("medium".to_string()),
                         super::types::EffortLevel::High => Some("high".to_string()),
                         super::types::EffortLevel::Xhigh => Some("xhigh".to_string()),
                         super::types::EffortLevel::Max => Some("xhigh".to_string()),
+                        super::types::EffortLevel::Ultracode => Some("xhigh".to_string()),
                         super::types::EffortLevel::Off => None,
                     });
 
@@ -2022,34 +3038,13 @@ pub async fn send_chat_message(
                 // Build combined instructions file (system prompt equivalent for Codex)
                 let codex_instructions_file = {
                     use crate::projects::github_issues::{
-                        get_github_contexts_dir, get_session_issue_refs, get_session_pr_refs,
+                        get_github_contexts_dir, get_session_advisory_refs, get_session_issue_refs,
+                        get_session_pr_refs, get_session_security_refs,
                     };
+                    use crate::projects::linear_issues::get_session_linear_refs;
                     use crate::projects::storage::load_projects_data;
 
-                    const DEFAULT_GLOBAL_SYSTEM_PROMPT: &str = "\
-## Plan Mode\n\
-\n\
-- Make the plan extremely concise. Sacrifice grammar for the sake of concision.\n\
-- At the end of each plan, give me a list of unresolved questions to answer, if any.\n\
-\n\
-## Not Plan Mode\n\
-\n\
-- After each finished task, please write a few bullet points on how to test the changes.\n\
-- When multiple independent operations are needed, batch them into parallel tool calls. Launch independent Task subagents simultaneously rather than sequentially.\n\
-- When specifying subagent_type for Task tool calls, always use the fully qualified name exactly as listed in the system prompt (e.g., \"code-simplifier:code-simplifier\", not just \"code-simplifier\"). If the agent type contains a colon, include the full namespace:name string.";
-
                     let mut system_prompt_parts: Vec<String> = Vec::new();
-
-                    // Codex plan mode: inject planning-only instructions
-                    if thread_execution_mode.as_deref() == Some("plan") {
-                        system_prompt_parts.push(
-                            "You are in PLANNING MODE (read-only sandbox). Create a detailed implementation plan. \
-                             Do NOT attempt to make any file changes — you are running in a read-only sandbox and writes will fail. \
-                             Describe exactly what changes you WOULD make: which files to create/modify, \
-                             what code to write, and in what order. End with any unresolved questions."
-                                .to_string(),
-                        );
-                    }
 
                     // AI language preference
                     if let Some(lang) = &thread_ai_language {
@@ -2059,23 +3054,18 @@ pub async fn send_chat_message(
                         }
                     }
 
-                    // Global system prompt from preferences
-                    if let Ok(prefs_path) = crate::get_preferences_path(&thread_app) {
-                        if let Ok(contents) = std::fs::read_to_string(&prefs_path) {
-                            if let Ok(prefs) =
-                                serde_json::from_str::<crate::AppPreferences>(&contents)
-                            {
-                                let prompt = prefs
-                                    .magic_prompts
-                                    .global_system_prompt
-                                    .as_deref()
-                                    .map(|s| s.trim())
-                                    .filter(|s| !s.is_empty())
-                                    .unwrap_or(DEFAULT_GLOBAL_SYSTEM_PROMPT);
-                                system_prompt_parts.push(prompt.to_string());
-                            }
-                        }
-                    }
+                    // Global system prompt from preferences (with default fallback)
+                    let preferences_global_prompt = crate::get_preferences_path(&thread_app)
+                        .ok()
+                        .and_then(|prefs_path| std::fs::read_to_string(&prefs_path).ok())
+                        .and_then(|contents| {
+                            serde_json::from_str::<crate::AppPreferences>(&contents).ok()
+                        })
+                        .and_then(|prefs| prefs.magic_prompts.global_system_prompt);
+                    system_prompt_parts.push(resolve_codex_global_system_prompt(
+                        preferences_global_prompt.as_deref(),
+                        thread_execution_mode.as_deref(),
+                    ));
 
                     // Parallel execution prompt
                     if let Some(prompt) = &thread_parallel_prompt {
@@ -2141,6 +3131,19 @@ pub async fn send_chat_message(
                         }
                     }
 
+                    // End-of-turn recap instruction (compact view surfaces this block)
+                    if super::should_add_recap_instruction(&thread_app) {
+                        system_prompt_parts.push(super::RECAP_INSTRUCTION.to_string());
+                    }
+
+                    // Keep the current Codex execution mode as the final authoritative
+                    // instruction so persisted/global plan-mode defaults cannot pull an
+                    // approved build/yolo continuation back into planning behavior.
+                    append_codex_execution_mode_instruction(
+                        &mut system_prompt_parts,
+                        thread_execution_mode.as_deref(),
+                    );
+
                     // Collect context file paths (issues, PRs, saved contexts)
                     let mut all_context_paths: Vec<std::path::PathBuf> = Vec::new();
 
@@ -2188,6 +3191,87 @@ pub async fn send_chat_message(
                                     let repo_key = parts[1];
                                     let file_path =
                                         contexts_dir.join(format!("{repo_key}-pr-{number}.md"));
+                                    if file_path.exists() {
+                                        all_context_paths.push(file_path);
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    let mut security_keys =
+                        get_session_security_refs(&thread_app, &thread_session_id)
+                            .unwrap_or_default();
+                    if let Ok(wt_keys) = get_session_security_refs(&thread_app, &thread_worktree_id)
+                    {
+                        for key in wt_keys {
+                            if !security_keys.contains(&key) {
+                                security_keys.push(key);
+                            }
+                        }
+                    }
+                    if !security_keys.is_empty() {
+                        if let Ok(contexts_dir) = get_github_contexts_dir(&thread_app) {
+                            for key in &security_keys {
+                                let parts: Vec<&str> = key.rsplitn(2, '-').collect();
+                                if parts.len() == 2 {
+                                    let number = parts[0];
+                                    let repo_key = parts[1];
+                                    let file_path = contexts_dir
+                                        .join(format!("{repo_key}-security-{number}.md"));
+                                    if file_path.exists() {
+                                        all_context_paths.push(file_path);
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    let mut advisory_keys =
+                        get_session_advisory_refs(&thread_app, &thread_session_id)
+                            .unwrap_or_default();
+                    if let Ok(wt_keys) = get_session_advisory_refs(&thread_app, &thread_worktree_id)
+                    {
+                        for key in wt_keys {
+                            if !advisory_keys.contains(&key) {
+                                advisory_keys.push(key);
+                            }
+                        }
+                    }
+                    if !advisory_keys.is_empty() {
+                        if let Ok(contexts_dir) = get_github_contexts_dir(&thread_app) {
+                            for key in &advisory_keys {
+                                if let Some((repo_key, ghsa_id)) = key.split_once("::") {
+                                    let file_path = contexts_dir
+                                        .join(format!("{repo_key}-advisory-{ghsa_id}.md"));
+                                    if file_path.exists() {
+                                        all_context_paths.push(file_path);
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    let mut linear_keys = get_session_linear_refs(&thread_app, &thread_session_id)
+                        .unwrap_or_default();
+                    if let Ok(wt_keys) = get_session_linear_refs(&thread_app, &thread_worktree_id) {
+                        for key in wt_keys {
+                            if !linear_keys.contains(&key) {
+                                linear_keys.push(key);
+                            }
+                        }
+                    }
+                    if !linear_keys.is_empty() {
+                        if let Ok(contexts_dir) = get_github_contexts_dir(&thread_app) {
+                            for key in &linear_keys {
+                                let parts: Vec<&str> = key.rsplitn(3, '-').collect();
+                                if parts.len() == 3 {
+                                    let project_name_part = parts[2];
+                                    let identifier_lower =
+                                        format!("{}-{}", parts[1].to_lowercase(), parts[0]);
+                                    let file_path = contexts_dir.join(format!(
+                                        "{project_name_part}-linear-{identifier_lower}.md"
+                                    ));
                                     if file_path.exists() {
                                         all_context_paths.push(file_path);
                                     }
@@ -2308,6 +3392,7 @@ pub async fn send_chat_message(
                             tool_calls: response.tool_calls,
                             content_blocks: response.content_blocks,
                             cancelled: response.cancelled,
+                            waiting_for_plan: false,
                             error_emitted: response.error_emitted,
                             usage: response.usage,
                             backend: Backend::Codex,
@@ -2343,18 +3428,22 @@ pub async fn send_chat_message(
 
                 let opencode_reasoning_effort: Option<String> =
                     thread_effort_level.as_ref().and_then(|e| match e {
+                        super::types::EffortLevel::Minimal => Some("low".to_string()),
                         super::types::EffortLevel::Low => Some("low".to_string()),
                         super::types::EffortLevel::Medium => Some("medium".to_string()),
                         super::types::EffortLevel::High => Some("high".to_string()),
                         super::types::EffortLevel::Xhigh => Some("xhigh".to_string()),
                         super::types::EffortLevel::Max => Some("xhigh".to_string()),
+                        super::types::EffortLevel::Ultracode => Some("xhigh".to_string()),
                         super::types::EffortLevel::Off => None,
                     });
 
                 let system_prompt = {
                     use crate::projects::github_issues::{
-                        get_github_contexts_dir, get_session_issue_refs, get_session_pr_refs,
+                        get_github_contexts_dir, get_session_advisory_refs, get_session_issue_refs,
+                        get_session_pr_refs, get_session_security_refs,
                     };
+                    use crate::projects::linear_issues::get_session_linear_refs;
                     use crate::projects::storage::load_projects_data;
 
                     let mut system_prompt_parts: Vec<String> = Vec::new();
@@ -2450,6 +3539,11 @@ pub async fn send_chat_message(
                         }
                     }
 
+                    // End-of-turn recap instruction (compact view surfaces this block)
+                    if super::should_add_recap_instruction(&thread_app) {
+                        system_prompt_parts.push(super::RECAP_INSTRUCTION.to_string());
+                    }
+
                     // Collect and inline context files (issues, PRs, saved contexts)
                     let mut context_content = String::new();
 
@@ -2498,6 +3592,90 @@ pub async fn send_chat_message(
                                     let repo_key = parts[1];
                                     let file_path =
                                         contexts_dir.join(format!("{repo_key}-pr-{number}.md"));
+                                    if let Ok(content) = std::fs::read_to_string(&file_path) {
+                                        context_content.push_str(&content);
+                                        context_content.push_str("\n\n---\n\n");
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    let mut security_keys =
+                        get_session_security_refs(&thread_app, &thread_session_id)
+                            .unwrap_or_default();
+                    if let Ok(wt_keys) = get_session_security_refs(&thread_app, &thread_worktree_id)
+                    {
+                        for key in wt_keys {
+                            if !security_keys.contains(&key) {
+                                security_keys.push(key);
+                            }
+                        }
+                    }
+                    if !security_keys.is_empty() {
+                        if let Ok(contexts_dir) = get_github_contexts_dir(&thread_app) {
+                            for key in &security_keys {
+                                let parts: Vec<&str> = key.rsplitn(2, '-').collect();
+                                if parts.len() == 2 {
+                                    let number = parts[0];
+                                    let repo_key = parts[1];
+                                    let file_path = contexts_dir
+                                        .join(format!("{repo_key}-security-{number}.md"));
+                                    if let Ok(content) = std::fs::read_to_string(&file_path) {
+                                        context_content.push_str(&content);
+                                        context_content.push_str("\n\n---\n\n");
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    let mut advisory_keys =
+                        get_session_advisory_refs(&thread_app, &thread_session_id)
+                            .unwrap_or_default();
+                    if let Ok(wt_keys) = get_session_advisory_refs(&thread_app, &thread_worktree_id)
+                    {
+                        for key in wt_keys {
+                            if !advisory_keys.contains(&key) {
+                                advisory_keys.push(key);
+                            }
+                        }
+                    }
+                    if !advisory_keys.is_empty() {
+                        if let Ok(contexts_dir) = get_github_contexts_dir(&thread_app) {
+                            for key in &advisory_keys {
+                                if let Some((repo_key, ghsa_id)) = key.split_once("::") {
+                                    let file_path = contexts_dir
+                                        .join(format!("{repo_key}-advisory-{ghsa_id}.md"));
+                                    if let Ok(content) = std::fs::read_to_string(&file_path) {
+                                        context_content.push_str(&content);
+                                        context_content.push_str("\n\n---\n\n");
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    let mut linear_keys = get_session_linear_refs(&thread_app, &thread_session_id)
+                        .unwrap_or_default();
+                    if let Ok(wt_keys) = get_session_linear_refs(&thread_app, &thread_worktree_id) {
+                        for key in wt_keys {
+                            if !linear_keys.contains(&key) {
+                                linear_keys.push(key);
+                            }
+                        }
+                    }
+                    if !linear_keys.is_empty() {
+                        if let Ok(contexts_dir) = get_github_contexts_dir(&thread_app) {
+                            for key in &linear_keys {
+                                let parts: Vec<&str> = key.rsplitn(3, '-').collect();
+                                if parts.len() == 3 {
+                                    let project_name_part = parts[2];
+                                    let identifier_lower =
+                                        format!("{}-{}", parts[1].to_lowercase(), parts[0]);
+                                    let file_path = contexts_dir.join(format!(
+                                        "{project_name_part}-linear-{identifier_lower}.md"
+                                    ));
                                     if let Ok(content) = std::fs::read_to_string(&file_path) {
                                         context_content.push_str(&content);
                                         context_content.push_str("\n\n---\n\n");
@@ -2565,6 +3743,7 @@ pub async fn send_chat_message(
                     &thread_app,
                     &thread_session_id,
                     &thread_worktree_id,
+                    &thread_run_id,
                     std::path::Path::new(&thread_working_dir),
                     thread_opencode_session_id.as_deref(),
                     thread_model.as_deref(),
@@ -2574,22 +3753,27 @@ pub async fn send_chat_message(
                     system_prompt.as_deref(),
                     cancel_flag,
                 ) {
-                    Ok(response) => Ok((
-                        // OpenCode has no child process PID; use 0 as a sentinel.
-                        // Crash recovery checks run.pid via is_process_alive — None means
-                        // the pid_callback was never called, which is correct for OpenCode.
-                        0,
-                        UnifiedResponse {
-                            content: response.content,
-                            resume_id: response.session_id,
-                            tool_calls: response.tool_calls,
-                            content_blocks: response.content_blocks,
-                            cancelled: response.cancelled,
-                            error_emitted: false,
-                            usage: response.usage,
-                            backend: Backend::Opencode,
-                        },
-                    )),
+                    Ok(response) => {
+                        let waiting_for_plan = thread_execution_mode.as_deref() == Some("plan")
+                            && !response.content.is_empty();
+                        Ok((
+                            // OpenCode has no child process PID; use 0 as a sentinel.
+                            // Crash recovery checks run.pid via is_process_alive — None means
+                            // the pid_callback was never called, which is correct for OpenCode.
+                            0,
+                            UnifiedResponse {
+                                content: response.content,
+                                resume_id: response.session_id,
+                                tool_calls: response.tool_calls,
+                                content_blocks: response.content_blocks,
+                                cancelled: response.cancelled,
+                                waiting_for_plan,
+                                error_emitted: false,
+                                usage: response.usage,
+                                backend: Backend::Opencode,
+                            },
+                        ))
+                    }
                     Err(e) => {
                         log::error!("execute_opencode FAILED: {e}");
                         Err(e)
@@ -2705,6 +3889,11 @@ pub async fn send_chat_message(
                         }
                     }
 
+                    // End-of-turn recap instruction (compact view surfaces this block)
+                    if super::should_add_recap_instruction(&thread_app) {
+                        parts.push(super::RECAP_INSTRUCTION.to_string());
+                    }
+
                     if parts.is_empty() {
                         None
                     } else {
@@ -2716,6 +3905,7 @@ pub async fn send_chat_message(
                     &thread_app,
                     &thread_session_id,
                     &thread_worktree_id,
+                    &thread_run_id,
                     std::path::Path::new(&thread_working_dir),
                     thread_cursor_chat_id.as_deref(),
                     thread_model.as_deref(),
@@ -2733,6 +3923,7 @@ pub async fn send_chat_message(
                             tool_calls: response.tool_calls,
                             content_blocks: response.content_blocks,
                             cancelled: response.cancelled,
+                            waiting_for_plan: false,
                             error_emitted: false,
                             usage: response.usage,
                             backend: Backend::Cursor,
@@ -2744,7 +3935,345 @@ pub async fn send_chat_message(
                     }
                 }
             }
+            Backend::Commandcode => {
+                let system_context =
+                    super::context_instructions::build_combined_terminal_context_content(
+                        &thread_app,
+                        &thread_session_id,
+                        &thread_worktree_id,
+                    );
+                match super::commandcode::execute_commandcode_headless(
+                    &thread_app,
+                    &thread_session_id,
+                    &thread_worktree_id,
+                    &thread_run_id,
+                    std::path::Path::new(&thread_working_dir),
+                    thread_execution_mode.as_deref(),
+                    thread_model.as_deref(),
+                    &thread_message,
+                    Some(&system_context),
+                    thread_commandcode_resume_id.as_deref(),
+                    Some(make_pid_callback()),
+                ) {
+                    Ok((_pid, response)) => Ok((
+                        0,
+                        UnifiedResponse {
+                            content: response.content,
+                            resume_id: response.session_id,
+                            tool_calls: response.tool_calls,
+                            content_blocks: response.content_blocks,
+                            cancelled: response.cancelled,
+                            waiting_for_plan: response.waiting_for_plan,
+                            error_emitted: false,
+                            usage: response.usage,
+                            backend: Backend::Commandcode,
+                        },
+                    )),
+                    Err(e) => {
+                        log::error!("execute_commandcode_headless FAILED: {e}");
+                        Err(e)
+                    }
+                }
+            }
+            Backend::Pi => {
+                let pi_system_prompt: Option<String> = {
+                    use crate::projects::storage::load_projects_data;
+
+                    let mut parts: Vec<String> = Vec::new();
+
+                    if let Some(lang) = &thread_ai_language {
+                        let lang = lang.trim();
+                        if !lang.is_empty() {
+                            parts.push(format!("Respond to the user in {lang}."));
+                        }
+                    }
+
+                    if let Ok(prefs_path) = crate::get_preferences_path(&thread_app) {
+                        if let Ok(contents) = std::fs::read_to_string(&prefs_path) {
+                            if let Ok(prefs) =
+                                serde_json::from_str::<crate::AppPreferences>(&contents)
+                            {
+                                if let Some(prompt) = prefs
+                                    .magic_prompts
+                                    .global_system_prompt
+                                    .as_deref()
+                                    .map(|s| s.trim())
+                                    .filter(|s| !s.is_empty())
+                                {
+                                    parts.push(prompt.to_string());
+                                }
+                            }
+                        }
+                    }
+
+                    if let Some(prompt) = &thread_parallel_prompt {
+                        let prompt = prompt.trim();
+                        if !prompt.is_empty() {
+                            parts.push(prompt.to_string());
+                        }
+                    }
+
+                    if let Ok(data) = load_projects_data(&thread_app) {
+                        if let Some(worktree) = data.find_worktree(&thread_worktree_id) {
+                            if let Some(project) = data.find_project(&worktree.project_id) {
+                                if let Some(prompt) = &project.custom_system_prompt {
+                                    let prompt = prompt.trim();
+                                    if !prompt.is_empty() {
+                                        parts.push(prompt.to_string());
+                                    }
+                                }
+
+                                let linked_paths = project
+                                    .linked_project_ids
+                                    .iter()
+                                    .filter_map(|id| data.find_project(id))
+                                    .filter(|p| !p.path.trim().is_empty())
+                                    .map(|p| p.path.clone())
+                                    .collect::<Vec<_>>();
+                                if !linked_paths.is_empty() {
+                                    let dirs_list = linked_paths
+                                        .iter()
+                                        .map(|p| format!("- {p}"))
+                                        .collect::<Vec<_>>()
+                                        .join("\n");
+                                    parts.push(format!(
+                                        "This project is linked to other projects for cross-project context. \
+                                         Check the following directories for additional instructions and documentation \
+                                         (e.g., CLAUDE.md, AGENTS.md, docs/):\n{dirs_list}"
+                                    ));
+                                }
+                            }
+                        }
+                    }
+
+                    let gh_binary = crate::gh_cli::config::resolve_gh_binary(&thread_app);
+                    if gh_binary != std::path::PathBuf::from("gh") {
+                        parts.push(format!(
+                            "When running GitHub CLI commands, use the full path to the embedded binary: {}\n\
+                             Do NOT use bare `gh` — always use the full path above.",
+                            gh_binary.display()
+                        ));
+                    }
+                    if let Ok(claude_binary) = crate::claude_cli::get_cli_binary_path(&thread_app) {
+                        if claude_binary.exists() {
+                            parts.push(format!(
+                                "When running Claude CLI commands, use the full path to the embedded binary: {}\n\
+                                 Do NOT use bare `claude` — always use the full path above.",
+                                claude_binary.display()
+                            ));
+                        }
+                    }
+                    if let Ok(codex_binary) = crate::codex_cli::get_cli_binary_path(&thread_app) {
+                        if codex_binary.exists() {
+                            parts.push(format!(
+                                "When running Codex CLI commands, use the full path to the embedded binary: {}\n\
+                                 Do NOT use bare `codex` — always use the full path above.",
+                                codex_binary.display()
+                            ));
+                        }
+                    }
+
+                    if super::should_add_recap_instruction(&thread_app) {
+                        parts.push(super::RECAP_INSTRUCTION.to_string());
+                    }
+
+                    if parts.is_empty() {
+                        None
+                    } else {
+                        Some(parts.join("\n\n"))
+                    }
+                };
+
+                match super::pi::execute_pi(
+                    &thread_app,
+                    &thread_session_id,
+                    &thread_worktree_id,
+                    &thread_output_file,
+                    std::path::Path::new(&thread_working_dir),
+                    thread_pi_session_id.as_deref(),
+                    thread_model.as_deref(),
+                    thread_execution_mode.as_deref(),
+                    thread_effort_level.as_ref(),
+                    &thread_message,
+                    pi_system_prompt.as_deref(),
+                    Some(make_pid_callback()),
+                ) {
+                    Ok(response) => Ok((
+                        0,
+                        UnifiedResponse {
+                            content: response.content,
+                            resume_id: response.session_id,
+                            tool_calls: response.tool_calls,
+                            content_blocks: response.content_blocks,
+                            cancelled: response.cancelled,
+                            waiting_for_plan: false,
+                            error_emitted: false,
+                            usage: response.usage,
+                            backend: Backend::Pi,
+                        },
+                    )),
+                    Err(e) => {
+                        log::error!("execute_pi FAILED: {e}");
+                        Err(e)
+                    }
+                }
+            }
+            Backend::Grok => {
+                let grok_system_prompt: Option<String> = {
+                    use crate::projects::storage::load_projects_data;
+
+                    let mut parts: Vec<String> = Vec::new();
+
+                    if let Some(lang) = &thread_ai_language {
+                        let lang = lang.trim();
+                        if !lang.is_empty() {
+                            parts.push(format!("Respond to the user in {lang}."));
+                        }
+                    }
+
+                    if let Ok(prefs_path) = crate::get_preferences_path(&thread_app) {
+                        if let Ok(contents) = std::fs::read_to_string(&prefs_path) {
+                            if let Ok(prefs) =
+                                serde_json::from_str::<crate::AppPreferences>(&contents)
+                            {
+                                if let Some(prompt) = prefs
+                                    .magic_prompts
+                                    .global_system_prompt
+                                    .as_deref()
+                                    .map(|s| s.trim())
+                                    .filter(|s| !s.is_empty())
+                                {
+                                    parts.push(prompt.to_string());
+                                }
+                            }
+                        }
+                    }
+
+                    if let Some(prompt) = &thread_parallel_prompt {
+                        let prompt = prompt.trim();
+                        if !prompt.is_empty() {
+                            parts.push(prompt.to_string());
+                        }
+                    }
+
+                    if let Ok(data) = load_projects_data(&thread_app) {
+                        if let Some(worktree) = data.find_worktree(&thread_worktree_id) {
+                            if let Some(project) = data.find_project(&worktree.project_id) {
+                                if let Some(prompt) = &project.custom_system_prompt {
+                                    let prompt = prompt.trim();
+                                    if !prompt.is_empty() {
+                                        parts.push(prompt.to_string());
+                                    }
+                                }
+
+                                let linked_paths = project
+                                    .linked_project_ids
+                                    .iter()
+                                    .filter_map(|id| data.find_project(id))
+                                    .filter(|p| !p.path.trim().is_empty())
+                                    .map(|p| p.path.clone())
+                                    .collect::<Vec<_>>();
+                                if !linked_paths.is_empty() {
+                                    let dirs_list = linked_paths
+                                        .iter()
+                                        .map(|p| format!("- {p}"))
+                                        .collect::<Vec<_>>()
+                                        .join("\n");
+                                    parts.push(format!(
+                                        "This project is linked to other projects for cross-project context. \
+                                         Check the following directories for additional instructions and documentation \
+                                         (e.g., CLAUDE.md, AGENTS.md, docs/):\n{dirs_list}"
+                                    ));
+                                }
+                            }
+                        }
+                    }
+
+                    let gh_binary = crate::gh_cli::config::resolve_gh_binary(&thread_app);
+                    if gh_binary != std::path::PathBuf::from("gh") {
+                        parts.push(format!(
+                            "When running GitHub CLI commands, use the full path to the embedded binary: {}\n\
+                             Do NOT use bare `gh` — always use the full path above.",
+                            gh_binary.display()
+                        ));
+                    }
+                    if let Ok(claude_binary) = crate::claude_cli::get_cli_binary_path(&thread_app) {
+                        if claude_binary.exists() {
+                            parts.push(format!(
+                                "When running Claude CLI commands, use the full path to the embedded binary: {}\n\
+                                 Do NOT use bare `claude` — always use the full path above.",
+                                claude_binary.display()
+                            ));
+                        }
+                    }
+                    if let Ok(codex_binary) = crate::codex_cli::get_cli_binary_path(&thread_app) {
+                        if codex_binary.exists() {
+                            parts.push(format!(
+                                "When running Codex CLI commands, use the full path to the embedded binary: {}\n\
+                                 Do NOT use bare `codex` — always use the full path above.",
+                                codex_binary.display()
+                            ));
+                        }
+                    }
+
+                    if super::should_add_recap_instruction(&thread_app) {
+                        parts.push(super::RECAP_INSTRUCTION.to_string());
+                    }
+
+                    if parts.is_empty() {
+                        None
+                    } else {
+                        Some(parts.join("\n\n"))
+                    }
+                };
+
+                let grok_effort: Option<String> =
+                    thread_effort_level.as_ref().and_then(|e| match e {
+                        super::types::EffortLevel::Minimal => Some("low".to_string()),
+                        super::types::EffortLevel::Low => Some("low".to_string()),
+                        super::types::EffortLevel::Medium => Some("medium".to_string()),
+                        super::types::EffortLevel::High => Some("high".to_string()),
+                        super::types::EffortLevel::Xhigh => Some("xhigh".to_string()),
+                        super::types::EffortLevel::Max => Some("max".to_string()),
+                        super::types::EffortLevel::Ultracode => Some("max".to_string()),
+                        super::types::EffortLevel::Off => None,
+                    });
+
+                match super::grok::execute_grok(super::grok::GrokExecutionOptions {
+                    app: &thread_app,
+                    jean_session_id: &thread_session_id,
+                    worktree_id: &thread_worktree_id,
+                    working_dir: std::path::Path::new(&thread_working_dir),
+                    existing_grok_session_id: thread_grok_session_id.as_deref(),
+                    model: thread_model.as_deref(),
+                    execution_mode: thread_execution_mode.as_deref(),
+                    effort_level: grok_effort.as_deref(),
+                    message: &thread_message,
+                    system_prompt: grok_system_prompt.as_deref(),
+                    pid_callback: Some(make_pid_callback()),
+                }) {
+                    Ok(response) => Ok((
+                        0,
+                        UnifiedResponse {
+                            content: response.content,
+                            resume_id: response.session_id,
+                            tool_calls: response.tool_calls,
+                            content_blocks: response.content_blocks,
+                            cancelled: response.cancelled,
+                            waiting_for_plan: false,
+                            error_emitted: false,
+                            usage: response.usage,
+                            backend: Backend::Grok,
+                        },
+                    )),
+                    Err(e) => {
+                        log::error!("execute_grok FAILED: {e}");
+                        Err(e)
+                    }
+                }
+            }
         };
+
         let _ = tx.send(result);
     });
 
@@ -2784,7 +4313,7 @@ pub async fn send_chat_message(
                         if let Err(save_err) =
                             with_sessions_mut(&app, &worktree_path, &worktree_id, |sessions| {
                                 if let Some(session) = sessions.find_session_mut(&session_id) {
-                                    session.claude_session_id = Some(sid.clone());
+                                    persist_salvaged_resume_id(session, &effective_backend, sid);
                                     session.is_reviewing = true;
                                     session.waiting_for_input = false;
                                 }
@@ -2805,13 +4334,23 @@ pub async fn send_chat_message(
                     if let Some(ref sid) = partial_sid {
                         let _ = with_sessions_mut(&app, &worktree_path, &worktree_id, |sessions| {
                             if let Some(session) = sessions.find_session_mut(&session_id) {
-                                session.claude_session_id = Some(sid.clone());
+                                persist_salvaged_resume_id(session, &effective_backend, sid);
                             }
                             Ok(())
                         });
                     }
                 }
             }
+            // Remove the input file so the hidden handoff/history payload isn't retained on disk.
+            if let Err(del_err) = run_log::delete_input_file(&app, &session_id, &run_id) {
+                log::warn!("Failed to delete input file after thread error: {del_err}");
+            }
+            trigger_backend_queue_drain(
+                app.clone(),
+                worktree_id.clone(),
+                worktree_path.clone(),
+                session_id.clone(),
+            );
             return Err(e);
         }
         Err(_) => {
@@ -2838,12 +4377,22 @@ pub async fn send_chat_message(
                 if let Some(ref sid) = partial_sid {
                     let _ = with_sessions_mut(&app, &worktree_path, &worktree_id, |sessions| {
                         if let Some(session) = sessions.find_session_mut(&session_id) {
-                            session.claude_session_id = Some(sid.clone());
+                            persist_salvaged_resume_id(session, &effective_backend, sid);
                         }
                         Ok(())
                     });
                 }
             }
+            // Remove the input file so the hidden handoff/history payload isn't retained on disk.
+            if let Err(del_err) = run_log::delete_input_file(&app, &session_id, &run_id) {
+                log::warn!("Failed to delete input file after thread panic: {del_err}");
+            }
+            trigger_backend_queue_drain(
+                app.clone(),
+                worktree_id.clone(),
+                worktree_path.clone(),
+                session_id.clone(),
+            );
             return Err(
                 "CLI execution thread closed unexpectedly (possible crash or panic)".to_string(),
             );
@@ -2859,18 +4408,23 @@ pub async fn send_chat_message(
     // OpenCode/Cursor runs are reconstructed in-process rather than tailed from a
     // detached JSONL stream. Write a synthetic assistant line so history reload can
     // reconstruct content after the live stream completes.
-    // Skip when cancelled: the frontend's save_cancelled_message already persists
-    // cancelled content to the same JSONL file, and writing here would duplicate it.
+    // Skip when cancelled: cancelled turns stay in run metadata/logs for diagnostics
+    // but are intentionally excluded from visible chat history on reload.
     if matches!(
         unified_response.backend,
-        Backend::Opencode | Backend::Cursor
+        Backend::Opencode | Backend::Cursor | Backend::Pi | Backend::Commandcode | Backend::Grok
     ) && !unified_response.cancelled
     {
         if let Ok(mut file) = std::fs::OpenOptions::new().append(true).open(&output_file) {
             if !unified_response.content_blocks.is_empty() {
                 // Filter out echoed user prompt: OpenCode includes the user
                 // message as the first text block in its response.
-                let trimmed_prompt = message.trim();
+                // Compare against the *effective* prompt (message_for_backend),
+                // not the raw message — when a hidden provider-switch handoff is
+                // prepended, the backend echoes the submitted prompt including the
+                // handoff. Matching the raw message would let that injected history
+                // leak into the visible assistant transcript/NDJSON.
+                let trimmed_prompt = message_for_backend.trim();
                 let blocks_to_write: Vec<&super::types::ContentBlock> = {
                     let mut iter = unified_response.content_blocks.iter().peekable();
                     let first = iter.peek();
@@ -2911,6 +4465,9 @@ pub async fn send_chat_message(
                         }
                         super::types::ContentBlock::Thinking { thinking } => {
                             serde_json::json!({"type": "thinking", "thinking": thinking})
+                        }
+                        super::types::ContentBlock::UserInput { text } => {
+                            serde_json::json!({"type": "user_input", "text": text})
                         }
                     })
                     .collect();
@@ -2955,8 +4512,23 @@ pub async fn send_chat_message(
     // This avoids cluttering history with empty cancelled messages from instant cancellations
     let has_meaningful_content = unified_response.content.len() >= 10;
     let has_tool_calls = !unified_response.tool_calls.is_empty();
+    let has_content_blocks = !unified_response.content_blocks.is_empty();
+    let has_assistant_payload =
+        !unified_response.content.is_empty() || has_tool_calls || has_content_blocks;
     let resume_id_for_log = unified_response.resume_id.clone();
     let response_backend = unified_response.backend.clone();
+    let has_persisted_visible_codex_artifacts = unified_response.cancelled
+        && response_backend == Backend::Codex
+        && !has_assistant_payload
+        && run_log::read_run_log(&app, &session_id, &run_id)
+            .map(|lines| {
+                super::codex::codex_run_log_has_visible_assistant_artifacts(
+                    &lines,
+                    execution_mode.as_deref() == Some("plan"),
+                )
+            })
+            .unwrap_or(false);
+    let has_resume_worthy_payload = has_assistant_payload || has_persisted_visible_codex_artifacts;
 
     // Handle error_emitted: backend emitted chat:error during execution (e.g., Codex usage limit).
     // Treat like undo_send so the user message doesn't persist in history.
@@ -2965,6 +4537,12 @@ pub async fn send_chat_message(
             log::warn!("Failed to cancel run log after error: {e}");
         }
         log::info!("[SendChat] EXIT session={session_id} reason=error_emitted");
+        trigger_backend_queue_drain(
+            app.clone(),
+            worktree_id.clone(),
+            worktree_path.clone(),
+            session_id.clone(),
+        );
         return Ok(ChatMessage {
             id: Uuid::new_v4().to_string(),
             session_id: session_id.clone(),
@@ -2984,13 +4562,18 @@ pub async fn send_chat_message(
         });
     }
 
-    if unified_response.cancelled && !has_meaningful_content && !has_tool_calls {
+    if unified_response.cancelled
+        && !has_meaningful_content
+        && !has_tool_calls
+        && !has_content_blocks
+        && !has_persisted_visible_codex_artifacts
+    {
         // Instant cancellation with no content
-        let resume_sid = if response_backend != Backend::Claude || resume_id_for_log.is_empty() {
-            None
-        } else {
-            Some(resume_id_for_log.as_str())
-        };
+        let resume_sid = resume_id_for_persisted_claude_run(
+            &response_backend,
+            &resume_id_for_log,
+            has_resume_worthy_payload,
+        );
         // Cancel the run log, persisting session ID if available so next run can --resume
         if let Err(e) = run_log_writer.cancel(None, resume_sid) {
             log::warn!("Failed to cancel run log: {e}");
@@ -3000,7 +4583,9 @@ pub async fn send_chat_message(
         with_sessions_mut(&app, &worktree_path, &worktree_id, |sessions| {
             if let Some(session) = sessions.find_session_mut(&session_id) {
                 // Persist resume ID so next run can resume context even after cancellation
-                if !resume_id_for_log.is_empty() {
+                if !resume_id_for_log.is_empty()
+                    && (response_backend != Backend::Claude || has_assistant_payload)
+                {
                     match response_backend {
                         Backend::Claude => {
                             session.claude_session_id = Some(resume_id_for_log.clone());
@@ -3013,6 +4598,15 @@ pub async fn send_chat_message(
                         }
                         Backend::Cursor => {
                             session.cursor_chat_id = Some(resume_id_for_log.clone());
+                        }
+                        Backend::Pi => {
+                            session.pi_session_id = Some(resume_id_for_log.clone());
+                        }
+                        Backend::Commandcode => {
+                            session.commandcode_session_id = Some(resume_id_for_log.clone());
+                        }
+                        Backend::Grok => {
+                            session.grok_session_id = Some(resume_id_for_log.clone());
                         }
                     }
                 }
@@ -3030,6 +4624,12 @@ pub async fn send_chat_message(
         })?;
 
         log::info!("[SendChat] EXIT session={session_id} reason=cancelled_no_content");
+        trigger_backend_queue_drain(
+            app.clone(),
+            worktree_id.clone(),
+            worktree_path.clone(),
+            session_id.clone(),
+        );
         // Return a minimal cancelled message (not persisted, just for UI)
         return Ok(ChatMessage {
             id: Uuid::new_v4().to_string(),
@@ -3053,26 +4653,27 @@ pub async fn send_chat_message(
     // Pre-compute completion state flags before moving unified_response fields
     let has_content = !unified_response.content.is_empty();
     let was_cancelled = unified_response.cancelled;
-    let has_blocking_tool = unified_response.tool_calls.iter().any(|tc| {
-        tc.name == "AskUserQuestion"
-            || tc.name == "ExitPlanMode"
-            || tc.name == "CodexPlan"
-            || tc.name == "question"
-    });
+    let has_blocking_tool = unified_response
+        .tool_calls
+        .iter()
+        .any(is_pending_blocking_tool_call);
     let has_question_tool = unified_response
         .tool_calls
         .iter()
-        .any(|tc| tc.name == "AskUserQuestion" || tc.name == "question");
+        .any(is_pending_question_tool_call);
     let has_plan_tool = unified_response
         .tool_calls
         .iter()
-        .any(|tc| tc.name == "ExitPlanMode" || tc.name == "CodexPlan");
-    let is_plan_mode_with_content = match response_backend {
-        Backend::Opencode => {
-            execution_mode.as_deref() == Some("plan") && has_content && !has_plan_tool
-        }
-        Backend::Cursor => false, // Plan approval only on real createPlanToolCall / interaction_query
-        _ => false,
+        .any(is_pending_plan_tool_call);
+    let is_plan_mode_with_content = if response_backend == Backend::Commandcode {
+        unified_response.waiting_for_plan
+    } else {
+        plan_mode_content_waits_for_approval(
+            &response_backend,
+            execution_mode.as_deref(),
+            has_content,
+            has_plan_tool,
+        )
     };
 
     // Create assistant message with tool calls and content blocks
@@ -3099,21 +4700,20 @@ pub async fn send_chat_message(
 
     // Finalize run log (complete or cancel based on response status)
     if was_cancelled {
-        let cancel_resume_sid =
-            if response_backend != Backend::Claude || resume_id_for_log.is_empty() {
-                None
-            } else {
-                Some(resume_id_for_log.as_str())
-            };
+        let cancel_resume_sid = resume_id_for_persisted_claude_run(
+            &response_backend,
+            &resume_id_for_log,
+            has_resume_worthy_payload,
+        );
         if let Err(e) = run_log_writer.cancel(Some(&assistant_msg_id), cancel_resume_sid) {
             log::warn!("Failed to cancel run log: {e}");
         }
     } else {
-        let resume_sid = if response_backend != Backend::Claude || resume_id_for_log.is_empty() {
-            None
-        } else {
-            Some(resume_id_for_log.as_str())
-        };
+        let resume_sid = resume_id_for_persisted_claude_run(
+            &response_backend,
+            &resume_id_for_log,
+            has_resume_worthy_payload,
+        );
         if let Err(e) =
             run_log_writer.complete(&assistant_msg_id, resume_sid, unified_response.usage)
         {
@@ -3131,7 +4731,7 @@ pub async fn send_chat_message(
     // back the conversation cache even though the CLI ran successfully (#209).
     if let Err(e) = with_sessions_mut(&app, &worktree_path, &worktree_id, |sessions| {
         if let Some(session) = sessions.find_session_mut(&session_id) {
-            if !resume_id_for_log.is_empty() && has_content {
+            if !resume_id_for_log.is_empty() && has_resume_worthy_payload {
                 match response_backend {
                     Backend::Claude => {
                         session.claude_session_id = Some(resume_id_for_log.clone());
@@ -3145,6 +4745,15 @@ pub async fn send_chat_message(
                     Backend::Cursor => {
                         session.cursor_chat_id = Some(resume_id_for_log.clone());
                     }
+                    Backend::Pi => {
+                        session.pi_session_id = Some(resume_id_for_log.clone());
+                    }
+                    Backend::Commandcode => {
+                        session.commandcode_session_id = Some(resume_id_for_log.clone());
+                    }
+                    Backend::Grok => {
+                        session.grok_session_id = Some(resume_id_for_log.clone());
+                    }
                 }
             }
 
@@ -3152,8 +4761,20 @@ pub async fn send_chat_message(
             // This eliminates the dual-client race where both native and web frontends
             // independently call update_session_state with conflicting decisions.
             // Flags are pre-computed above before unified_response fields are moved.
+            let queued_prompt_should_continue = queued_prompt_skips_plan_wait(
+                !session.queued_messages.is_empty(),
+                has_question_tool,
+                has_blocking_tool || is_plan_mode_with_content,
+            );
             if was_cancelled {
                 // Cancelled: don't change waiting/reviewing state
+            } else if queued_prompt_should_continue {
+                // A queued prompt is an explicit "continue now"; don't park on
+                // plan approval because the backend queue drain runs right after
+                // this write and should be allowed to dequeue it.
+                session.waiting_for_input = false;
+                session.is_reviewing = true;
+                session.waiting_for_input_type = None;
             } else if has_blocking_tool {
                 session.waiting_for_input = true;
                 session.is_reviewing = false;
@@ -3192,6 +4813,12 @@ pub async fn send_chat_message(
     } else {
         log::info!("[SendChat] EXIT session={session_id} reason=success");
     }
+    trigger_backend_queue_drain(
+        app.clone(),
+        worktree_id.clone(),
+        worktree_path.clone(),
+        session_id.clone(),
+    );
     Ok(assistant_msg)
 }
 
@@ -3219,6 +4846,7 @@ pub async fn clear_session_history(
         if let Some(session) = sessions.find_session_mut(&session_id) {
             let selected_model = session.selected_model.clone();
             let selected_thinking_level = session.selected_thinking_level.clone();
+            let selected_effort_level = session.selected_effort_level.clone();
             let selected_provider = session.selected_provider.clone();
 
             session.messages.clear();
@@ -3226,8 +4854,12 @@ pub async fn clear_session_history(
             session.codex_thread_id = None;
             session.opencode_session_id = None;
             session.cursor_chat_id = None;
+            session.pi_session_id = None;
+            session.commandcode_session_id = None;
+            session.grok_session_id = None;
             session.selected_model = selected_model;
             session.selected_thinking_level = selected_thinking_level;
+            session.selected_effort_level = selected_effort_level;
             session.selected_provider = selected_provider;
 
             log::trace!("Session history cleared");
@@ -3284,6 +4916,28 @@ pub async fn set_session_thinking_level(
     })
 }
 
+/// Set the selected effort level for a session
+#[tauri::command]
+pub async fn set_session_effort_level(
+    app: AppHandle,
+    worktree_id: String,
+    worktree_path: String,
+    session_id: String,
+    effort_level: EffortLevel,
+) -> Result<(), String> {
+    log::trace!("Setting effort level for session {session_id}: {effort_level:?}");
+
+    with_sessions_mut(&app, &worktree_path, &worktree_id, |sessions| {
+        if let Some(session) = sessions.find_session_mut(&session_id) {
+            session.selected_effort_level = Some(effort_level);
+            log::trace!("Effort level selection saved");
+            Ok(())
+        } else {
+            Err(format!("Session not found: {session_id}"))
+        }
+    })
+}
+
 /// Set the selected provider (custom CLI profile) for a session
 #[tauri::command]
 pub async fn set_session_provider(
@@ -3323,6 +4977,9 @@ pub async fn set_session_backend(
                 "codex" => super::types::Backend::Codex,
                 "opencode" => super::types::Backend::Opencode,
                 "cursor" => super::types::Backend::Cursor,
+                "pi" => super::types::Backend::Pi,
+                "commandcode" => super::types::Backend::Commandcode,
+                "grok" => super::types::Backend::Grok,
                 _ => super::types::Backend::Claude,
             };
             log::trace!("Backend selection saved");
@@ -3331,6 +4988,191 @@ pub async fn set_session_backend(
             Err(format!("Session not found: {session_id}"))
         }
     })
+}
+
+// =============================================================================
+// Codex `/goal` long-horizon mode (codex backend only)
+// =============================================================================
+//
+// Wraps the codex app-server experimental `thread/goal/{set,get,clear}` RPCs.
+// The goal is also persisted on `Session.codex_goal` so the UI banner survives
+// restarts; the server-side `thread/goal/updated` notification handler keeps
+// the persisted copy in sync if the model itself toggles the goal.
+
+/// Set or replace the persisted goal for a codex session.
+///
+/// If no codex thread exists yet (no first message sent), the goal is buffered
+/// on `Session.codex_goal` and pushed to the app-server via `thread/goal/set`
+/// after `thread/start` succeeds (see `flush_pending_codex_goal`).
+#[tauri::command]
+pub fn codex_goal_set(
+    app: AppHandle,
+    worktree_id: String,
+    worktree_path: String,
+    session_id: String,
+    objective: String,
+) -> Result<(), String> {
+    let trimmed = objective.trim();
+    if trimmed.is_empty() {
+        return Err("Goal objective cannot be empty".to_string());
+    }
+
+    let thread_id = codex_thread_id_for_session(&app, &worktree_id, &worktree_path, &session_id)?;
+
+    if let Some(tid) = thread_id {
+        super::codex_server::ensure_running(&app)?;
+        let params = codex_goal_set_params(&tid, trimmed);
+        super::codex_server::send_request("thread/goal/set", params)?;
+    }
+
+    persist_codex_goal(
+        &app,
+        &worktree_id,
+        &worktree_path,
+        &session_id,
+        Some(trimmed.to_string()),
+    )?;
+    Ok(())
+}
+
+/// Read the current persisted goal for a codex session.
+#[tauri::command]
+pub fn codex_goal_get(
+    app: AppHandle,
+    worktree_id: String,
+    worktree_path: String,
+    session_id: String,
+) -> Result<Option<String>, String> {
+    let thread_id = codex_thread_id_for_session(&app, &worktree_id, &worktree_path, &session_id)?;
+
+    let goal = if let Some(tid) = thread_id {
+        super::codex_server::ensure_running(&app)?;
+        let response = super::codex_server::send_request(
+            "thread/goal/get",
+            serde_json::json!({ "threadId": tid }),
+        )?;
+        extract_codex_goal_objective(&response)
+    } else {
+        super::storage::with_sessions_mut(&app, &worktree_path, &worktree_id, |sessions| {
+            Ok(sessions
+                .find_session(&session_id)
+                .and_then(|s| s.codex_goal.clone()))
+        })?
+    };
+
+    persist_codex_goal(
+        &app,
+        &worktree_id,
+        &worktree_path,
+        &session_id,
+        goal.clone(),
+    )?;
+    Ok(goal)
+}
+
+/// Clear the persisted goal for a codex session.
+#[tauri::command]
+pub fn codex_goal_clear(
+    app: AppHandle,
+    worktree_id: String,
+    worktree_path: String,
+    session_id: String,
+) -> Result<(), String> {
+    let thread_id = codex_thread_id_for_session(&app, &worktree_id, &worktree_path, &session_id)?;
+
+    if let Some(tid) = thread_id {
+        super::codex_server::ensure_running(&app)?;
+        super::codex_server::send_request(
+            "thread/goal/clear",
+            serde_json::json!({ "threadId": tid }),
+        )?;
+    }
+
+    persist_codex_goal(&app, &worktree_id, &worktree_path, &session_id, None)?;
+    Ok(())
+}
+
+/// Resolve the codex thread ID for a session, returning `None` if no thread
+/// has been started yet. Errors only when the session is missing or the
+/// backend is not codex.
+fn codex_thread_id_for_session(
+    app: &AppHandle,
+    worktree_id: &str,
+    worktree_path: &str,
+    session_id: &str,
+) -> Result<Option<String>, String> {
+    super::storage::with_sessions_mut(app, worktree_path, worktree_id, |sessions| {
+        let session = sessions
+            .find_session(session_id)
+            .ok_or_else(|| format!("Session not found: {session_id}"))?;
+        if !matches!(session.backend, super::types::Backend::Codex) {
+            return Err("/goal is only available on codex sessions".to_string());
+        }
+        Ok(session.codex_thread_id.clone())
+    })
+}
+
+/// Push a buffered `Session.codex_goal` into the app-server via
+/// `thread/goal/set` after a fresh thread starts. Called once we have a
+/// thread ID for a session that already has a buffered objective.
+pub fn flush_pending_codex_goal(app: &AppHandle, session_id: &str, thread_id: &str) {
+    let goal =
+        super::storage::with_existing_metadata_mut(app, session_id, |meta| meta.codex_goal.clone())
+            .ok()
+            .flatten();
+    let Some(objective) = goal else { return };
+    let params = codex_goal_set_params(thread_id, &objective);
+    if let Err(e) = super::codex_server::send_request("thread/goal/set", params) {
+        log::warn!("Failed to flush buffered codex goal: {e}");
+    }
+}
+
+fn codex_goal_set_params(thread_id: &str, objective: &str) -> serde_json::Value {
+    serde_json::json!({
+        "threadId": thread_id,
+        "objective": objective,
+        "status": "active",
+    })
+}
+
+pub(crate) fn extract_codex_goal_objective(response: &serde_json::Value) -> Option<String> {
+    response
+        .get("goal")
+        .and_then(|goal| goal.get("objective"))
+        .and_then(|objective| objective.as_str())
+        .map(|objective| objective.to_string())
+}
+
+/// Persist the goal on the session metadata and broadcast cache invalidation.
+pub(crate) fn persist_codex_goal(
+    app: &AppHandle,
+    worktree_id: &str,
+    worktree_path: &str,
+    session_id: &str,
+    goal: Option<String>,
+) -> Result<(), String> {
+    super::storage::with_sessions_mut(app, worktree_path, worktree_id, |sessions| {
+        if let Some(session) = sessions.find_session_mut(session_id) {
+            session.codex_goal = goal.clone();
+        }
+        Ok(())
+    })?;
+    let _ = app.emit_all(
+        "chat:codex_goal",
+        &CodexGoalEvent {
+            session_id: session_id.to_string(),
+            worktree_id: worktree_id.to_string(),
+            goal,
+        },
+    );
+    Ok(())
+}
+
+#[derive(serde::Serialize, Clone)]
+struct CodexGoalEvent {
+    session_id: String,
+    worktree_id: String,
+    goal: Option<String>,
 }
 
 /// Cancel a running Claude chat request for a session
@@ -3342,6 +5184,13 @@ pub async fn cancel_chat_message(
     worktree_id: String,
 ) -> Result<bool, String> {
     log::trace!("Cancel chat message requested for session: {session_id}");
+    if !should_forward_cancel_request(&session_id) {
+        log::warn!(
+            "Ignoring cancel request for idle session: {session_id} (no active send/process)"
+        );
+        super::registry::cleanup_session_registrations(&session_id);
+        return Ok(false);
+    }
     cancel_process(&app, &session_id, &worktree_id)
 }
 
@@ -3350,6 +5199,14 @@ pub async fn cancel_chat_message(
 #[tauri::command]
 pub fn has_running_sessions() -> bool {
     !super::registry::get_running_sessions().is_empty()
+}
+
+/// Check if any running sessions would NOT survive Jean quitting.
+/// Detached Claude processes and (on Unix) detached Codex app-server turns
+/// keep running after exit and are recovered on next launch; OpenCode and
+/// piped CLI sessions are not.
+pub fn has_nonsurvivable_running_sessions() -> bool {
+    super::registry::has_nonsurvivable_running_sessions()
 }
 
 /// Save a cancelled message to chat history
@@ -3654,6 +5511,24 @@ pub async fn read_clipboard_image(app: AppHandle) -> Result<Option<SaveImageResp
         .map_err(|e| format!("Clipboard image task failed: {e}"))??;
 
     Ok(result)
+}
+
+/// Write text to the native system clipboard.
+///
+/// Browser web access can lose Clipboard API user activation when a command
+/// fetches data asynchronously before copying. This backend command is the
+/// same-machine fallback used by the frontend clipboard helper.
+#[tauri::command]
+pub async fn write_clipboard_text(text: String) -> Result<(), String> {
+    tokio::task::spawn_blocking(move || -> Result<(), String> {
+        let mut clipboard =
+            arboard::Clipboard::new().map_err(|e| format!("Failed to access clipboard: {e}"))?;
+        clipboard
+            .set_text(text)
+            .map_err(|e| format!("Failed to write clipboard text: {e}"))
+    })
+    .await
+    .map_err(|e| format!("Clipboard text task failed: {e}"))?
 }
 
 /// Save a dropped image file to the app data directory
@@ -4048,11 +5923,80 @@ pub async fn write_file_content(path: String, content: String) -> Result<(), Str
     std::fs::write(&file_path, &content).map_err(|e| format!("Failed to write file: {e}"))
 }
 
+fn editor_location(path: &str, line: Option<u32>, column: Option<u32>) -> String {
+    match (line, column) {
+        (Some(line), Some(column)) => format!("{path}:{line}:{column}"),
+        (Some(line), None) => format!("{path}:{line}"),
+        _ => path.to_string(),
+    }
+}
+
+fn editor_file_args(
+    editor: &str,
+    path: &str,
+    line: Option<u32>,
+    column: Option<u32>,
+) -> Vec<String> {
+    match editor {
+        "vscode" | "cursor" => {
+            if line.is_some() {
+                vec!["-g".to_string(), editor_location(path, line, column)]
+            } else {
+                vec![path.to_string()]
+            }
+        }
+        "xcode" => {
+            if let Some(line) = line {
+                vec!["-l".to_string(), line.to_string(), path.to_string()]
+            } else {
+                vec![path.to_string()]
+            }
+        }
+        "intellij" => {
+            if let Some(line) = line {
+                vec!["--line".to_string(), line.to_string(), path.to_string()]
+            } else {
+                vec![path.to_string()]
+            }
+        }
+        "zed" => vec![editor_location(path, line, column)],
+        _ => {
+            if line.is_some() {
+                vec!["-g".to_string(), editor_location(path, line, column)]
+            } else {
+                vec![path.to_string()]
+            }
+        }
+    }
+}
+
+fn macos_open_app_args(
+    app_name: &str,
+    editor: &str,
+    path: &str,
+    line: Option<u32>,
+    column: Option<u32>,
+) -> Vec<String> {
+    let mut args = vec!["-a".to_string(), app_name.to_string()];
+    if line.is_some() {
+        args.push("--args".to_string());
+        args.extend(editor_file_args(editor, path, line, column));
+    } else {
+        args.push(path.to_string());
+    }
+    args
+}
+
 /// Open a file in the user's preferred editor
 ///
 /// Uses the editor preference (zed, vscode, cursor, xcode, intellij) to open files.
 #[tauri::command]
-pub async fn open_file_in_default_app(path: String, editor: Option<String>) -> Result<(), String> {
+pub async fn open_file_in_default_app(
+    path: String,
+    editor: Option<String>,
+    line: Option<u32>,
+    column: Option<u32>,
+) -> Result<(), String> {
     let editor_app = editor.unwrap_or_else(|| "zed".to_string());
     log::trace!("Opening file in {editor_app}: {path}");
 
@@ -4068,39 +6012,65 @@ pub async fn open_file_in_default_app(path: String, editor: Option<String>) -> R
     #[cfg(target_os = "macos")]
     {
         let result = match editor_app.as_str() {
-            "zed" => match std::process::Command::new("zed").arg(&path).spawn() {
+            "zed" => match std::process::Command::new("zed")
+                .args(editor_file_args("zed", &path, line, column))
+                .spawn()
+            {
                 Ok(child) => Ok(child),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                     std::process::Command::new("open")
-                        .args(["-a", "Zed", &path])
+                        .args(macos_open_app_args("Zed", "zed", &path, line, column))
                         .spawn()
                 }
                 Err(e) => Err(e),
             },
-            "cursor" => match std::process::Command::new("cursor").arg(&path).spawn() {
+            "cursor" => match std::process::Command::new("cursor")
+                .args(editor_file_args("cursor", &path, line, column))
+                .spawn()
+            {
                 Ok(child) => Ok(child),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                     std::process::Command::new("open")
-                        .args(["-a", "Cursor", &path])
+                        .args(macos_open_app_args("Cursor", "cursor", &path, line, column))
                         .spawn()
                 }
                 Err(e) => Err(e),
             },
-            "xcode" => std::process::Command::new("xed").arg(&path).spawn(),
-            "intellij" => match std::process::Command::new("idea").arg(&path).spawn() {
+            "xcode" => std::process::Command::new("xed")
+                .args(editor_file_args("xcode", &path, line, column))
+                .spawn(),
+            "intellij" => match std::process::Command::new("idea")
+                .args(editor_file_args("intellij", &path, line, column))
+                .spawn()
+            {
                 Ok(child) => Ok(child),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                     std::process::Command::new("open")
-                        .args(["-a", "IntelliJ IDEA", &path])
+                        .args(macos_open_app_args(
+                            "IntelliJ IDEA",
+                            "intellij",
+                            &path,
+                            line,
+                            column,
+                        ))
                         .spawn()
                 }
                 Err(e) => Err(e),
             },
-            _ => match std::process::Command::new("code").arg(&path).spawn() {
+            _ => match std::process::Command::new("code")
+                .args(editor_file_args("vscode", &path, line, column))
+                .spawn()
+            {
                 Ok(child) => Ok(child),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                     std::process::Command::new("open")
-                        .args(["-a", "Visual Studio Code", &path])
+                        .args(macos_open_app_args(
+                            "Visual Studio Code",
+                            "vscode",
+                            &path,
+                            line,
+                            column,
+                        ))
                         .spawn()
                 }
                 Err(e) => Err(e),
@@ -4125,18 +6095,23 @@ pub async fn open_file_in_default_app(path: String, editor: Option<String>) -> R
         const CREATE_NO_WINDOW: u32 = 0x08000000;
 
         let result = match editor_app.as_str() {
-            "zed" => std::process::Command::new("zed").arg(&path).spawn(),
+            "zed" => std::process::Command::new("zed")
+                .args(editor_file_args("zed", &path, line, column))
+                .spawn(),
             "cursor" => std::process::Command::new("cmd")
-                .args(["/c", "cursor", &path])
+                .args(["/c", "cursor"])
+                .args(editor_file_args("cursor", &path, line, column))
                 .creation_flags(CREATE_NO_WINDOW)
                 .spawn(),
             "intellij" => std::process::Command::new("cmd")
-                .args(["/c", "idea", &path])
+                .args(["/c", "idea"])
+                .args(editor_file_args("intellij", &path, line, column))
                 .creation_flags(CREATE_NO_WINDOW)
                 .spawn(),
             "xcode" => return Err("Xcode is only available on macOS".to_string()),
             _ => std::process::Command::new("cmd")
-                .args(["/c", "code", &path])
+                .args(["/c", "code"])
+                .args(editor_file_args("vscode", &path, line, column))
                 .creation_flags(CREATE_NO_WINDOW)
                 .spawn(),
         };
@@ -4153,11 +6128,19 @@ pub async fn open_file_in_default_app(path: String, editor: Option<String>) -> R
     #[cfg(target_os = "linux")]
     {
         let result = match editor_app.as_str() {
-            "zed" => std::process::Command::new("zed").arg(&path).spawn(),
-            "cursor" => std::process::Command::new("cursor").arg(&path).spawn(),
-            "intellij" => std::process::Command::new("idea").arg(&path).spawn(),
+            "zed" => std::process::Command::new("zed")
+                .args(editor_file_args("zed", &path, line, column))
+                .spawn(),
+            "cursor" => std::process::Command::new("cursor")
+                .args(editor_file_args("cursor", &path, line, column))
+                .spawn(),
+            "intellij" => std::process::Command::new("idea")
+                .args(editor_file_args("intellij", &path, line, column))
+                .spawn(),
             "xcode" => return Err("Xcode is only available on macOS".to_string()),
-            _ => std::process::Command::new("code").arg(&path).spawn(),
+            _ => std::process::Command::new("code")
+                .args(editor_file_args("vscode", &path, line, column))
+                .spawn(),
         };
 
         result.map_err(|e| {
@@ -4323,7 +6306,7 @@ pub async fn list_saved_contexts(app: AppHandle) -> Result<SavedContextsResponse
     }
 
     // Sort by created_at descending (newest first)
-    contexts.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+    contexts.sort_by_key(|context| std::cmp::Reverse(context.created_at));
 
     log::trace!("Found {} saved contexts", contexts.len());
     Ok(SavedContextsResponse { contexts })
@@ -4719,7 +6702,7 @@ fn execute_summarization_claude(
     magic_backend: Option<&str>,
     reasoning_effort: Option<&str>,
 ) -> Result<ContextSummaryResponse, String> {
-    let model_str = model.unwrap_or("claude-opus-4-7");
+    let model_str = model.unwrap_or("claude-opus-4-8[1m]");
 
     // Per-operation backend > project/global default_backend
     let backend = resolve_magic_prompt_backend(app, magic_backend, worktree_id);
@@ -4765,6 +6748,21 @@ fn execute_summarization_claude(
         });
     }
 
+    if backend == super::types::Backend::Grok {
+        log::trace!("Executing one-shot Grok summarization");
+        let json_str = super::grok::execute_one_shot_grok(
+            app,
+            prompt,
+            model_str,
+            working_dir,
+            reasoning_effort,
+        )?;
+        return serde_json::from_str(&json_str).map_err(|e| {
+            log::error!("Failed to parse Grok summarization JSON: {e}, content: {json_str}");
+            format!("Failed to parse summarization response: {e}")
+        });
+    }
+
     let cli_path = resolve_cli_binary(app);
     if !cli_path.exists() {
         return Err("Claude CLI not installed".to_string());
@@ -4772,8 +6770,9 @@ fn execute_summarization_claude(
 
     log::trace!("Executing one-shot Claude summarization with JSON schema");
 
-    let mut cmd = silent_command(&cli_path);
+    let mut cmd = crate::platform::cli_command(&cli_path.to_string_lossy(), None);
     crate::chat::claude::apply_custom_profile_settings(&mut cmd, custom_profile_name);
+    crate::chat::claude::apply_custom_profile_env(&mut cmd, custom_profile_name);
     cmd.args([
         "--print",
         "--input-format",
@@ -4781,6 +6780,8 @@ fn execute_summarization_claude(
         "--output-format",
         "stream-json",
         "--verbose",
+        "--tools",
+        "default",
         "--model",
         model_str,
         "--no-session-persistence",
@@ -5053,6 +7054,8 @@ pub async fn get_session_debug_info(
     let session = sessions.find_session(&session_id);
     let claude_session_id = session.and_then(|s| s.claude_session_id.clone());
     let cursor_chat_id = session.and_then(|s| s.cursor_chat_id.clone());
+    let pi_session_id = session.and_then(|s| s.pi_session_id.clone());
+    let grok_session_id = session.and_then(|s| s.grok_session_id.clone());
 
     // Try to find Claude CLI's JSONL file
     let claude_jsonl_file = claude_session_id.as_ref().and_then(|sid| {
@@ -5135,6 +7138,9 @@ pub async fn get_session_debug_info(
         manifest_file,
         claude_session_id,
         cursor_chat_id,
+        pi_session_id,
+        commandcode_session_id: None,
+        grok_session_id,
         claude_jsonl_file,
         run_log_files,
         total_usage,
@@ -5226,7 +7232,8 @@ pub async fn resume_session(
 
         // === Codex crash recovery path ===
         if let Some(ref codex_tid) = run.codex_thread_id {
-            let had_active_turn = run.codex_turn_id.is_some();
+            let codex_turn_id = run.codex_turn_id.clone();
+            let had_active_turn = codex_turn_id.is_some();
             log::trace!(
                 "Resuming Codex run: {run_id}, thread={codex_tid}, had_active_turn={had_active_turn}"
             );
@@ -5260,20 +7267,15 @@ pub async fn resume_session(
                     &worktree_id_clone,
                     &run_id_clone,
                     &thread_id_clone,
-                    had_active_turn,
+                    codex_turn_id.as_deref(),
                 ) {
                     Ok(true) => {
                         log::info!(
                             "Codex crash recovery succeeded for session {session_id_clone}, run {run_id_clone}"
                         );
-                        // process_turn_events (if active turn) or
-                        // resume_codex_after_crash (if idle) already emitted
-                        // chat:done, so only emit here for non-active-turn
-                        // paths where the function handled completion internally.
-                        if !had_active_turn {
-                            emit_done(&app_clone, &session_id_clone, &worktree_id_clone);
-                        }
-                        // For active turns, process_turn_events emits chat:done.
+                        // process_turn_events (active turn) or
+                        // resume_codex_after_crash (idle/interrupted turn)
+                        // emits chat:done itself.
                     }
                     Ok(false) => {
                         // Thread expired — mark as crashed
@@ -5307,6 +7309,101 @@ pub async fn resume_session(
             continue;
         }
 
+        // === Pi detached RPC-host resume path ===
+        if run.backend == Some(Backend::Pi) {
+            let pid = match run.pid {
+                Some(p) => p,
+                None => continue,
+            };
+            let output_file = session_dir.join(format!("{run_id}.jsonl"));
+
+            log::trace!(
+                "Resuming Pi RPC host run: {run_id}, PID: {pid}, output: {:?}",
+                output_file
+            );
+
+            if let Some(metadata_run) = metadata.find_run_mut(&run_id) {
+                metadata_run.status = RunStatus::Running;
+            }
+            save_metadata(&app, &metadata)?;
+
+            if !super::registry::register_detached_process(session_id.clone(), pid) {
+                log::warn!("Resume Pi session {session_id} was cancelled before tailing started");
+                return Ok(ResumeSessionResponse {
+                    resumed: false,
+                    run_count: 0,
+                });
+            }
+
+            let app_clone = app.clone();
+            let session_id_clone = session_id.clone();
+            let worktree_id_clone = worktree_id.clone();
+            let run_id_clone = run_id.clone();
+
+            tauri::async_runtime::spawn(async move {
+                let emit_done = |app: &tauri::AppHandle, sid: &str, wid: &str| {
+                    let _ = app.emit_all(
+                        "chat:done",
+                        &serde_json::json!({ "session_id": sid, "worktree_id": wid, "waiting_for_plan": false }),
+                    );
+                };
+
+                let (pi_session_id, usage, cancelled) = match super::pi::tail_pi_output(
+                    &app_clone,
+                    &session_id_clone,
+                    &worktree_id_clone,
+                    &output_file,
+                    pid,
+                ) {
+                    Ok(response) => (response.session_id, response.usage, response.cancelled),
+                    Err(e) => {
+                        log::error!("Resume Pi tail failed for run: {run_id_clone}, error: {e}");
+                        super::registry::unregister_process(&session_id_clone);
+                        if let Ok(mut writer) =
+                            RunLogWriter::resume(&app_clone, &session_id_clone, &run_id_clone)
+                        {
+                            if let Err(e) = writer.crash() {
+                                log::error!("Failed to mark Pi run as crashed: {e}");
+                            }
+                        }
+                        emit_done(&app_clone, &session_id_clone, &worktree_id_clone);
+                        return;
+                    }
+                };
+
+                super::registry::unregister_process(&session_id_clone);
+                if cancelled {
+                    emit_done(&app_clone, &session_id_clone, &worktree_id_clone);
+                }
+
+                if let Ok(mut writer) =
+                    RunLogWriter::resume(&app_clone, &session_id_clone, &run_id_clone)
+                {
+                    let assistant_message_id = uuid::Uuid::new_v4().to_string();
+                    if let Err(e) = writer.complete(&assistant_message_id, None, usage.clone()) {
+                        log::error!("Failed to mark resumed Pi run completed: {e}");
+                    }
+                }
+
+                if !pi_session_id.is_empty() {
+                    if let Err(e) =
+                        with_existing_metadata_mut(&app_clone, &session_id_clone, |metadata| {
+                            metadata.pi_session_id = Some(pi_session_id.clone());
+                            if let Some(run) = metadata.find_run_mut(&run_id_clone) {
+                                // Pi run entries do not have a dedicated per-run
+                                // field yet; session-level pi_session_id is the
+                                // authoritative resume id.
+                                run.usage = usage.clone();
+                            }
+                        })
+                    {
+                        log::warn!("Failed to persist recovered Pi session id: {e}");
+                    }
+                }
+            });
+            continue;
+        }
+
         // === Claude PID-based resume path ===
         let pid = match run.pid {
             Some(p) => p,
@@ -5327,7 +7424,7 @@ pub async fn resume_session(
 
         // Register the PID in the in-memory process registry so cancel works
         // Returns false if a pending cancel was queued (process killed immediately)
-        if !super::registry::register_process(session_id.clone(), pid) {
+        if !super::registry::register_detached_process(session_id.clone(), pid) {
             log::warn!("Resume session {session_id} was cancelled before tailing started");
             return Ok(ResumeSessionResponse {
                 resumed: false,
@@ -5482,279 +7579,6 @@ pub async fn check_resumable_sessions(
     Ok(resumable)
 }
 
-// ============================================================================
-// Session Digest Commands (for context recall after switching)
-// ============================================================================
-
-/// JSON schema for session digest response
-const SESSION_DIGEST_SCHEMA: &str = r#"{"type":"object","properties":{"chat_summary":{"type":"string","description":"One sentence (max 100 chars) summarizing the overall chat goal and progress"},"last_action":{"type":"string","description":"One sentence (max 200 chars) describing what was just completed"}},"required":["chat_summary","last_action"],"additionalProperties":false}"#;
-
-/// Prompt template for session digest generation
-const SESSION_DIGEST_PROMPT: &str = r#"You are a summarization assistant. Your ONLY job is to summarize the following conversation transcript. Do NOT continue the conversation or take any actions. Just summarize.
-
-CONVERSATION TRANSCRIPT:
-{conversation}
-
-END OF TRANSCRIPT.
-
-Now provide a brief summary with exactly two fields:
-- chat_summary: One sentence (max 100 chars) describing the overall goal and current status
-- last_action: One sentence (max 200 chars) describing what was just completed in the last exchange"#;
-
-/// Response from session digest generation
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct SessionDigestResponse {
-    pub chat_summary: String,
-    pub last_action: String,
-}
-
-/// Execute one-shot Claude CLI call for session digest with JSON schema (non-streaming)
-fn execute_digest_claude(
-    app: &AppHandle,
-    prompt: &str,
-    model: &str,
-    custom_profile_name: Option<&str>,
-    working_dir: Option<&std::path::Path>,
-    worktree_id: Option<&str>,
-    magic_backend: Option<&str>,
-    reasoning_effort: Option<&str>,
-) -> Result<SessionDigestResponse, String> {
-    // Per-operation backend > project/global default_backend
-    let backend = resolve_magic_prompt_backend(app, magic_backend, worktree_id);
-
-    if backend == super::types::Backend::Opencode {
-        log::trace!("Executing one-shot OpenCode digest");
-        let json_str = super::opencode::execute_one_shot_opencode(
-            app,
-            prompt,
-            model,
-            Some(SESSION_DIGEST_SCHEMA),
-            working_dir,
-            reasoning_effort,
-        )?;
-        return serde_json::from_str(&json_str).map_err(|e| {
-            log::error!("Failed to parse OpenCode digest JSON: {e}, content: {json_str}");
-            format!("Failed to parse digest response: {e}")
-        });
-    }
-
-    if backend == super::types::Backend::Codex {
-        log::trace!("Executing one-shot Codex digest with output-schema");
-        let json_str = super::codex::execute_one_shot_codex(
-            app,
-            prompt,
-            model,
-            SESSION_DIGEST_SCHEMA,
-            working_dir,
-            reasoning_effort,
-        )?;
-        return serde_json::from_str(&json_str).map_err(|e| {
-            log::error!("Failed to parse Codex digest JSON: {e}, content: {json_str}");
-            format!("Failed to parse digest response: {e}")
-        });
-    }
-
-    if backend == super::types::Backend::Cursor {
-        log::trace!("Executing one-shot Cursor digest");
-        let json_str = super::cursor::execute_one_shot_cursor(app, prompt, model, working_dir)?;
-        return serde_json::from_str(&json_str).map_err(|e| {
-            log::error!("Failed to parse Cursor digest JSON: {e}, content: {json_str}");
-            format!("Failed to parse digest response: {e}")
-        });
-    }
-
-    let cli_path = resolve_cli_binary(app);
-    if !cli_path.exists() {
-        return Err("Claude CLI not installed".to_string());
-    }
-
-    log::trace!("Executing one-shot Claude digest with JSON schema");
-
-    let mut cmd = silent_command(&cli_path);
-    crate::chat::claude::apply_custom_profile_settings(&mut cmd, custom_profile_name);
-    cmd.args([
-        "--print",
-        "--input-format",
-        "stream-json",
-        "--output-format",
-        "stream-json",
-        "--verbose",
-        "--model",
-        model,
-        "--no-session-persistence",
-        "--max-turns",
-        "2", // Need 2 turns: one for thinking, one for structured output
-        "--json-schema",
-        SESSION_DIGEST_SCHEMA,
-        "--permission-mode",
-        "plan", // Read-only mode - don't allow any tool use
-    ]);
-
-    cmd.stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| format!("Failed to spawn Claude CLI: {e}"))?;
-
-    // Write prompt to stdin as stream-json format
-    {
-        let stdin = child.stdin.as_mut().ok_or("Failed to open stdin")?;
-        let input_message = serde_json::json!({
-            "type": "user",
-            "message": {
-                "role": "user",
-                "content": prompt
-            }
-        });
-        writeln!(stdin, "{input_message}").map_err(|e| format!("Failed to write to stdin: {e}"))?;
-    }
-
-    let output = child
-        .wait_with_output()
-        .map_err(|e| format!("Failed to wait for Claude CLI: {e}"))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        return Err(format!(
-            "Claude CLI failed (exit code {:?}): stderr={}, stdout={}",
-            output.status.code(),
-            stderr.trim(),
-            stdout.trim()
-        ));
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-
-    log::trace!("Claude CLI stdout: {stdout}");
-    log::trace!("Claude CLI stderr: {stderr}");
-
-    let text_content = extract_text_from_stream_json(&stdout)?;
-
-    log::trace!("Extracted text content for JSON parsing: {text_content}");
-
-    // Check for empty content before trying to parse
-    if text_content.trim().is_empty() {
-        log::error!(
-            "Empty content extracted from Claude response. stdout: {}, stderr: {}",
-            stdout,
-            stderr
-        );
-        return Err("Empty response from Claude CLI".to_string());
-    }
-
-    // Parse the JSON response
-    serde_json::from_str(&text_content).map_err(|e| {
-        let preview = if text_content.len() > 200 {
-            format!("{}...", &text_content[..200])
-        } else {
-            text_content.to_string()
-        };
-        log::error!(
-            "Failed to parse JSON response: {e}, content preview: {preview}, full stdout: {stdout}"
-        );
-        format!("Failed to parse structured response: {e}")
-    })
-}
-
-/// Generate a brief digest of a session for context recall
-///
-/// This command is called when a user opens a session that had activity while
-/// it was out of focus. It generates a short summary to help the user recall
-/// what was happening in the session.
-#[tauri::command]
-pub async fn generate_session_digest(
-    app: AppHandle,
-    session_id: String,
-) -> Result<SessionDigest, String> {
-    log::trace!("Generating digest for session {}", session_id);
-
-    // Load preferences to get model
-    let prefs = crate::load_preferences(app.clone())
-        .await
-        .map_err(|e| format!("Failed to load preferences: {e}"))?;
-
-    // Load messages from session
-    let messages = run_log::load_session_messages(&app, &session_id)?;
-
-    if messages.len() < 2 {
-        return Err("Session has too few messages for digest".to_string());
-    }
-
-    // Format messages into conversation history (reuse existing function)
-    let conversation_history = format_messages_for_summary(&messages);
-
-    // Build digest prompt (use custom magic prompt if set, otherwise default)
-    let prompt_template = prefs
-        .magic_prompts
-        .session_recap
-        .as_deref()
-        .filter(|p| !p.trim().is_empty())
-        .unwrap_or(SESSION_DIGEST_PROMPT);
-    let prompt = prompt_template.replace("{conversation}", &conversation_history);
-
-    // Use magic prompt model/provider/backend
-    let model = &prefs.magic_prompt_models.session_recap_model;
-    let provider = prefs
-        .magic_prompt_providers
-        .session_recap_provider
-        .as_deref();
-    let magic_backend = prefs.magic_prompt_backends.session_recap_backend.as_deref();
-    let effort = prefs.magic_prompt_efforts.session_recap_effort.as_deref();
-
-    // Call Claude CLI with JSON schema (non-streaming)
-    let response = execute_digest_claude(
-        &app,
-        &prompt,
-        model,
-        provider,
-        None,
-        None,
-        magic_backend,
-        effort,
-    )?;
-
-    Ok(SessionDigest {
-        chat_summary: response.chat_summary,
-        last_action: response.last_action,
-        created_at: Some(
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs(),
-        ),
-        message_count: Some(messages.len()),
-    })
-}
-
-/// Update a session's persisted digest
-///
-/// Called after generating a digest to persist it to disk so it survives app reload.
-#[tauri::command]
-pub async fn update_session_digest(
-    app: AppHandle,
-    session_id: String,
-    digest: SessionDigest,
-) -> Result<(), String> {
-    log::trace!("Persisting digest for session {session_id}");
-
-    // Load existing metadata
-    let metadata = load_metadata(&app, &session_id)?
-        .ok_or_else(|| format!("Session {session_id} not found"))?;
-
-    // Update and save with new digest
-    let mut updated = metadata;
-    updated.digest = Some(digest);
-
-    super::storage::save_metadata(&app, &updated)?;
-
-    log::trace!("Digest persisted for session {session_id}");
-    Ok(())
-}
-
 /// Broadcast a session setting change to all connected clients.
 /// Used for real-time sync of model, thinking level, and execution mode.
 #[tauri::command]
@@ -5826,6 +7650,7 @@ pub async fn get_mcp_servers(
         Some("codex") => crate::codex_cli::mcp::get_mcp_servers(wt),
         Some("opencode") => crate::opencode_cli::mcp::get_mcp_servers(wt),
         Some("cursor") => crate::cursor_cli::mcp::get_mcp_servers(wt),
+        Some("grok") => Vec::new(),
         _ => crate::claude_cli::mcp::get_mcp_servers(wt),
     };
     Ok(servers)
@@ -5891,6 +7716,9 @@ pub async fn check_mcp_health(
         Some("codex") => check_mcp_health_codex(&app),
         Some("opencode") => check_mcp_health_opencode(&app),
         Some("cursor") => check_mcp_health_cursor(&app, worktree_path.as_deref()),
+        Some("grok") => Ok(McpHealthResult {
+            statuses: std::collections::HashMap::new(),
+        }),
         _ => check_mcp_health_claude(&app),
     }
 }
@@ -5903,7 +7731,7 @@ fn check_mcp_health_claude(app: &AppHandle) -> Result<McpHealthResult, String> {
 
     log::debug!("Running: claude mcp list");
 
-    let output = silent_command(&cli_path)
+    let output = crate::platform::cli_command(&cli_path.to_string_lossy(), None)
         .args(["mcp", "list"])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -5922,14 +7750,14 @@ fn check_mcp_health_claude(app: &AppHandle) -> Result<McpHealthResult, String> {
 }
 
 fn check_mcp_health_codex(app: &AppHandle) -> Result<McpHealthResult, String> {
-    let cli_path = crate::codex_cli::resolve_cli_binary(app);
+    let cli_path = crate::codex_cli::resolve_cli_binary(app)?;
     if !cli_path.exists() {
         return Err("Codex CLI not installed".to_string());
     }
 
     log::debug!("Running: codex mcp list --json");
 
-    let output = silent_command(&cli_path)
+    let output = crate::platform::cli_command(&cli_path.to_string_lossy(), None)
         .args(["mcp", "list", "--json"])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -5955,7 +7783,7 @@ fn check_mcp_health_opencode(app: &AppHandle) -> Result<McpHealthResult, String>
 
     log::debug!("Running: opencode mcp list");
 
-    let output = silent_command(&cli_path)
+    let output = crate::platform::cli_command(&cli_path.to_string_lossy(), None)
         .args(["mcp", "list"])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -6106,8 +7934,8 @@ pub fn respond_codex_dynamic_tool_call(
 #[tauri::command]
 pub async fn enqueue_message(
     app: AppHandle,
-    _worktree_id: String,
-    _worktree_path: String,
+    worktree_id: String,
+    worktree_path: String,
     session_id: String,
     message: serde_json::Value,
 ) -> Result<Vec<serde_json::Value>, String> {
@@ -6121,6 +7949,8 @@ pub async fn enqueue_message(
         &serde_json::json!({ "sessionId": session_id, "queue": queue }),
     )
     .ok();
+
+    trigger_backend_queue_drain(app.clone(), worktree_id, worktree_path, session_id);
 
     Ok(queue)
 }
@@ -6202,6 +8032,685 @@ pub async fn clear_message_queue(
     Ok(())
 }
 
+/// Move a specific queued message to the front of the queue by its `id` field.
+/// Returns `false` when the message is no longer queued (another client dequeued
+/// or removed it) — callers must abort their send-now flow in that case.
+/// Holds the metadata lock across the entire read-modify-write to prevent TOCTOU races.
+#[tauri::command]
+pub async fn move_queued_message_front(
+    app: AppHandle,
+    worktree_id: String,
+    worktree_path: String,
+    session_id: String,
+    message_id: String,
+) -> Result<bool, String> {
+    let (moved, queue) = with_existing_metadata_mut(&app, &session_id, |metadata| {
+        let idx = metadata
+            .queued_messages
+            .iter()
+            .position(|m| m.get("id").and_then(|v| v.as_str()) == Some(message_id.as_str()));
+        let moved = match idx {
+            Some(idx) => {
+                let msg = metadata.queued_messages.remove(idx);
+                metadata.queued_messages.insert(0, msg);
+                true
+            }
+            None => false,
+        };
+        (moved, metadata.queued_messages.clone())
+    })?;
+
+    if moved {
+        app.emit_all(
+            "queue:updated",
+            &serde_json::json!({ "sessionId": session_id, "queue": queue }),
+        )
+        .ok();
+
+        // A session that went idle mid-click should still pick up the promoted message.
+        trigger_backend_queue_drain(app.clone(), worktree_id, worktree_path, session_id);
+    }
+
+    Ok(moved)
+}
+
+/// Inject a user message into a running Codex turn via app-server `turn/steer`.
+/// The injected text becomes part of the current turn (the model sees it after
+/// the next tool call). Fails when the session has no active turn or the turn
+/// already ended — callers fall back to cancel+send.
+#[tauri::command]
+pub async fn steer_codex_turn(
+    app: AppHandle,
+    worktree_id: String,
+    session_id: String,
+    message: String,
+    queued_message: Option<Value>,
+) -> Result<(), String> {
+    if let Some(queued_message) = queued_message {
+        let input = codex_steer_input_from_queued_message(&queued_message)?;
+        let display_text = build_queued_message_with_refs(&queued_message)?;
+        steer_input_into_codex_turn(&app, &worktree_id, &session_id, input, &display_text).await
+    } else {
+        steer_text_into_codex_turn(&app, &worktree_id, &session_id, &message).await
+    }
+}
+
+/// Inject a text-only user message into a running OpenCode session via
+/// OpenCode's `prompt_async` endpoint. Unlike Codex `turn/steer`, OpenCode
+/// appends an async prompt to the active session; callers still fall back to
+/// queue/cancel+send when this request fails.
+#[tauri::command]
+pub async fn steer_opencode_turn(
+    app: AppHandle,
+    worktree_id: String,
+    worktree_path: String,
+    session_id: String,
+    message: String,
+) -> Result<(), String> {
+    steer_text_into_opencode_turn(&app, &worktree_id, &worktree_path, &session_id, &message).await
+}
+
+fn opencode_text_prompt_payload(message: &str) -> serde_json::Value {
+    serde_json::json!({
+        "parts": [
+            {
+                "type": "text",
+                "text": message,
+            }
+        ]
+    })
+}
+
+async fn steer_text_into_opencode_turn(
+    app: &AppHandle,
+    worktree_id: &str,
+    worktree_path: &str,
+    session_id: &str,
+    message: &str,
+) -> Result<(), String> {
+    let metadata = load_metadata(app, session_id)?
+        .ok_or_else(|| format!("No metadata found for session: {session_id}"))?;
+    // Prefer the live run's OpenCode session id from the registry: on the FIRST
+    // turn of a new session, `metadata.opencode_session_id` is still None (only
+    // persisted after the run completes), so metadata-only resolution silently
+    // dropped first-turn steers. The registry holds the currently-running id.
+    let opencode_session_id = super::registry::get_opencode_session_id(session_id)
+        .or_else(|| metadata.opencode_session_id.clone())
+        .ok_or_else(|| format!("No OpenCode session id for session: {session_id}"))?;
+    let run_id = metadata
+        .runs
+        .iter()
+        .rev()
+        .find(|r| r.status == RunStatus::Running && r.backend == Some(Backend::Opencode))
+        .map(|r| r.run_id.clone())
+        .ok_or_else(|| format!("No running OpenCode run for session: {session_id}"))?;
+
+    // Wait until the main `/message` turn is actively streaming before injecting.
+    // A `prompt_async` sent before the turn is live starts a SECOND concurrent
+    // turn on the same OpenCode session, which resets the in-flight `/message`
+    // connection (the "error sending request for url" failure). If the turn never
+    // starts within the window, bail so the caller requeues instead of colliding.
+    if !crate::chat::opencode::wait_opencode_turn_started(
+        &opencode_session_id,
+        std::time::Duration::from_secs(15),
+    ) {
+        return Err(format!(
+            "OpenCode turn not yet active for session {session_id}; cannot steer"
+        ));
+    }
+
+    let base_url = crate::opencode_server::acquire(app)?;
+
+    struct ServerReleaseGuard;
+    impl Drop for ServerReleaseGuard {
+        fn drop(&mut self) {
+            crate::opencode_server::release();
+        }
+    }
+    let _server_guard = ServerReleaseGuard;
+
+    let prompt_url = format!("{base_url}/session/{opencode_session_id}/prompt_async");
+    let directory = worktree_path.to_string();
+    let payload = opencode_text_prompt_payload(message);
+
+    tauri::async_runtime::spawn_blocking(move || {
+        let client = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .map_err(|e| format!("Failed to build OpenCode steer client: {e}"))?;
+
+        let response = client
+            .post(&prompt_url)
+            .query(&[("directory", directory)])
+            .json(&payload)
+            .send()
+            .map_err(|e| format!("Failed to steer OpenCode session: {e}"))?;
+
+        if response.status().is_success() {
+            Ok(())
+        } else {
+            let status = response.status();
+            let body = response.text().unwrap_or_default();
+            Err(format!(
+                "OpenCode steer failed: status={status}, body={body}"
+            ))
+        }
+    })
+    .await
+    .map_err(|e| format!("OpenCode steer task failed: {e}"))??;
+
+    // Tell the running OpenCode turn to wait for `session.idle` before finalizing,
+    // so this injected prompt's streamed output is captured into the run.
+    crate::chat::opencode::mark_opencode_steered(&opencode_session_id);
+
+    match run_log::RunLogWriter::resume(app, session_id, &run_id) {
+        Ok(mut writer) => {
+            let line = serde_json::json!({
+                "type": "steered_user_message",
+                "text": message,
+            });
+            if let Err(e) = writer.write_line(&line.to_string()) {
+                log::warn!(
+                    "Failed to persist OpenCode steered message for session {session_id}: {e}"
+                );
+            }
+        }
+        Err(e) => log::warn!("Failed to open OpenCode run log for steered message: {e}"),
+    }
+
+    app.emit_all(
+        "chat:steered",
+        &serde_json::json!({
+            "session_id": session_id,
+            "worktree_id": worktree_id,
+            "text": message,
+        }),
+    )
+    .ok();
+
+    Ok(())
+}
+
+/// Core steer implementation shared by the `steer_codex_turn` command and the
+/// queue auto-steer drain: sends `turn/steer`, persists the injected text into
+/// the run log, and broadcasts `chat:steered` for live display.
+async fn steer_text_into_codex_turn(
+    app: &AppHandle,
+    worktree_id: &str,
+    session_id: &str,
+    message: &str,
+) -> Result<(), String> {
+    let input = vec![serde_json::json!({
+        "type": "text",
+        "text": message,
+        "text_elements": [],
+    })];
+    steer_input_into_codex_turn(app, worktree_id, session_id, input, message).await
+}
+
+async fn steer_input_into_codex_turn(
+    app: &AppHandle,
+    worktree_id: &str,
+    session_id: &str,
+    input: Vec<Value>,
+    display_text: &str,
+) -> Result<(), String> {
+    let (thread_id, turn_id) = super::registry::get_codex_turn(session_id)
+        .ok_or_else(|| format!("No active Codex turn for session: {session_id}"))?;
+    // Turn registered with empty id before turn/started arrives — too early to steer.
+    if turn_id.is_empty() {
+        return Err("Codex turn not started yet".to_string());
+    }
+
+    let metadata = load_metadata(app, session_id)?
+        .ok_or_else(|| format!("No metadata found for session: {session_id}"))?;
+    let run_id = metadata
+        .runs
+        .iter()
+        .rev()
+        .find(|r| r.status == RunStatus::Running)
+        .map(|r| r.run_id.clone())
+        .ok_or_else(|| format!("No running run for session: {session_id}"))?;
+
+    // send_request blocks on a oneshot channel — must not run on the async runtime.
+    let params = super::codex::build_turn_steer_params_with_input(&thread_id, &turn_id, input);
+    tauri::async_runtime::spawn_blocking(move || {
+        super::codex_server::send_request("turn/steer", params)
+    })
+    .await
+    .map_err(|e| format!("Steer task failed: {e}"))??;
+
+    // Persist into the run log so transcript reconstruction keeps the injected
+    // text ordered between the surrounding tool calls. Appends are atomic per
+    // write, so this is safe alongside the live event writer.
+    match run_log::RunLogWriter::resume(app, session_id, &run_id) {
+        Ok(mut writer) => {
+            let line = serde_json::json!({
+                "type": "steered_user_message",
+                "text": display_text,
+            });
+            if let Err(e) = writer.write_line(&line.to_string()) {
+                log::warn!("Failed to persist steered message for session {session_id}: {e}");
+            }
+        }
+        Err(e) => log::warn!("Failed to open run log for steered message: {e}"),
+    }
+
+    // Live display on all clients (native + web).
+    app.emit_all(
+        "chat:steered",
+        &serde_json::json!({
+            "session_id": session_id,
+            "worktree_id": worktree_id,
+            "text": display_text,
+        }),
+    )
+    .ok();
+
+    Ok(())
+}
+
+/// A queued message can be steered into a running Codex turn when its captured
+/// backend is Codex. Codex `turn/steer` accepts structured user input, so queued
+/// images/files/skills are forwarded as structured attachments. A message queued
+/// with a different backend
+///   selected (the user switched mid-run) must NOT be injected into the Codex
+///   turn — it runs as its own backend once the current run finishes.
+///
+/// The `backend` field is omitted for the Claude default (see the frontend
+/// `QueuedMessage` capture), so a missing/null backend is treated as non-Codex.
+fn queued_message_is_steerable(msg: &serde_json::Value) -> bool {
+    queued_message_is_steerable_for_backend(msg, "codex")
+}
+
+fn queued_message_is_steerable_for_backend(msg: &serde_json::Value, backend: &str) -> bool {
+    let backend_matches = msg.get("backend").and_then(Value::as_str) == Some(backend);
+    if !backend_matches {
+        return false;
+    }
+
+    if backend == "codex" {
+        return true;
+    }
+
+    const ATTACHMENT_KEYS: [&str; 4] = [
+        "pendingImages",
+        "pendingFiles",
+        "pendingSkills",
+        "pendingTextFiles",
+    ];
+    ATTACHMENT_KEYS.iter().all(|key| {
+        msg.get(key)
+            .and_then(Value::as_array)
+            .map(|a| a.is_empty())
+            .unwrap_or(true)
+    })
+}
+
+/// Inject a user message into a running Pi RPC turn via the detached PI host.
+#[tauri::command]
+pub async fn steer_pi_turn(
+    app: AppHandle,
+    worktree_id: String,
+    session_id: String,
+    message: String,
+) -> Result<(), String> {
+    steer_text_into_pi_turn(&app, &worktree_id, &session_id, &message).await
+}
+
+async fn steer_text_into_pi_turn(
+    app: &AppHandle,
+    worktree_id: &str,
+    session_id: &str,
+    message: &str,
+) -> Result<(), String> {
+    #[cfg(not(unix))]
+    {
+        let _ = (app, worktree_id, session_id, message);
+        Err("Pi steering is only available for detached Unix RPC hosts".to_string())
+    }
+
+    #[cfg(unix)]
+    {
+        let metadata = load_metadata(app, session_id)?
+            .ok_or_else(|| format!("No metadata found for session: {session_id}"))?;
+        let run_id = metadata
+            .runs
+            .iter()
+            .rev()
+            .find(|r| r.status == RunStatus::Running && r.backend == Some(Backend::Pi))
+            .map(|r| r.run_id.clone())
+            .ok_or_else(|| format!("No running Pi run for session: {session_id}"))?;
+        let app_data = app
+            .path()
+            .app_data_dir()
+            .map_err(|e| format!("Failed to resolve app data dir: {e}"))?;
+        let socket_path = super::pi::pi_rpc_socket_path(&app_data, session_id, &run_id);
+        let line = super::pi::serialize_pi_rpc_command(
+            "steer",
+            Some(message),
+            Some(&format!("steer-{run_id}")),
+        );
+        super::pi::send_pi_rpc_host_command(&socket_path, &line)?;
+
+        match run_log::RunLogWriter::resume(app, session_id, &run_id) {
+            Ok(mut writer) => {
+                let line = serde_json::json!({
+                    "type": "steered_user_message",
+                    "text": message,
+                });
+                if let Err(e) = writer.write_line(&line.to_string()) {
+                    log::warn!(
+                        "Failed to persist Pi steered message for session {session_id}: {e}"
+                    );
+                }
+            }
+            Err(e) => log::warn!("Failed to open run log for Pi steered message: {e}"),
+        }
+
+        app.emit_all(
+            "chat:steered",
+            &serde_json::json!({
+                "session_id": session_id,
+                "worktree_id": worktree_id,
+                "text": message,
+            }),
+        )
+        .ok();
+
+        Ok(())
+    }
+}
+
+/// Drain steerable queued messages straight into the running Codex turn
+/// (when the `codex_auto_steer_enabled` preference is on, default true).
+/// Pops from the queue front in FIFO order and stops at the first message
+/// that can't be steered (attachments) so queue order is preserved.
+async fn drain_queue_into_codex_turn(app: &AppHandle, worktree_id: &str, session_id: &str) {
+    let auto_steer = crate::load_preferences_sync(app)
+        .map(|p| p.codex_auto_steer_enabled)
+        .unwrap_or(true);
+    if !auto_steer {
+        return;
+    }
+
+    loop {
+        // Only steer while a started codex turn is registered.
+        let Some((_, turn_id)) = super::registry::get_codex_turn(session_id) else {
+            return;
+        };
+        if turn_id.is_empty() {
+            return;
+        }
+
+        let popped = match with_existing_metadata_mut(app, session_id, |metadata| {
+            match metadata.queued_messages.first() {
+                Some(front) if queued_message_is_steerable(front) => {
+                    let msg = metadata.queued_messages.remove(0);
+                    (Some(msg), metadata.queued_messages.clone())
+                }
+                _ => (None, metadata.queued_messages.clone()),
+            }
+        }) {
+            Ok((popped, queue)) => {
+                if popped.is_some() {
+                    app.emit_all(
+                        "queue:updated",
+                        &serde_json::json!({ "sessionId": session_id, "queue": queue }),
+                    )
+                    .ok();
+                }
+                popped
+            }
+            Err(e) => {
+                log::warn!("[CodexSteer] failed to read queue session={session_id}: {e}");
+                return;
+            }
+        };
+
+        let Some(msg) = popped else { return };
+        let input = match codex_steer_input_from_queued_message(&msg) {
+            Ok(input) => input,
+            Err(e) => {
+                log::warn!(
+                    "[CodexSteer] invalid queued message, skipping session={session_id}: {e}"
+                );
+                continue;
+            }
+        };
+        let display_text = match build_queued_message_with_refs(&msg) {
+            Ok(text) => text,
+            Err(e) => {
+                log::warn!("[CodexSteer] invalid queued message display text, skipping session={session_id}: {e}");
+                continue;
+            }
+        };
+
+        log::info!("[CodexSteer] steering queued message into running turn session={session_id}");
+        if let Err(e) =
+            steer_input_into_codex_turn(app, worktree_id, session_id, input, &display_text).await
+        {
+            // Turn ended mid-drain — put the message back so the normal
+            // queue path sends it when the run completes.
+            log::warn!("[CodexSteer] steer failed, requeueing at front session={session_id}: {e}");
+            let requeued = with_existing_metadata_mut(app, session_id, |metadata| {
+                metadata.queued_messages.insert(0, msg.clone());
+                metadata.queued_messages.clone()
+            });
+            if let Ok(queue) = requeued {
+                app.emit_all(
+                    "queue:updated",
+                    &serde_json::json!({ "sessionId": session_id, "queue": queue }),
+                )
+                .ok();
+            }
+            return;
+        }
+    }
+}
+
+/// Fire-and-forget steer drain — called from the Codex `turn/started` handler
+/// so prompts queued before the turn became steerable get injected.
+pub(crate) fn trigger_codex_queue_steer(app: AppHandle, worktree_id: String, session_id: String) {
+    tauri::async_runtime::spawn(async move {
+        drain_queue_into_codex_turn(&app, &worktree_id, &session_id).await;
+    });
+}
+
+/// Drain steerable queued messages into a running OpenCode session via
+/// `prompt_async` (when `opencode_auto_steer_enabled` is on, default true).
+async fn drain_queue_into_opencode_turn(
+    app: &AppHandle,
+    worktree_id: &str,
+    worktree_path: &str,
+    session_id: &str,
+) {
+    let auto_steer = crate::load_preferences_sync(app)
+        .map(|p| p.opencode_auto_steer_enabled)
+        .unwrap_or(true);
+    if !auto_steer {
+        return;
+    }
+
+    loop {
+        let has_running_opencode = load_metadata(app, session_id)
+            .ok()
+            .flatten()
+            .and_then(|metadata| {
+                metadata
+                    .runs
+                    .iter()
+                    .rev()
+                    .find(|r| {
+                        r.status == RunStatus::Running && r.backend == Some(Backend::Opencode)
+                    })
+                    .map(|r| r.run_id.clone())
+            })
+            .is_some();
+        if !has_running_opencode {
+            return;
+        }
+
+        let popped = match with_existing_metadata_mut(app, session_id, |metadata| {
+            match metadata.queued_messages.first() {
+                Some(front) if queued_message_is_steerable_for_backend(front, "opencode") => {
+                    let msg = metadata.queued_messages.remove(0);
+                    (Some(msg), metadata.queued_messages.clone())
+                }
+                _ => (None, metadata.queued_messages.clone()),
+            }
+        }) {
+            Ok((popped, queue)) => {
+                if popped.is_some() {
+                    app.emit_all(
+                        "queue:updated",
+                        &serde_json::json!({ "sessionId": session_id, "queue": queue }),
+                    )
+                    .ok();
+                }
+                popped
+            }
+            Err(e) => {
+                log::warn!("[OpenCodeSteer] failed to read queue session={session_id}: {e}");
+                return;
+            }
+        };
+
+        let Some(msg) = popped else { return };
+        let text = msg
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        if text.is_empty() {
+            continue;
+        }
+
+        log::info!("[OpenCodeSteer] steering queued message into running session={session_id}");
+        if let Err(e) =
+            steer_text_into_opencode_turn(app, worktree_id, worktree_path, session_id, &text).await
+        {
+            log::warn!(
+                "[OpenCodeSteer] steer failed, requeueing at front session={session_id}: {e}"
+            );
+            let requeued = with_existing_metadata_mut(app, session_id, |metadata| {
+                metadata.queued_messages.insert(0, msg.clone());
+                metadata.queued_messages.clone()
+            });
+            if let Ok(queue) = requeued {
+                app.emit_all(
+                    "queue:updated",
+                    &serde_json::json!({ "sessionId": session_id, "queue": queue }),
+                )
+                .ok();
+            }
+            return;
+        }
+    }
+}
+
+/// Fire-and-forget OpenCode steer drain — called after OpenCode session id is
+/// known, so prompts queued while startup was still registering can be injected.
+pub(crate) fn trigger_opencode_queue_steer(
+    app: AppHandle,
+    worktree_id: String,
+    worktree_path: String,
+    session_id: String,
+) {
+    tauri::async_runtime::spawn(async move {
+        drain_queue_into_opencode_turn(&app, &worktree_id, &worktree_path, &session_id).await;
+    });
+}
+
+/// Drain steerable queued messages into a running Pi RPC host. Pi's own
+/// steering queue delivers these at the next safe tool/turn boundary.
+async fn drain_queue_into_pi_turn(app: &AppHandle, worktree_id: &str, session_id: &str) {
+    let auto_steer = crate::load_preferences_sync(app)
+        .map(|p| p.pi_auto_steer_enabled)
+        .unwrap_or(true);
+    if !auto_steer {
+        return;
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = (app, worktree_id, session_id);
+    }
+
+    #[cfg(unix)]
+    loop {
+        let has_running_pi = load_metadata(app, session_id)
+            .ok()
+            .flatten()
+            .and_then(|metadata| {
+                metadata
+                    .runs
+                    .iter()
+                    .rev()
+                    .find(|r| r.status == RunStatus::Running && r.backend == Some(Backend::Pi))
+                    .map(|r| r.run_id.clone())
+            })
+            .is_some();
+        if !has_running_pi {
+            return;
+        }
+
+        let popped = match with_existing_metadata_mut(app, session_id, |metadata| {
+            match metadata.queued_messages.first() {
+                Some(front) if queued_message_is_steerable_for_backend(front, "pi") => {
+                    let msg = metadata.queued_messages.remove(0);
+                    (Some(msg), metadata.queued_messages.clone())
+                }
+                _ => (None, metadata.queued_messages.clone()),
+            }
+        }) {
+            Ok((popped, queue)) => {
+                if popped.is_some() {
+                    app.emit_all(
+                        "queue:updated",
+                        &serde_json::json!({ "sessionId": session_id, "queue": queue }),
+                    )
+                    .ok();
+                }
+                popped
+            }
+            Err(e) => {
+                log::warn!("[PiSteer] failed to read queue session={session_id}: {e}");
+                return;
+            }
+        };
+
+        let Some(msg) = popped else { return };
+        let text = msg
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        if text.is_empty() {
+            continue;
+        }
+
+        log::info!("[PiSteer] steering queued message into running Pi session={session_id}");
+        if let Err(e) = steer_text_into_pi_turn(app, worktree_id, session_id, &text).await {
+            log::warn!("[PiSteer] steer failed, requeueing at front session={session_id}: {e}");
+            let requeued = with_existing_metadata_mut(app, session_id, |metadata| {
+                metadata.queued_messages.insert(0, msg.clone());
+                metadata.queued_messages.clone()
+            });
+            if let Ok(queue) = requeued {
+                app.emit_all(
+                    "queue:updated",
+                    &serde_json::json!({ "sessionId": session_id, "queue": queue }),
+                )
+                .ok();
+            }
+            return;
+        }
+    }
+}
+
 /// Cancel the pending ScheduleWakeup for a session (user-initiated).
 #[tauri::command]
 pub async fn cancel_session_wakeup(app: AppHandle, session_id: String) -> Result<bool, String> {
@@ -6247,6 +8756,547 @@ pub async fn answer_opencode_question(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::chat::types::ToolCall;
+
+    #[test]
+    fn unavailable_ask_user_question_error_is_not_pending_input() {
+        let tool = ToolCall {
+            id: "toolu_unavailable_question".to_string(),
+            name: "AskUserQuestion".to_string(),
+            input: serde_json::json!({
+                "questions": "[{\"question\":\"Pick one\"}]"
+            }),
+            output: Some("<tool_use_error>Error: No such tool available: AskUserQuestion. AskUserQuestion exists but is not enabled in this context. Use one of the available tools instead.</tool_use_error>".to_string()),
+            parent_tool_use_id: None,
+        };
+
+        assert!(!is_pending_blocking_tool_call(&tool));
+    }
+
+    #[test]
+    fn editor_file_args_uses_goto_location_for_vscode_and_cursor() {
+        assert_eq!(
+            editor_file_args("vscode", "/tmp/main.ts", Some(42), Some(3)),
+            vec!["-g".to_string(), "/tmp/main.ts:42:3".to_string()]
+        );
+        assert_eq!(
+            editor_file_args("cursor", "/tmp/main.ts", Some(42), None),
+            vec!["-g".to_string(), "/tmp/main.ts:42".to_string()]
+        );
+    }
+
+    #[test]
+    fn editor_file_args_uses_editor_specific_line_flags() {
+        assert_eq!(
+            editor_file_args("xcode", "/tmp/main.swift", Some(7), Some(2)),
+            vec![
+                "-l".to_string(),
+                "7".to_string(),
+                "/tmp/main.swift".to_string()
+            ]
+        );
+        assert_eq!(
+            editor_file_args("intellij", "/tmp/Main.kt", Some(7), Some(2)),
+            vec![
+                "--line".to_string(),
+                "7".to_string(),
+                "/tmp/Main.kt".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn queued_message_steerable_allows_codex_attachments() {
+        // Codex backend, no attachments → steerable
+        let codex_plain = serde_json::json!({
+            "id": "m1", "message": "hello", "backend": "codex",
+        });
+        assert!(queued_message_is_steerable(&codex_plain));
+
+        let codex_empty_attachments = serde_json::json!({
+            "id": "m2",
+            "message": "hello",
+            "backend": "codex",
+            "pendingImages": [],
+            "pendingFiles": [],
+            "pendingSkills": [],
+            "pendingTextFiles": [],
+        });
+        assert!(queued_message_is_steerable(&codex_empty_attachments));
+
+        // Codex backend with attachments → steerable as structured Codex input
+        let codex_with_image = serde_json::json!({
+            "id": "m3",
+            "message": "hello",
+            "backend": "codex",
+            "pendingImages": [{ "id": "img-1", "path": "/tmp/a.png" }],
+        });
+        assert!(queued_message_is_steerable(&codex_with_image));
+
+        // Different backend selected mid-run → never steer into the codex turn
+        let claude_default = serde_json::json!({ "id": "m4", "message": "hello" });
+        assert!(!queued_message_is_steerable(&claude_default));
+
+        let opencode = serde_json::json!({
+            "id": "m5", "message": "hello", "backend": "opencode",
+        });
+        assert!(!queued_message_is_steerable(&opencode));
+    }
+
+    #[test]
+    fn queued_message_steerable_for_backend_accepts_opencode_text_only() {
+        let opencode_plain = serde_json::json!({
+            "id": "m1",
+            "message": "hello",
+            "backend": "opencode",
+            "pendingImages": [],
+            "pendingFiles": [],
+            "pendingSkills": [],
+            "pendingTextFiles": [],
+        });
+        assert!(queued_message_is_steerable_for_backend(
+            &opencode_plain,
+            "opencode"
+        ));
+
+        let opencode_with_file = serde_json::json!({
+            "id": "m2",
+            "message": "hello",
+            "backend": "opencode",
+            "pendingFiles": [{ "id": "file-1", "path": "/tmp/a.txt" }],
+        });
+        assert!(!queued_message_is_steerable_for_backend(
+            &opencode_with_file,
+            "opencode"
+        ));
+    }
+
+    #[test]
+    fn opencode_text_prompt_payload_uses_text_part_only() {
+        assert_eq!(
+            opencode_text_prompt_payload("steer now"),
+            serde_json::json!({
+                "parts": [
+                    {
+                        "type": "text",
+                        "text": "steer now",
+                    }
+                ]
+            })
+        );
+    }
+
+    #[test]
+    fn test_queue_default_allowed_tools_match_frontend_git_scope() {
+        assert!(QUEUE_DEFAULT_ALLOWED_TOOLS.contains(&"Bash(git:*)"));
+        assert!(!QUEUE_DEFAULT_ALLOWED_TOOLS.contains(&"Bash"));
+        assert!(QUEUE_DEFAULT_ALLOWED_TOOLS.contains(&"Read"));
+        assert!(QUEUE_DEFAULT_ALLOWED_TOOLS.contains(&"Glob"));
+        assert!(QUEUE_DEFAULT_ALLOWED_TOOLS.contains(&"Grep"));
+    }
+
+    #[test]
+    fn commandcode_model_implies_commandcode_backend() {
+        assert_eq!(
+            infer_backend_from_model("commandcode/deepseek/deepseek-v4-flash", Backend::Claude),
+            Backend::Commandcode
+        );
+    }
+
+    #[test]
+    fn claude_resume_id_requires_assistant_payload() {
+        assert_eq!(
+            resume_id_for_persisted_claude_run(&Backend::Claude, "claude-session-1", false),
+            None
+        );
+        assert_eq!(
+            resume_id_for_persisted_claude_run(&Backend::Claude, "claude-session-1", true),
+            Some("claude-session-1")
+        );
+    }
+
+    #[test]
+    fn stale_resumed_claude_session_is_cleared_for_empty_cancelled_response() {
+        assert!(should_clear_stale_resumed_claude_session(
+            true, false, false, false, false, false
+        ));
+    }
+
+    #[test]
+    fn stale_resumed_claude_session_is_not_cleared_when_payload_exists() {
+        assert!(!should_clear_stale_resumed_claude_session(
+            true, true, false, false, false, true
+        ));
+        assert!(!should_clear_stale_resumed_claude_session(
+            true, false, true, false, false, true
+        ));
+        assert!(!should_clear_stale_resumed_claude_session(
+            true, false, false, true, false, true
+        ));
+    }
+
+    #[test]
+    fn stale_resumed_claude_session_is_kept_for_cancelled_content_block_only_response() {
+        // Regression for the send-path branch at the execute_claude_detached call
+        // site: a cancelled response that carries content_blocks but no plain
+        // content must NOT clear the resumed session id. Clearing it here is what
+        // produced "Response content was not captured for this completed run."
+        // after cancelling and resending (issue #395).
+        let was_resuming = true;
+        let has_content = false;
+        let has_tool_calls = false;
+        let has_content_blocks = true;
+        let has_usage = false;
+        let was_cancelled = true;
+
+        assert!(!should_clear_stale_resumed_claude_session(
+            was_resuming,
+            has_content,
+            has_tool_calls,
+            has_content_blocks,
+            has_usage,
+            was_cancelled,
+        ));
+    }
+
+    #[test]
+    fn idle_sessions_should_not_forward_cancel_requests() {
+        assert!(!should_forward_cancel_request("idle-session"));
+    }
+
+    #[test]
+    fn active_send_should_forward_cancel_requests_before_process_registration() {
+        let _claim =
+            SendClaim::try_acquire("pre-register-session").expect("send claim should acquire");
+
+        assert!(should_forward_cancel_request("pre-register-session"));
+    }
+
+    #[test]
+    fn default_model_for_commandcode_backend_uses_commandcode_preference() {
+        let prefs = crate::AppPreferences {
+            selected_model: "claude-sonnet-4-6[1m]".to_string(),
+            selected_commandcode_model: "commandcode/deepseek/deepseek-v4-flash".to_string(),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            default_model_for_backend(&Backend::Commandcode, &prefs),
+            Some("commandcode/deepseek/deepseek-v4-flash".to_string())
+        );
+    }
+
+    #[test]
+    fn test_codex_default_prompt_injects_plan_rules_only_in_plan_mode() {
+        let plan_prompt = codex_default_global_system_prompt(Some("plan"));
+        assert!(plan_prompt.contains("## Plan Mode"));
+        assert!(plan_prompt.contains("PLAN MODE"));
+        assert!(plan_prompt.contains("update_plan"));
+        assert!(plan_prompt.contains("CodexPlan"));
+        assert!(plan_prompt.contains("approval UI"));
+        assert!(!plan_prompt.contains("## Not Plan Mode"));
+
+        let build_prompt = codex_default_global_system_prompt(Some("build"));
+        assert!(!build_prompt.contains("## Plan Mode"));
+        assert!(!build_prompt.contains("update_plan"));
+        assert!(!build_prompt.contains("CodexPlan"));
+        assert!(build_prompt.contains("## Not Plan Mode"));
+        assert!(build_prompt.contains("Jean Worktree Policy"));
+        assert!(build_prompt.contains("Do NOT create git worktrees manually"));
+        assert!(build_prompt.contains("Jean MCP/tools"));
+        assert!(build_prompt.contains("VERY IMPORTANT: Keep Code Simple"));
+        assert!(build_prompt.contains("Always implement the simplest maintainable solution"));
+        assert!(build_prompt.contains("Clickable References"));
+        assert!(build_prompt.contains("include clickable links when available"));
+
+        let yolo_prompt = codex_default_global_system_prompt(Some("yolo"));
+        assert!(!yolo_prompt.contains("## Plan Mode"));
+        assert!(!yolo_prompt.contains("update_plan"));
+        assert!(!yolo_prompt.contains("CodexPlan"));
+        assert!(yolo_prompt.contains("## Not Plan Mode"));
+        assert!(yolo_prompt.contains("VERY IMPORTANT: Keep Code Simple"));
+        assert!(yolo_prompt.contains("Clickable References"));
+    }
+
+    #[test]
+    fn test_codex_legacy_global_default_resolves_to_mode_specific_prompt() {
+        let legacy_default = "### 1. Plan Mode Default
+- Every Codex plan-mode response that contains or revises a plan must use `update_plan`/`CodexPlan`; do not provide plain-text-only plans.
+
+## Jean Worktree Policy";
+
+        let yolo_prompt = resolve_codex_global_system_prompt(Some(legacy_default), Some("yolo"));
+        assert!(!yolo_prompt.contains("Plan Mode Default"));
+        assert!(!yolo_prompt.contains("update_plan"));
+        assert!(!yolo_prompt.contains("CodexPlan"));
+        assert!(yolo_prompt.contains("## Not Plan Mode"));
+
+        let plan_prompt = resolve_codex_global_system_prompt(Some(legacy_default), Some("plan"));
+        assert!(plan_prompt.contains("## Plan Mode"));
+        assert!(plan_prompt.contains("CodexPlan"));
+    }
+
+    #[test]
+    fn test_codex_custom_global_prompt_is_preserved() {
+        let custom_prompt = "Custom project rule: always mention the release train.";
+
+        let resolved = resolve_codex_global_system_prompt(Some(custom_prompt), Some("yolo"));
+
+        assert_eq!(resolved, custom_prompt);
+    }
+
+    #[test]
+    fn test_codex_execution_mode_instruction_is_last_authoritative_part() {
+        let mut parts = vec![
+            "Custom prompt still says Every Codex plan-mode response must use update_plan/CodexPlan.".to_string(),
+            crate::chat::RECAP_INSTRUCTION.to_string(),
+        ];
+
+        append_codex_execution_mode_instruction(&mut parts, Some("yolo"));
+        let combined = parts.join("\n");
+
+        let stale_plan_rule = combined
+            .rfind("update_plan/CodexPlan")
+            .expect("stale plan rule is present in custom prompt");
+        let mode_override = combined
+            .rfind("YOLO EXECUTION MODE")
+            .expect("yolo override is present");
+
+        assert!(
+            mode_override > stale_plan_rule,
+            "the current execution-mode override must come after stale plan instructions"
+        );
+        assert!(combined
+            .trim_end()
+            .ends_with("switching back to plan mode."));
+    }
+
+    #[test]
+    fn test_codex_execution_mode_instruction_overrides_build_and_yolo() {
+        assert!(codex_execution_mode_instruction(Some("plan")).is_none());
+
+        let build = codex_execution_mode_instruction(Some("build")).unwrap();
+        assert!(build.contains("BUILD MODE"));
+        assert!(build.contains("Start implementing immediately"));
+        assert!(build.contains("Do NOT call update_plan/emit CodexPlan"));
+        assert!(build.contains("supersedes any earlier plan-mode"));
+        assert!(build.contains("approved plan"));
+
+        let yolo = codex_execution_mode_instruction(Some("yolo")).unwrap();
+        assert!(yolo.contains("YOLO EXECUTION MODE"));
+        assert!(yolo.contains("Start implementing immediately"));
+        assert!(yolo.contains("Do NOT call update_plan/emit CodexPlan"));
+        assert!(yolo.contains("Do not ask for confirmation"));
+        assert!(yolo.contains("supersedes any earlier plan-mode"));
+        assert!(yolo.contains("approved plan"));
+    }
+
+    #[test]
+    fn test_codex_plan_mode_content_waits_for_approval_without_plan_tool() {
+        assert!(plan_mode_content_waits_for_approval(
+            &Backend::Codex,
+            Some("plan"),
+            true,
+            false
+        ));
+    }
+
+    #[test]
+    fn test_plan_mode_content_waiting_does_not_override_existing_plan_tools_or_non_plan_modes() {
+        assert!(!plan_mode_content_waits_for_approval(
+            &Backend::Codex,
+            Some("plan"),
+            true,
+            true
+        ));
+        assert!(!plan_mode_content_waits_for_approval(
+            &Backend::Codex,
+            Some("build"),
+            true,
+            false
+        ));
+        assert!(!plan_mode_content_waits_for_approval(
+            &Backend::Claude,
+            Some("plan"),
+            true,
+            false
+        ));
+        assert!(!plan_mode_content_waits_for_approval(
+            &Backend::Cursor,
+            Some("plan"),
+            true,
+            false
+        ));
+        assert!(!plan_mode_content_waits_for_approval(
+            &Backend::Commandcode,
+            Some("plan"),
+            true,
+            false
+        ));
+    }
+
+    #[test]
+    fn queued_prompt_skips_plan_wait_but_not_questions() {
+        assert!(queued_prompt_skips_plan_wait(true, false, true));
+        assert!(!queued_prompt_skips_plan_wait(false, false, true));
+        assert!(!queued_prompt_skips_plan_wait(true, true, true));
+        assert!(!queued_prompt_skips_plan_wait(true, false, false));
+    }
+
+    #[test]
+    fn codex_steer_input_from_queued_message_preserves_attachments() {
+        let queued = serde_json::json!({
+            "message": "Please inspect",
+            "pendingFiles": [{
+                "relativePath": "src/main.rs",
+                "sourceRootPath": "/repo",
+                "isDirectory": false
+            }],
+            "pendingSkills": [{
+                "name": "rust-async-patterns",
+                "path": "/skills/rust-async-patterns/SKILL.md"
+            }],
+            "pendingImages": [{ "path": "/tmp/screenshot.png" }],
+            "pendingTextFiles": [{
+                "filename": "notes.txt",
+                "path": "/tmp/notes.txt"
+            }]
+        });
+
+        let input = codex_steer_input_from_queued_message(&queued).unwrap();
+
+        assert_eq!(input[0]["type"], "text");
+        assert_eq!(input[0]["text"], "Please inspect");
+        assert_eq!(
+            input[1],
+            serde_json::json!({
+                "type": "mention",
+                "name": "main.rs",
+                "path": "/repo/src/main.rs",
+            })
+        );
+        assert_eq!(
+            input[2],
+            serde_json::json!({
+                "type": "skill",
+                "name": "rust-async-patterns",
+                "path": "/skills/rust-async-patterns/SKILL.md",
+            })
+        );
+        assert_eq!(
+            input[3],
+            serde_json::json!({
+                "type": "localImage",
+                "path": "/tmp/screenshot.png",
+            })
+        );
+        assert_eq!(
+            input[4],
+            serde_json::json!({
+                "type": "mention",
+                "name": "notes.txt",
+                "path": "/tmp/notes.txt",
+            })
+        );
+    }
+
+    #[test]
+    fn test_build_queued_message_with_refs_matches_frontend_format() {
+        let queued = serde_json::json!({
+            "message": "Please inspect these",
+            "pendingFiles": [{
+                "relativePath": "src/main.rs",
+                "sourceRootPath": "/repo",
+                "isDirectory": false
+            }, {
+                "relativePath": "src-tauri",
+                "sourceRootPath": "/repo",
+                "isDirectory": true
+            }],
+            "pendingSkills": [{
+                "path": "/skills/rust-async-patterns/SKILL.md"
+            }],
+            "pendingImages": [{
+                "path": "/tmp/screenshot.png"
+            }],
+            "pendingTextFiles": [{
+                "path": "/tmp/notes.txt"
+            }]
+        });
+
+        let message = build_queued_message_with_refs(&queued).unwrap();
+
+        assert!(message.contains("Please inspect these"));
+        assert!(message.contains("[File: /repo/src/main.rs - Use the Read tool to view this file]"));
+        assert!(message.contains(
+            "[Directory: /repo/src-tauri - Use Glob and Read tools to explore this directory]"
+        ));
+        assert!(message.contains(
+            "[Skill: /skills/rust-async-patterns/SKILL.md - Read and use this skill to guide your response]"
+        ));
+        assert!(message.contains(
+            "[Image attached: /tmp/screenshot.png - Use the Read tool to view this image]"
+        ));
+        assert!(message.contains(
+            "[Text file attached: /tmp/notes.txt - Use the Read tool to view this file]"
+        ));
+    }
+
+    #[test]
+    fn test_build_queued_message_with_image_only_default_prompt() {
+        let queued = serde_json::json!({
+            "message": "",
+            "pendingImages": [{ "path": "/tmp/image.png" }]
+        });
+
+        assert_eq!(
+            build_queued_message_with_refs(&queued).unwrap(),
+            "Please check this image and tell me what is wrong.\n\n[Image attached: /tmp/image.png - Use the Read tool to view this image]"
+        );
+    }
+
+    #[test]
+    fn test_codex_goal_set_params_uses_app_server_schema() {
+        let params = codex_goal_set_params("thread-123", "Ship the goal UI");
+
+        assert_eq!(
+            params,
+            serde_json::json!({
+                "threadId": "thread-123",
+                "objective": "Ship the goal UI",
+                "status": "active",
+            })
+        );
+        assert!(params.get("goal").is_none());
+    }
+
+    #[test]
+    fn test_extract_codex_goal_objective_reads_thread_goal_object() {
+        let response = serde_json::json!({
+            "goal": {
+                "threadId": "thread-123",
+                "objective": "Ship the goal UI",
+                "status": "active",
+                "createdAt": 1,
+                "updatedAt": 2,
+                "timeUsedSeconds": 3,
+                "tokensUsed": 4
+            }
+        });
+
+        assert_eq!(
+            extract_codex_goal_objective(&response).as_deref(),
+            Some("Ship the goal UI")
+        );
+    }
+
+    #[test]
+    fn test_extract_codex_goal_objective_handles_absent_goal() {
+        assert_eq!(
+            extract_codex_goal_objective(&serde_json::json!({ "goal": null })),
+            None
+        );
+    }
 
     #[test]
     fn test_extract_text_from_stream_json_text_only() {
@@ -6404,5 +9454,23 @@ my-disabled: /usr/bin/disabled (STDIO) - disabled";
         let remaining = vec![s2, s3];
         let selected = find_neighbor_non_archived_session_id(&remaining, 0);
         assert_eq!(selected.as_deref(), Some("s3"));
+    }
+
+    #[test]
+    fn native_terminal_resume_ids_are_saved_on_the_backend_specific_field() {
+        let mut claude = Session::new("Claude".to_string(), 0, Backend::Claude);
+        persist_salvaged_resume_id(&mut claude, &Backend::Claude, "claude-session");
+        assert_eq!(claude.claude_session_id.as_deref(), Some("claude-session"));
+
+        let mut codex = Session::new("Codex".to_string(), 0, Backend::Codex);
+        persist_salvaged_resume_id(&mut codex, &Backend::Codex, "codex-thread");
+        assert_eq!(codex.codex_thread_id.as_deref(), Some("codex-thread"));
+
+        let mut opencode = Session::new("OpenCode".to_string(), 0, Backend::Opencode);
+        persist_salvaged_resume_id(&mut opencode, &Backend::Opencode, "opencode-session");
+        assert_eq!(
+            opencode.opencode_session_id.as_deref(),
+            Some("opencode-session")
+        );
     }
 }

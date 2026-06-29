@@ -33,11 +33,14 @@ function isThinkingLevel(
 }
 
 const EFFORT_LEVEL_VALUES = new Set<EffortLevel>([
+  'off',
+  'minimal',
   'low',
   'medium',
   'high',
   'xhigh',
   'max',
+  'ultracode',
 ])
 
 function isEffortLevel(value: string | null | undefined): value is EffortLevel {
@@ -164,8 +167,8 @@ export function usePlanApproval({
       const model = overridesApply
         ? (preferences?.build_model ??
           preferences?.selected_model ??
-          'claude-opus-4-7')
-        : (preferences?.selected_model ?? 'claude-opus-4-7')
+          'claude-opus-4-8[1m]')
+        : (preferences?.selected_model ?? 'claude-opus-4-8[1m]')
       const buildThinkingOverride = overridesApply
         ? preferences?.build_thinking_level
         : null
@@ -178,11 +181,14 @@ export function usePlanApproval({
           : 'off'
 
       const isCodex = sessionBackend === 'codex'
+      const isPi = sessionBackend === 'pi'
       const buildEffortOverride = overridesApply
         ? preferences?.build_effort_level
         : null
       const effortAppliesBuild =
-        isCodex || supportsAdaptiveThinking(model, cliStatus?.version ?? null)
+        isCodex ||
+        isPi ||
+        supportsAdaptiveThinking(model, cliStatus?.version ?? null)
       const effortLevel: EffortLevel | undefined = effortAppliesBuild
         ? isEffortLevel(buildEffortOverride)
           ? buildEffortOverride
@@ -367,8 +373,8 @@ export function usePlanApproval({
       const model = overridesApplyYolo
         ? (preferences?.yolo_model ??
           preferences?.selected_model ??
-          'claude-opus-4-7')
-        : (preferences?.selected_model ?? 'claude-opus-4-7')
+          'claude-opus-4-8[1m]')
+        : (preferences?.selected_model ?? 'claude-opus-4-8[1m]')
       const yoloThinkingOverride = overridesApplyYolo
         ? preferences?.yolo_thinking_level
         : null
@@ -379,11 +385,13 @@ export function usePlanApproval({
           : 'off'
 
       const isCodexYolo = sessionBackend === 'codex'
+      const isPiYolo = sessionBackend === 'pi'
       const yoloEffortOverride = overridesApplyYolo
         ? preferences?.yolo_effort_level
         : null
       const effortAppliesYolo =
         isCodexYolo ||
+        isPiYolo ||
         supportsAdaptiveThinking(model, cliStatus?.version ?? null)
       const effortLevel: EffortLevel | undefined = effortAppliesYolo
         ? isEffortLevel(yoloEffortOverride)

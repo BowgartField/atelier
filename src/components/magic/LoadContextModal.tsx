@@ -536,7 +536,8 @@ export function LoadContextModal({
         {handlers.viewingContext &&
           (handlers.viewingContext.type === 'saved' ||
             handlers.viewingContext.type === 'security' ||
-            handlers.viewingContext.type === 'advisory') && (
+            handlers.viewingContext.type === 'advisory' ||
+            handlers.viewingContext.type === 'linear') && (
             <Dialog
               open={true}
               onOpenChange={() => handlers.setViewingContext(null)}
@@ -548,6 +549,8 @@ export function LoadContextModal({
                       <Shield className="h-4 w-4 text-orange-500" />
                     ) : handlers.viewingContext.type === 'advisory' ? (
                       <ShieldAlert className="h-4 w-4 text-orange-500" />
+                    ) : handlers.viewingContext.type === 'linear' ? (
+                      <LinearIcon className="h-4 w-4 text-violet-500" />
                     ) : (
                       <FolderOpen className="h-4 w-4 text-blue-500" />
                     )}
@@ -555,7 +558,7 @@ export function LoadContextModal({
                   </DialogTitle>
                 </DialogHeader>
                 <ScrollArea className="flex-1 min-h-0">
-                  <Markdown className="p-4">
+                  <Markdown compact className="p-4 text-sm">
                     {handlers.viewingContext.content}
                   </Markdown>
                 </ScrollArea>

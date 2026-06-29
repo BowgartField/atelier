@@ -43,12 +43,28 @@ export const test = base.extend<TauriMockFixtures>({
             active_session_id: string | null
           }
         > = {}
+        const worktreeStore: Array<Record<string, unknown>> = Array.isArray(
+          responseMap.list_worktrees
+        )
+          ? structuredClone(responseMap.list_worktrees)
+          : []
 
         function getWorktreeStore(worktreeId: string) {
           if (!sessionStore[worktreeId]) {
+            const seededWorktree = worktreeStore.find(
+              worktree => worktree.id === worktreeId
+            )
+            const seededSessions = Array.isArray(seededWorktree?.sessions)
+              ? structuredClone(
+                  seededWorktree.sessions as Record<string, unknown>[]
+                )
+              : []
             sessionStore[worktreeId] = {
-              sessions: [],
-              active_session_id: null,
+              sessions: seededSessions,
+              active_session_id:
+                typeof seededSessions[0]?.id === 'string'
+                  ? seededSessions[0].id
+                  : null,
             }
           }
           return sessionStore[worktreeId]
@@ -68,6 +84,35 @@ export const test = base.extend<TauriMockFixtures>({
               active_session_id: store.active_session_id,
               version: 2,
             }
+          },
+          list_worktrees: args => {
+            const projectId = args?.projectId as string | undefined
+            return structuredClone(
+              worktreeStore
+                .filter(
+                  worktree =>
+                    projectId == null || worktree.project_id === projectId
+                )
+                .sort((a, b) => Number(a.order ?? 0) - Number(b.order ?? 0))
+            )
+          },
+          reorder_worktrees: args => {
+            const orderedIds = Array.isArray(args?.worktreeIds)
+              ? (args.worktreeIds as string[])
+              : []
+            const orderById = new Map(
+              orderedIds.map((worktreeId, index) => [worktreeId, index + 1])
+            )
+
+            for (const worktree of worktreeStore) {
+              if (typeof worktree.id !== 'string') continue
+              const nextOrder = orderById.get(worktree.id)
+              if (nextOrder != null) {
+                worktree.order = nextOrder
+              }
+            }
+
+            return null
           },
           create_session: args => {
             const wid = (args?.worktreeId as string) ?? 'unknown'
@@ -145,8 +190,12 @@ export const test = base.extend<TauriMockFixtures>({
         const handlers: Record<string, (args?: any) => unknown> = {}
 
         for (const [cmd, data] of Object.entries(responseMap)) {
-          // If explicitly overridden, use static response (override wins over dynamic)
-          if (overrideSet.has(cmd)) {
+          // Keep worktree list overrides stateful so reorder_worktrees can update
+          // the same in-memory data during tests.
+          if (cmd === 'list_worktrees' || cmd === 'reorder_worktrees') {
+            handlers[cmd] = dynamicHandlers[cmd]
+          } else if (overrideSet.has(cmd)) {
+            // If explicitly overridden, use static response (override wins over dynamic)
             handlers[cmd] = () => structuredClone(data)
           } else if (dynamicHandlers[cmd]) {
             handlers[cmd] = dynamicHandlers[cmd]

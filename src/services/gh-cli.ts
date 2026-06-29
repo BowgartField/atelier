@@ -107,7 +107,12 @@ export function useGhCliStatus(options?: { enabled?: boolean }) {
 /**
  * Hook to check if GitHub CLI is authenticated
  */
-export function useGhCliAuth(options?: { enabled?: boolean }) {
+export function useGhCliAuth(options?: {
+  enabled?: boolean
+  staleTime?: number
+  gcTime?: number
+  refetchOnMount?: boolean | 'always'
+}) {
   return useQuery({
     queryKey: ghCliQueryKeys.auth(),
     queryFn: async (): Promise<GhAuthStatus> => {
@@ -130,8 +135,9 @@ export function useGhCliAuth(options?: { enabled?: boolean }) {
       }
     },
     enabled: options?.enabled ?? true,
-    staleTime: 1000 * 60 * 5, // 5 minutes
-    gcTime: 1000 * 60 * 10, // 10 minutes
+    staleTime: options?.staleTime ?? 1000 * 60 * 5, // 5 minutes
+    gcTime: options?.gcTime ?? 1000 * 60 * 10, // 10 minutes
+    refetchOnMount: options?.refetchOnMount,
   })
 }
 

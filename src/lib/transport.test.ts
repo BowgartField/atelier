@@ -27,11 +27,21 @@ class MockWebSocket {
       this.onopen?.(new Event('open'))
     })
   }
+
+  receive(data: unknown) {
+    this.onmessage?.({ data: JSON.stringify(data) } as MessageEvent)
+  }
 }
 
 async function flushAsync() {
   await Promise.resolve()
   await Promise.resolve()
+}
+
+function getWs(index: number): MockWebSocket {
+  const ws = MockWebSocket.instances[index]
+  if (!ws) throw new Error(`Expected websocket instance ${index}`)
+  return ws
 }
 
 async function loadTransportModule() {
@@ -59,8 +69,72 @@ describe('transport bootstrap', () => {
   })
 
   afterEach(() => {
+    vi.useRealTimers()
     vi.unstubAllGlobals()
     vi.doUnmock('./environment')
+  })
+
+
+  it('uses reconnect mode when refetching initial data after reconnect', async () => {
+    const transport = await loadTransportModule()
+
+    await transport.refetchInitialData({ 'worktree-1': 'session-1' }, 'project-1')
+
+    expect(fetch).toHaveBeenCalledWith(
+      '/api/init?mode=reconnect&selected_project=project-1&active_sessions=worktree-1%3Asession-1'
+    )
+  })
+
+  it('starts reconnect init fetch before websocket comes back and reuses it', async () => {
+    const transport = await loadTransportModule()
+    const fetchMock = vi.mocked(fetch)
+    fetchMock.mockClear()
+
+    const prefetch = transport.prefetchReconnectInitialData(
+      { 'worktree-1': 'session-1' },
+      'project-1'
+    )
+
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+    expect(fetchMock).toHaveBeenCalledWith(
+      '/api/init?mode=reconnect&selected_project=project-1&active_sessions=worktree-1%3Asession-1'
+    )
+
+    await expect(
+      transport.consumeReconnectInitialData(
+        { 'worktree-1': 'session-1' },
+        'project-1'
+      )
+    ).resolves.toEqual({})
+    await prefetch
+
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+  })
+
+  it('retries reconnect init fetch on consume when the prefetch failed', async () => {
+    const transport = await loadTransportModule()
+    const fetchMock = vi.mocked(fetch)
+    fetchMock.mockReset()
+    fetchMock
+      .mockResolvedValueOnce({ ok: false } as Response)
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ projects: [] }),
+      } as Response)
+
+    await transport.prefetchReconnectInitialData(
+      { 'worktree-1': 'session-1' },
+      'project-1'
+    )
+
+    await expect(
+      transport.consumeReconnectInitialData(
+        { 'worktree-1': 'session-1' },
+        'project-1'
+      )
+    ).resolves.toEqual({ projects: [] })
+
+    expect(fetchMock).toHaveBeenCalledTimes(2)
   })
 
   it('does not open websocket until bootstrap explicitly connects it', async () => {
@@ -103,5 +177,210 @@ describe('transport bootstrap', () => {
       [{ payload: { session_id: 'session-1', content: 'second' } }],
     ])
     expect(MockWebSocket.instances).toHaveLength(0)
+  })
+
+  it('dedupes terminal replay events by terminal sequence number', async () => {
+    const transport = await loadTransportModule()
+    const handler = vi.fn()
+
+    await transport.listen('terminal:output', handler)
+    transport.connectTransport()
+    await flushAsync()
+
+    const ws = getWs(0)
+    ws.receive({
+      type: 'event',
+      event: 'terminal:output',
+      payload: { terminal_id: 'term-1', data: 'first' },
+      seq: 10,
+    })
+    ws.receive({
+      type: 'event',
+      event: 'terminal:output',
+      payload: { terminal_id: 'term-1', data: 'duplicate' },
+      seq: 10,
+    })
+    ws.receive({
+      type: 'event',
+      event: 'terminal:output',
+      payload: { terminal_id: 'term-1', data: 'second' },
+      seq: 11,
+    })
+
+    expect(handler.mock.calls).toEqual([
+      [{ payload: { terminal_id: 'term-1', data: 'first' } }],
+      [{ payload: { terminal_id: 'term-1', data: 'second' } }],
+    ])
+  })
+
+  it('ignores app-level heartbeat messages without dispatching events', async () => {
+    const transport = await loadTransportModule()
+    const handler = vi.fn()
+
+    await transport.listen('heartbeat', handler)
+    transport.connectTransport()
+    await flushAsync()
+
+    getWs(0).receive({ type: 'heartbeat' })
+
+    expect(handler).not.toHaveBeenCalled()
+  })
+
+  it('keeps idle websocket alive when app-level heartbeats arrive', async () => {
+    vi.useFakeTimers()
+    const transport = await loadTransportModule()
+
+    transport.connectTransport()
+    await flushAsync()
+
+    const ws = getWs(0)
+    vi.advanceTimersByTime(49_000)
+    expect(ws.close).not.toHaveBeenCalled()
+
+    ws.receive({ type: 'heartbeat' })
+    vi.advanceTimersByTime(40_000)
+    expect(ws.close).not.toHaveBeenCalled()
+
+    vi.advanceTimersByTime(11_000)
+    expect(ws.close).toHaveBeenCalledTimes(1)
+
+    vi.useRealTimers()
+  })
+
+  it('uses extended timeout for terminal lifecycle commands', async () => {
+    vi.useFakeTimers()
+    const transport = await loadTransportModule()
+
+    let rejected = false
+    const request = transport
+      .invoke('terminal_write', { terminalId: 'term-1', data: 'echo hi\r' })
+      .catch(() => {
+        rejected = true
+      })
+
+    vi.advanceTimersByTime(60_001)
+    await flushAsync()
+
+    expect(rejected).toBe(false)
+
+    vi.advanceTimersByTime(30 * 60_000)
+    await request
+
+    expect(rejected).toBe(true)
+
+    vi.useRealTimers()
+  })
+
+  it('can explicitly request terminal replay from seq zero after full page reload', async () => {
+    const transport = await loadTransportModule()
+
+    transport.connectTransport()
+    await flushAsync()
+
+    const ws = getWs(0)
+    transport.requestTerminalReplay('term-restored', 0)
+
+    expect(ws.send).toHaveBeenCalledWith(
+      JSON.stringify({
+        type: 'terminal_replay',
+        terminal_id: 'term-restored',
+        last_seq: 0,
+      })
+    )
+  })
+
+  it('uses highest known sequence for explicit terminal replay requests', async () => {
+    const transport = await loadTransportModule()
+
+    transport.connectTransport()
+    await flushAsync()
+
+    const ws = getWs(0)
+    ws.receive({
+      type: 'event',
+      event: 'terminal:output',
+      payload: { terminal_id: 'term-1', data: 'running' },
+      seq: 21,
+    })
+
+    transport.requestTerminalReplay('term-1', 0)
+
+    expect(ws.send).toHaveBeenCalledWith(
+      JSON.stringify({
+        type: 'terminal_replay',
+        terminal_id: 'term-1',
+        last_seq: 21,
+      })
+    )
+  })
+
+  it('requests terminal_replay for active terminals after websocket reconnect', async () => {
+    const transport = await loadTransportModule()
+
+    transport.connectTransport()
+    await flushAsync()
+
+    const firstWs = getWs(0)
+    firstWs.receive({
+      type: 'event',
+      event: 'terminal:started',
+      payload: { terminal_id: 'term-1', cols: 120, rows: 40 },
+      seq: 20,
+    })
+    firstWs.receive({
+      type: 'event',
+      event: 'terminal:output',
+      payload: { terminal_id: 'term-1', data: 'running' },
+      seq: 21,
+    })
+
+    firstWs.close()
+    await new Promise(resolve => setTimeout(resolve, 150))
+    await flushAsync()
+
+    const secondWs = getWs(1)
+    expect(secondWs).toBeDefined()
+    expect(secondWs.send).toHaveBeenCalledWith(
+      JSON.stringify({
+        type: 'terminal_replay',
+        terminal_id: 'term-1',
+        last_seq: 21,
+      })
+    )
+  })
+
+  it('does not request terminal_replay after terminal stopped event', async () => {
+    const transport = await loadTransportModule()
+
+    transport.connectTransport()
+    await flushAsync()
+
+    const firstWs = getWs(0)
+    firstWs.receive({
+      type: 'event',
+      event: 'terminal:started',
+      payload: { terminal_id: 'term-1', cols: 120, rows: 40 },
+      seq: 20,
+    })
+    firstWs.receive({
+      type: 'event',
+      event: 'terminal:stopped',
+      payload: { terminal_id: 'term-1', exit_code: 0, signal: null },
+      seq: 21,
+    })
+
+    firstWs.close()
+    await new Promise(resolve => setTimeout(resolve, 150))
+    await flushAsync()
+
+    const secondWs = getWs(1)
+    expect(secondWs).toBeDefined()
+    expect(secondWs.send).not.toHaveBeenCalledWith(
+      JSON.stringify({
+        type: 'terminal_replay',
+        terminal_id: 'term-1',
+        last_seq: 21,
+      })
+    )
   })
 })

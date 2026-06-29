@@ -2,8 +2,15 @@ import { createRef } from 'react'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { fireEvent, render, screen, waitFor } from '@/test/test-utils'
 import { ChatInput } from './ChatInput'
+import { invoke } from '@/lib/transport'
+import {
+  appendPromptMetadataToPlainText,
+  encodePromptAttachmentMetadata,
+  type PromptAttachmentMetadata,
+} from './message-content-utils'
 
 const processAttachmentFile = vi.fn()
+const invokeMock = invoke as unknown as ReturnType<typeof vi.fn>
 
 const storeState = {
   inputDrafts: {} as Record<string, string>,
@@ -32,6 +39,10 @@ vi.mock('./SlashPopover', () => ({
   SlashPopover: () => null,
 }))
 
+vi.mock('@/lib/transport', () => ({
+  invoke: vi.fn(),
+}))
+
 vi.mock('@/store/chat-store', () => ({
   useChatStore: {
     getState: () => storeState,
@@ -40,8 +51,30 @@ vi.mock('@/store/chat-store', () => ({
 }))
 
 describe('ChatInput attachments', () => {
+  const renderInput = () => {
+    const formRef = createRef<HTMLFormElement>()
+    const inputRef = createRef<HTMLTextAreaElement>()
+
+    render(
+      <ChatInput
+        activeSessionId="session-1"
+        activeWorktreePath="/tmp/worktree"
+        isSending={false}
+        executionMode="build"
+        focusChatShortcut="⌘K"
+        onSubmit={vi.fn()}
+        onCancel={vi.fn()}
+        formRef={formRef}
+        inputRef={inputRef}
+      />
+    )
+
+    return screen.getByRole('textbox') as HTMLTextAreaElement
+  }
+
   beforeEach(() => {
     processAttachmentFile.mockReset()
+    invokeMock.mockReset()
     storeState.setInputDraft.mockReset()
     storeState.getPendingFiles.mockReset()
     storeState.getPendingFiles.mockReturnValue([])
@@ -130,5 +163,174 @@ describe('ChatInput attachments', () => {
     )
     expect(textarea.className).toContain('[overflow-wrap:anywhere]')
     expect(textarea.parentElement).toHaveClass('min-w-0')
+  })
+
+  it('restores attachments from rich copied prompt metadata', async () => {
+    const textarea = renderInput()
+    const metadata: PromptAttachmentMetadata = {
+      v: 1,
+      images: ['/tmp/image.png'],
+      textFiles: [],
+      files: [
+        { path: 'src/App.tsx', isDirectory: false },
+        { path: 'src/components', isDirectory: true },
+      ],
+      skills: [{ name: 'foo', path: '/skills/foo/SKILL.md' }],
+    }
+
+    fireEvent.paste(textarea, {
+      clipboardData: {
+        getData: (type: string) =>
+          type === 'text/html'
+            ? `<span data-jean-prompt="${encodePromptAttachmentMetadata(metadata)}">Check this</span>`
+            : type === 'text/plain'
+              ? 'Check this'
+              : '',
+        items: [],
+      },
+    })
+
+    await waitFor(() => {
+      expect(storeState.setInputDraft).toHaveBeenCalledWith(
+        'session-1',
+        'Check this'
+      )
+      expect(storeState.addPendingImage).toHaveBeenCalledWith(
+        'session-1',
+        expect.objectContaining({
+          path: '/tmp/image.png',
+          filename: 'image.png',
+        })
+      )
+      expect(storeState.addPendingFile).toHaveBeenCalledWith(
+        'session-1',
+        expect.objectContaining({
+          relativePath: 'src/App.tsx',
+          isDirectory: false,
+        })
+      )
+      expect(storeState.addPendingFile).toHaveBeenCalledWith(
+        'session-1',
+        expect.objectContaining({
+          relativePath: 'src/components',
+          isDirectory: true,
+        })
+      )
+      expect(storeState.addPendingSkill).toHaveBeenCalledWith(
+        'session-1',
+        expect.objectContaining({
+          name: 'foo',
+          path: '/skills/foo/SKILL.md',
+        })
+      )
+    })
+  })
+
+  it('restores attachments from plain-text copied prompt fallback', async () => {
+    const textarea = renderInput()
+    const metadata: PromptAttachmentMetadata = {
+      v: 1,
+      images: ['/tmp/image.png'],
+      textFiles: [],
+      files: [{ path: 'src/components', isDirectory: true }],
+      skills: [],
+    }
+    const copiedText = appendPromptMetadataToPlainText('Check this', metadata)
+
+    fireEvent.paste(textarea, {
+      clipboardData: {
+        getData: (type: string) => (type === 'text/plain' ? copiedText : ''),
+        items: [],
+      },
+    })
+
+    await waitFor(() => {
+      expect(storeState.setInputDraft).toHaveBeenCalledWith(
+        'session-1',
+        'Check this'
+      )
+      expect(storeState.addPendingImage).toHaveBeenCalledWith(
+        'session-1',
+        expect.objectContaining({ path: '/tmp/image.png' })
+      )
+      expect(storeState.addPendingFile).toHaveBeenCalledWith(
+        'session-1',
+        expect.objectContaining({
+          relativePath: 'src/components',
+          isDirectory: true,
+        })
+      )
+    })
+
+    expect(textarea.value).toBe('Check this')
+  })
+
+  it('preserves both image and small text when pasted together', async () => {
+    const textarea = renderInput()
+    const image = new File(['png'], 'clip.png', { type: 'image/png' })
+    processAttachmentFile.mockResolvedValue(undefined)
+
+    fireEvent.paste(textarea, {
+      clipboardData: {
+        getData: (type: string) =>
+          type === 'text/plain' ? 'caption text' : '',
+        items: [
+          {
+            type: 'image/png',
+            getAsFile: () => image,
+          },
+        ],
+      },
+    })
+
+    await waitFor(() => {
+      expect(processAttachmentFile).toHaveBeenCalledWith(image, 'session-1')
+      expect(storeState.setInputDraft).toHaveBeenCalledWith(
+        'session-1',
+        'caption text'
+      )
+    })
+    expect(textarea.value).toBe('caption text')
+  })
+
+  it('saves large text as an attachment when pasted with an image', async () => {
+    const textarea = renderInput()
+    const image = new File(['png'], 'clip.png', { type: 'image/png' })
+    const largeText = 'x'.repeat(2100)
+    processAttachmentFile.mockResolvedValue(undefined)
+    invokeMock.mockResolvedValue({
+      id: 'text-1',
+      path: '/tmp/paste.txt',
+      filename: 'paste.txt',
+      size: largeText.length,
+    })
+
+    fireEvent.paste(textarea, {
+      clipboardData: {
+        getData: (type: string) => (type === 'text/plain' ? largeText : ''),
+        items: [
+          {
+            type: 'image/png',
+            getAsFile: () => image,
+          },
+        ],
+      },
+    })
+
+    await waitFor(() => {
+      expect(processAttachmentFile).toHaveBeenCalledWith(image, 'session-1')
+      expect(invokeMock).toHaveBeenCalledWith('save_pasted_text', {
+        content: largeText,
+      })
+      expect(storeState.addPendingTextFile).toHaveBeenCalledWith(
+        'session-1',
+        expect.objectContaining({
+          id: 'text-1',
+          path: '/tmp/paste.txt',
+          content: largeText,
+        })
+      )
+    })
+    expect(textarea.value).toBe('')
   })
 })

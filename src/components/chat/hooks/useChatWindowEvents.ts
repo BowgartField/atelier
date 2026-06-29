@@ -6,14 +6,8 @@ import { useChatStore } from '@/store/chat-store'
 import { useUIStore } from '@/store/ui-store'
 import { useTerminalStore } from '@/store/terminal-store'
 import { cancelChatMessage } from '@/services/chat'
-import { isNativeApp } from '@/lib/environment'
 import { logger } from '@/lib/logger'
-import type {
-  ContentBlock,
-  QueuedMessage,
-  SessionDigest,
-  Session,
-} from '@/types/chat'
+import type { ContentBlock, QueuedMessage, Session } from '@/types/chat'
 
 interface UseChatWindowEventsParams {
   inputRef: RefObject<HTMLTextAreaElement | null>
@@ -26,13 +20,7 @@ interface UseChatWindowEventsParams {
   latestPlanFilePath: string | null
   setPlanDialogContent: (content: string | null) => void
   setIsPlanDialogOpen: (open: boolean) => void
-  // Recap dialog
   session: Session | null | undefined
-  isRecapDialogOpen: boolean
-  recapDialogDigest: SessionDigest | null
-  setRecapDialogDigest: (d: SessionDigest | null) => void
-  setIsRecapDialogOpen: (open: boolean) => void
-  setIsGeneratingRecap: (g: boolean) => void
   // Git diff
   gitStatus: { base_branch?: string } | null | undefined
   setDiffRequest: (
@@ -61,13 +49,6 @@ interface UseChatWindowEventsParams {
   currentStreamingContentBlocks: ContentBlock[]
   isSending: boolean
   currentQueuedMessages: QueuedMessage[]
-  // Create session
-  createSession: {
-    mutate: (
-      args: { worktreeId: string; worktreePath: string },
-      opts?: { onSuccess?: (session: { id: string }) => void }
-    ) => void
-  }
   // Debug/preferences
   preferences: { debug_mode_enabled?: boolean } | undefined
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -96,7 +77,7 @@ interface UseChatWindowEventsParams {
 
 /**
  * Manages all window event listeners for ChatWindow.
- * Consolidates focus, plan, recap, git-diff, cancel, create-session,
+ * Consolidates focus, plan, git-diff, cancel, create-session,
  * cycle-mode, set-chat-input, debug-mode, and context command events.
  */
 export function useChatWindowEvents({
@@ -110,11 +91,6 @@ export function useChatWindowEvents({
   setPlanDialogContent,
   setIsPlanDialogOpen,
   session,
-  isRecapDialogOpen,
-  recapDialogDigest,
-  setRecapDialogDigest,
-  setIsRecapDialogOpen,
-  setIsGeneratingRecap,
   gitStatus,
   setDiffRequest,
   isAtBottom,
@@ -122,7 +98,6 @@ export function useChatWindowEvents({
   currentStreamingContentBlocks,
   isSending,
   currentQueuedMessages,
-  createSession,
   preferences,
   patchPreferences,
   handleSaveContext,
@@ -164,7 +139,7 @@ export function useChatWindowEvents({
         !activeElement ||
         activeElement === document.body ||
         activeElement.tagName === 'BODY' ||
-        !!activeElement.closest('.xterm')
+        !!activeElement.closest('.xterm, [data-terminal-emulator]')
       )
     }
 
@@ -232,98 +207,23 @@ export function useChatWindowEvents({
     setIsPlanDialogOpen,
   ])
 
-  // R key: Open recap dialog
+  // CMD+T: Open configured default; CMD+SHIFT+T / plus buttons open picker
   useEffect(() => {
-    const handleOpenRecap = async () => {
-      if (!activeSessionId) return
-
-      if (isRecapDialogOpen) {
-        const currentCount = session?.messages.length ?? 0
-        const digestCount = recapDialogDigest?.message_count ?? 0
-        if (currentCount <= digestCount) {
-          toast.info('No new messages since last recap')
-          return
-        }
-      }
-
-      const cachedDigest = useChatStore
-        .getState()
-        .getSessionDigest(activeSessionId)
-      const existingDigest = cachedDigest ?? session?.digest ?? null
-
-      if (existingDigest && !isRecapDialogOpen) {
-        setRecapDialogDigest(existingDigest)
-        setIsRecapDialogOpen(true)
-        return
-      }
-
-      const messageCount = session?.messages.length ?? 0
-      if (messageCount < 2) {
-        toast.info('Not enough messages to generate a recap')
-        return
-      }
-
-      setRecapDialogDigest(null)
-      setIsRecapDialogOpen(true)
-      setIsGeneratingRecap(true)
-
-      try {
-        const digest = await invoke<SessionDigest>('generate_session_digest', {
-          sessionId: activeSessionId,
-        })
-        useChatStore.getState().markSessionNeedsDigest(activeSessionId)
-        useChatStore.getState().setSessionDigest(activeSessionId, digest)
-        invoke('update_session_digest', {
-          sessionId: activeSessionId,
-          digest,
-        }).catch(err => {
-          console.error('[ChatWindow] Failed to persist digest:', err)
-        })
-        setRecapDialogDigest(digest)
-      } catch (error) {
-        setRecapDialogDigest(null)
-        setIsRecapDialogOpen(false)
-        toast.error(`Failed to generate recap: ${error}`)
-      } finally {
-        setIsGeneratingRecap(false)
-      }
-    }
-    window.addEventListener('open-recap', handleOpenRecap)
-    return () => window.removeEventListener('open-recap', handleOpenRecap)
-  }, [
-    isModal,
-    activeSessionId,
-    session,
-    isRecapDialogOpen,
-    recapDialogDigest,
-    setRecapDialogDigest,
-    setIsRecapDialogOpen,
-    setIsGeneratingRecap,
-  ])
-
-  // CMD+T: Create new session
-  useEffect(() => {
-    const handler = () => {
+    const handler = (event: Event) => {
       if (!activeWorktreeId || !activeWorktreePath) return
-      createSession.mutate(
-        { worktreeId: activeWorktreeId, worktreePath: activeWorktreePath },
-        {
-          onSuccess: session => {
-            useChatStore
-              .getState()
-              .setActiveSession(activeWorktreeId, session.id)
-            window.dispatchEvent(
-              new CustomEvent('open-session-modal', {
-                detail: { sessionId: session.id },
-              })
-            )
-          },
-        }
-      )
+      const intent =
+        (event as CustomEvent<{ intent?: 'default' | 'picker' }>).detail
+          ?.intent ?? 'picker'
+      useUIStore.getState().openNewSessionModeModal({
+        worktreeId: activeWorktreeId,
+        worktreePath: activeWorktreePath,
+        origin: isModal ? 'modal' : 'chat',
+        intent,
+      })
     }
     window.addEventListener('create-new-session', handler)
     return () => window.removeEventListener('create-new-session', handler)
-  }, [activeWorktreeId, activeWorktreePath, createSession])
+  }, [activeWorktreeId, activeWorktreePath, isModal])
 
   // SHIFT+TAB: Cycle execution mode
   useEffect(() => {
@@ -449,7 +349,7 @@ export function useChatWindowEvents({
     const handleLoad = () => handleLoadContext()
     const handleRun = () => {
       const first = runScripts[0]
-      if (!isNativeApp() || !activeWorktreeId || !first) return
+      if (!activeWorktreeId || !first) return
       useTerminalStore.getState().startRun(activeWorktreeId, first)
     }
     window.addEventListener('command:save-context', handleSave)
@@ -512,7 +412,7 @@ export function useChatWindowEvents({
     const handler = (
       e: CustomEvent<{
         direction: 'up' | 'down'
-        amount?: 'small' | 'page'
+        amount?: 'small' | 'medium' | 'page'
       }>
     ) => {
       const viewport = scrollViewportRef.current
@@ -527,7 +427,12 @@ export function useChatWindowEvents({
       if (e.detail.direction === 'up' && scrollTop < 2) return
       beginKeyboardScroll()
       const isSmall = e.detail.amount === 'small'
-      const magnitude = isSmall ? 100 : viewport.clientHeight * 0.75
+      const isMedium = e.detail.amount === 'medium'
+      const magnitude = isSmall
+        ? 100
+        : isMedium
+          ? viewport.clientHeight * 0.35
+          : viewport.clientHeight * 0.75
       const delta = e.detail.direction === 'up' ? -magnitude : magnitude
       const now = performance.now()
       // Held-key repeat: previous press very recent → jump instantly so
@@ -543,7 +448,7 @@ export function useChatWindowEvents({
         endKeyboardScroll()
         return
       }
-      const duration = isSmall ? 120 : 250
+      const duration = isSmall ? 120 : isMedium ? 180 : 250
       const start = viewport.scrollTop
       const startTime = now
       const step = (t: number) => {

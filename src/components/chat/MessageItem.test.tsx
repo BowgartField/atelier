@@ -58,7 +58,6 @@ describe('MessageItem', () => {
     onQuestionAnswer: noopQuestionAnswer,
     onQuestionSkip: vi.fn(),
     onFileClick: vi.fn(),
-    onEditedFileClick: vi.fn(),
     onFixFinding: noopFixFinding,
     onFixAllFindings: noopFixAllFindings,
     isQuestionAnswered: vi.fn(() => false),
@@ -259,10 +258,37 @@ describe('MessageItem', () => {
     expect(screen.getByText('Inspect birds')).toBeVisible()
   })
 
+  it('does not render message content as intro when it exactly matches the Codex plan', () => {
+    render(
+      <MessageItem
+        {...baseProps}
+        message={{
+          ...baseMessage,
+          content: 'Short answer: goal is separate from plan mode.',
+          tool_calls: [
+            {
+              id: 'plan-1',
+              name: 'CodexPlan',
+              input: {
+                plan: 'Short answer: goal is separate from plan mode.',
+              },
+            },
+          ],
+          content_blocks: [{ type: 'tool_use', tool_call_id: 'plan-1' }],
+        }}
+      />
+    )
+
+    expect(
+      screen.getAllByText('Short answer: goal is separate from plan mode.')
+    ).toHaveLength(1)
+  })
+
   it('renders prose before the fallback plan above tool calls', () => {
     render(
       <MessageItem
         {...baseProps}
+        durationMs={23_000}
         message={{
           ...baseMessage,
           content: 'Repo inspected.\n\nPlan:\n- Implement changes\n- Add tests',
@@ -288,8 +314,12 @@ describe('MessageItem', () => {
     )
 
     const prose = screen.getByText('Repo inspected.')
+    const duration = screen.getByText('23s')
     const toolsToggle = screen.getByRole('button', { name: /1 tool used/i })
     expect(prose.compareDocumentPosition(toolsToggle)).toBe(
+      Node.DOCUMENT_POSITION_FOLLOWING
+    )
+    expect(duration.compareDocumentPosition(toolsToggle)).toBe(
       Node.DOCUMENT_POSITION_FOLLOWING
     )
     expect(screen.getByText('Plan:')).toBeVisible()
@@ -337,5 +367,49 @@ describe('MessageItem', () => {
     )
 
     expect(screen.getByText('Raptors')).toBeVisible()
+  })
+
+  it('renders assistant duration in mm:ss format when minutes are non-zero', () => {
+    render(<MessageItem {...baseProps} durationMs={145_000} />)
+
+    expect(screen.getByText('02:25')).toBeVisible()
+  })
+
+  it('renders assistant duration as seconds only when under a minute', () => {
+    render(<MessageItem {...baseProps} durationMs={23_000} />)
+
+    expect(screen.getByText('23s')).toBeVisible()
+  })
+
+  it('copies steered prompts rendered in full native messages', () => {
+    const onCopyToInput = vi.fn()
+
+    render(
+      <MessageItem
+        {...baseProps}
+        onCopyToInput={onCopyToInput}
+        message={{
+          ...baseMessage,
+          id: 'assistant-steered',
+          content: '',
+          tool_calls: [],
+          content_blocks: [
+            { type: 'text', text: 'Before steer' },
+            { type: 'user_input', text: 'copy this steered prompt' },
+            { type: 'text', text: 'After steer' },
+          ],
+        }}
+      />
+    )
+
+    screen.getByRole('button', { name: 'Copy steered prompt' }).click()
+
+    expect(onCopyToInput).toHaveBeenCalledTimes(1)
+    expect(onCopyToInput).toHaveBeenCalledWith(
+      expect.objectContaining({
+        role: 'user',
+        content: 'copy this steered prompt',
+      })
+    )
   })
 })

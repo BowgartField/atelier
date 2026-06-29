@@ -1,12 +1,13 @@
 use tauri::Manager;
 
 use super::types::{
-    CompactMetadata, ContentBlock, EffortLevel, PermissionDenial, PermissionDeniedEvent,
-    ThinkingLevel, ToolCall, UsageData,
+    is_claude_compaction_summary_text, CompactMetadata, ContentBlock, EffortLevel,
+    PermissionDenial, PermissionDeniedEvent, ThinkingLevel, ToolCall, UsageData,
 };
 use crate::http_server::EmitExt;
 use crate::projects::github_issues::{
-    get_github_contexts_dir, get_session_issue_refs, get_session_pr_refs,
+    get_github_contexts_dir, get_session_advisory_refs, get_session_issue_refs,
+    get_session_pr_refs, get_session_security_refs,
 };
 use crate::projects::linear_issues::get_session_linear_refs;
 use crate::projects::storage::load_projects_data;
@@ -17,13 +18,17 @@ use crate::projects::storage::load_projects_data;
 
 /// Default global system prompt (must match DEFAULT_GLOBAL_SYSTEM_PROMPT in preferences.ts)
 const DEFAULT_GLOBAL_SYSTEM_PROMPT: &str = "\
-### 1. Plan Mode Default\n\
-- Enter plan mode for ANY non-trivial task (3+ steps or architectural decisions)\n\
+### 1. Planning Guidance\n\
+- For non-trivial tasks (3+ steps or architectural decisions), prefer planning before implementation when the current execution mode has not already authorized execution.\n\
 - If something goes sideways, STOP and re-plan immediately - don't keep pushing\n\
-- Use plan mode for verification steps, not just building\n\
+- Use plan mode for verification steps when the current execution mode is plan; in build/yolo, verify directly after implementing.\n\
 - Write detailed specs upfront to reduce ambiguity\n\
 - Make the plan extremely concise. Sacrifice grammar for the sake of concision.\n\
-- At the end of each plan, give me a list of unresolved questions to answer, if any.\n\
+- When the current execution mode is plan, use the backend's native plan tool/UI call when available (Claude ExitPlanMode, Codex update_plan/CodexPlan, Cursor/OpenCode equivalent), not plain text only.\n\
+- For unresolved questions while planning, prefer the backend-native interactive question UI instead of plain text when available: Claude AskUserQuestion, Codex request_user_input, OpenCode question. If no such interactive question tool is present in your current tool set (headless/`--print` runs may omit Claude AskUserQuestion), do NOT skip the question and do NOT dead-end on a tool search — instead ask inline as a short numbered list of options (1, 2, 3...) and tell the user to reply with a number.\n\
+- For Codex specifically, when the current execution mode is plan: after the user answers native `request_user_input`/open questions, immediately call `update_plan`/emit `CodexPlan` again with the revised plan before any implementation.\n\
+- Every Codex response that contains or revises a plan while the current execution mode is plan must use `update_plan`/`CodexPlan`; do not provide plain-text-only plans.\n\
+- Use a plain-text Unresolved Questions section only for non-actionable notes or when the backend cannot ask interactively.\n\
 \n\
 ### 2. Documentation First\n\
 - Before designing or coding against any external library/framework/SDK/API/CLI, run WebSearch for current docs.\n\
@@ -71,8 +76,15 @@ const DEFAULT_GLOBAL_SYSTEM_PROMPT: &str = "\
 \n\
 ## Core Principles\n\
 - **Simplicity First**: Make every change as simple as possible. Impact minimal code.\n\
+- **VERY IMPORTANT: Keep Code Simple**: Do not over-engineer. Always implement the simplest maintainable solution. Avoid extra abstractions, frameworks, configuration, or future-proofing unless clearly required.\n\
+- **Clickable References**: When output mentions issues, PRs, security advisories/alerts, Linear issues, or other external resources, include clickable links when available so users can open them directly.\n\
 - **No Laziness**: Find root causes. No temporary fixes. Senior developer standards.\n\
 - **Minimal Impact**: Changes should only touch what's necessary. Avoid introducing bugs.\n\
+\n\
+## Jean Worktree Policy\n\
+- Do NOT create git worktrees manually (`git worktree add`, Superpowers `using-git-worktrees`, or similar) unless the user explicitly asks for a new worktree.\n\
+- If a new worktree is explicitly required, use Jean's worktree features through Jean MCP/tools, not raw git worktree commands.\n\
+- If already in a Jean worktree or base/main workspace, continue in the current workspace.\n\
 \n\
 ## Important!\n\
 \n\
@@ -84,13 +96,16 @@ fn execution_mode_instruction(execution_mode: Option<&str>) -> Option<&'static s
             "You are in BUILD MODE. Start implementing immediately. \
              Do NOT enter plan mode and do NOT use ExitPlanMode unless the user explicitly asks \
              for a new plan. If a required decision is missing, use AskUserQuestion instead of \
-             ExitPlanMode.",
+             ExitPlanMode; if AskUserQuestion is not in your tool set, ask inline with a short \
+             numbered list of options and have the user reply with a number.",
         ),
         "yolo" => Some(
             "You are in YOLO EXECUTION MODE. Start implementing immediately. \
              Do NOT enter plan mode and do NOT use ExitPlanMode unless the user explicitly asks \
              for a new plan. Do not ask for confirmation before routine implementation steps. \
-             If a required decision is missing, use AskUserQuestion instead of ExitPlanMode.",
+             If a required decision is missing, use AskUserQuestion instead of ExitPlanMode; \
+             if AskUserQuestion is not in your tool set, ask inline with a short numbered list \
+             of options and have the user reply with a number.",
         ),
         _ => None,
     }
@@ -122,6 +137,8 @@ struct ChunkEvent {
     session_id: String,
     worktree_id: String, // Kept for backward compatibility
     content: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    run_id: Option<String>,
 }
 
 /// Payload for tool use events sent to frontend
@@ -161,6 +178,8 @@ pub struct CancelledEvent {
     pub worktree_id: String, // Kept for backward compatibility
     pub undo_send: bool, // True if user message should be restored to input (instant cancellation)
     pub emitted_at_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
 }
 
 /// Payload for tool block position events sent to frontend
@@ -222,6 +241,59 @@ struct CompactedEvent {
     metadata: CompactMetadata,
 }
 
+fn compact_metadata_from_system_message(msg: &serde_json::Value) -> Option<CompactMetadata> {
+    msg.get("compact_metadata")
+        .or_else(|| msg.get("compactMetadata"))
+        .and_then(|metadata_val| {
+            serde_json::from_value::<CompactMetadata>(metadata_val.clone()).ok()
+        })
+}
+
+#[derive(Debug, Clone)]
+struct StreamToolUse {
+    index: usize,
+    id: String,
+    name: String,
+    input: serde_json::Value,
+}
+
+fn stream_event_tool_use(msg: &serde_json::Value) -> Option<StreamToolUse> {
+    let event = msg.get("event")?;
+    if event.get("type").and_then(|v| v.as_str()) != Some("content_block_start") {
+        return None;
+    }
+
+    let block = event.get("content_block")?;
+    if block.get("type").and_then(|v| v.as_str()) != Some("tool_use") {
+        return None;
+    }
+
+    Some(StreamToolUse {
+        index: event.get("index")?.as_u64()? as usize,
+        id: block.get("id")?.as_str()?.to_string(),
+        name: block.get("name")?.as_str()?.to_string(),
+        input: block
+            .get("input")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
+    })
+}
+
+fn stream_event_input_delta(msg: &serde_json::Value) -> Option<(usize, &str)> {
+    let event = msg.get("event")?;
+    if event.get("type").and_then(|v| v.as_str()) != Some("content_block_delta") {
+        return None;
+    }
+
+    let index = event.get("index")?.as_u64()? as usize;
+    let delta = event.get("delta")?;
+    if delta.get("type").and_then(|v| v.as_str()) != Some("input_json_delta") {
+        return None;
+    }
+
+    Some((index, delta.get("partial_json")?.as_str()?))
+}
+
 // =============================================================================
 // Detached Claude CLI execution
 // =============================================================================
@@ -243,6 +315,64 @@ pub fn apply_custom_profile_settings(cmd: &mut std::process::Command, profile_na
             }
         }
     }
+}
+
+fn custom_profile_env_vars_from_settings(settings: &str) -> Result<Vec<(String, String)>, String> {
+    let value: serde_json::Value =
+        serde_json::from_str(settings).map_err(|e| format!("Invalid CLI profile JSON: {e}"))?;
+
+    let Some(env) = value.get("env").and_then(|env| env.as_object()) else {
+        return Ok(Vec::new());
+    };
+
+    Ok(env
+        .iter()
+        .filter_map(|(key, value)| {
+            value
+                .as_str()
+                .map(|value| (key.to_string(), value.to_string()))
+        })
+        .collect())
+}
+
+fn load_custom_profile_env_vars(profile_name: Option<&str>) -> Vec<(String, String)> {
+    let Some(name) = profile_name.filter(|name| !name.is_empty()) else {
+        return Vec::new();
+    };
+
+    let Ok(path) = crate::get_cli_profile_path(name) else {
+        return Vec::new();
+    };
+
+    if !path.exists() {
+        return Vec::new();
+    }
+
+    match std::fs::read_to_string(&path)
+        .map_err(|e| format!("Failed to read CLI profile '{}': {e}", path.display()))
+        .and_then(|settings| custom_profile_env_vars_from_settings(&settings))
+    {
+        Ok(env_vars) => env_vars,
+        Err(error) => {
+            log::warn!("{error}");
+            Vec::new()
+        }
+    }
+}
+
+/// Apply custom CLI profile env vars to a Command.
+///
+/// Newer Claude CLI versions may check authentication before fully applying
+/// `--settings` env, so API-compatible providers need their ANTHROPIC_* vars
+/// present in the child process environment too.
+pub fn apply_custom_profile_env(cmd: &mut std::process::Command, profile_name: Option<&str>) {
+    for (key, value) in load_custom_profile_env_vars(profile_name) {
+        cmd.env(key, value);
+    }
+}
+
+fn should_mirror_custom_profile_env_for_detached() -> bool {
+    cfg!(windows) && !crate::platform::get_wsl_config().enabled
 }
 
 /// Strip a `-fast` suffix from the model string.
@@ -285,6 +415,8 @@ fn build_claude_args(
     args.push("--input-format".to_string());
     args.push("stream-json".to_string());
     args.push("--verbose".to_string());
+    args.push("--tools".to_string());
+    args.push("default".to_string());
     // Stream partial messages so long-running tools (Monitor, etc.) can push events
     // to the UI without waiting for message boundaries.
     args.push("--include-partial-messages".to_string());
@@ -347,13 +479,13 @@ fn build_claude_args(
     }
 
     // Model (strip "-fast" suffix: "opus-fast" → model="opus" + fastMode setting)
-    let is_fast = if let Some(m) = model {
+    let (is_fast, fast_base_model) = if let Some(m) = model {
         let (actual_model, fast) = split_fast_model(m);
         args.push("--model".to_string());
         args.push(actual_model.to_string());
-        fast
+        (fast, fast.then(|| actual_model.to_string()))
     } else {
-        false
+        (false, None)
     };
 
     // Permission mode
@@ -387,6 +519,9 @@ fn build_claude_args(
                 }
             }
         }
+    }
+    if should_mirror_custom_profile_env_for_detached() {
+        env_vars.extend(load_custom_profile_env_vars(custom_profile_name));
     }
 
     // Thinking/effort settings: passed as separate --settings JSON (no secrets here)
@@ -429,6 +564,16 @@ fn build_claude_args(
         }
     }
 
+    // Fast mode picks the CLI's default fast Opus version (4.8 in Claude Code
+    // v2.1.154+), ignoring --model for the Opus version. Pin to 4.6 when the
+    // user explicitly selected the 4.6 fast variant.
+    if fast_base_model.as_deref() == Some("claude-opus-4-6[1m]") {
+        env_vars.push((
+            "CLAUDE_CODE_OPUS_4_6_FAST_MODE_OVERRIDE".to_string(),
+            "1".to_string(),
+        ));
+    }
+
     // Emit --settings if we have any settings to pass
     if let Some(settings) = &settings_json {
         args.push("--settings".to_string());
@@ -457,25 +602,7 @@ fn build_claude_args(
     args.push("--allowedTools".to_string());
     args.push("Bash(*claude-cli/claude*)".to_string());
 
-    // MCP server configuration
-    if let Some(config) = mcp_config {
-        if !config.is_empty() {
-            args.push("--mcp-config".to_string());
-            args.push(config.to_string());
-            args.push("--strict-mcp-config".to_string());
-
-            // Auto-allow all tools from configured MCP servers
-            // Pattern "mcp__<name>" matches all tools from that server
-            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(config) {
-                if let Some(servers) = parsed.get("mcpServers").and_then(|v| v.as_object()) {
-                    for server_name in servers.keys() {
-                        args.push("--allowedTools".to_string());
-                        args.push(format!("mcp__{server_name}"));
-                    }
-                }
-            }
-        }
-    }
+    append_mcp_config_args(&mut args, mcp_config);
 
     // Chrome browser integration (beta)
     if chrome_enabled {
@@ -511,8 +638,6 @@ fn build_claude_args(
         }
     }
 
-    // Explicit mode override for Claude so build/yolo do not fall back into plan mode
-    // due to the default global prompt.
     if let Some(mode_instruction) = execution_mode_instruction(execution_mode) {
         system_prompt_parts.push(mode_instruction.to_string());
     }
@@ -585,6 +710,11 @@ fn build_claude_args(
         }
     }
 
+    // End-of-turn recap instruction (compact view surfaces this block)
+    if super::should_add_recap_instruction(app) {
+        system_prompt_parts.push(super::RECAP_INSTRUCTION.to_string());
+    }
+
     // Collect all context files (issues and PRs) and concatenate into a single file
     let mut all_context_paths: Vec<std::path::PathBuf> = Vec::new();
 
@@ -641,6 +771,55 @@ fn build_claude_args(
                     let file_path = contexts_dir.join(format!("{repo_key}-pr-{number}.md"));
                     if file_path.exists() {
                         log::trace!("Adding PR context file: {:?}", file_path);
+                        all_context_paths.push(file_path);
+                    }
+                }
+            }
+        }
+    }
+
+    // Check for security alert context files (shared storage)
+    let mut security_keys = get_session_security_refs(app, session_id).unwrap_or_default();
+    if let Ok(wt_keys) = get_session_security_refs(app, worktree_id) {
+        for key in wt_keys {
+            if !security_keys.contains(&key) {
+                security_keys.push(key);
+            }
+        }
+    }
+    if !security_keys.is_empty() {
+        if let Ok(contexts_dir) = get_github_contexts_dir(app) {
+            for key in security_keys {
+                let parts: Vec<&str> = key.rsplitn(2, '-').collect();
+                if parts.len() == 2 {
+                    let number = parts[0];
+                    let repo_key = parts[1];
+                    let file_path = contexts_dir.join(format!("{repo_key}-security-{number}.md"));
+                    if file_path.exists() {
+                        log::trace!("Adding security context file: {:?}", file_path);
+                        all_context_paths.push(file_path);
+                    }
+                }
+            }
+        }
+    }
+
+    // Check repository advisory context files (shared storage)
+    let mut advisory_keys = get_session_advisory_refs(app, session_id).unwrap_or_default();
+    if let Ok(wt_keys) = get_session_advisory_refs(app, worktree_id) {
+        for key in wt_keys {
+            if !advisory_keys.contains(&key) {
+                advisory_keys.push(key);
+            }
+        }
+    }
+    if !advisory_keys.is_empty() {
+        if let Ok(contexts_dir) = get_github_contexts_dir(app) {
+            for key in advisory_keys {
+                if let Some((repo_key, ghsa_id)) = key.split_once("::") {
+                    let file_path = contexts_dir.join(format!("{repo_key}-advisory-{ghsa_id}.md"));
+                    if file_path.exists() {
+                        log::trace!("Adding advisory context file: {:?}", file_path);
                         all_context_paths.push(file_path);
                     }
                 }
@@ -731,6 +910,20 @@ fn build_claude_args(
                     s.contains("git-context") && s.contains("-pr-")
                 })
                 .count();
+            let security_count = all_context_paths
+                .iter()
+                .filter(|p| {
+                    let s = p.to_string_lossy();
+                    s.contains("git-context") && s.contains("-security-")
+                })
+                .count();
+            let advisory_count = all_context_paths
+                .iter()
+                .filter(|p| {
+                    let s = p.to_string_lossy();
+                    s.contains("git-context") && s.contains("-advisory-")
+                })
+                .count();
             let linear_count = all_context_paths
                 .iter()
                 .filter(|p| {
@@ -766,7 +959,13 @@ fn build_claude_args(
                 combined_content
                     .push_str("You should be aware of this when working on this task.\n\n");
 
-                if issue_count > 0 || pr_count > 0 || linear_count > 0 || saved_context_count > 0 {
+                if issue_count > 0
+                    || pr_count > 0
+                    || security_count > 0
+                    || advisory_count > 0
+                    || linear_count > 0
+                    || saved_context_count > 0
+                {
                     combined_content.push_str("**Summary:**\n");
                     if issue_count > 0 {
                         combined_content.push_str(&format!("- {} GitHub Issue(s)\n", issue_count));
@@ -774,6 +973,14 @@ fn build_claude_args(
                     if pr_count > 0 {
                         combined_content
                             .push_str(&format!("- {} GitHub Pull Request(s)\n", pr_count));
+                    }
+                    if security_count > 0 {
+                        combined_content
+                            .push_str(&format!("- {} Security Alert(s)\n", security_count));
+                    }
+                    if advisory_count > 0 {
+                        combined_content
+                            .push_str(&format!("- {} Security Advisory(s)\n", advisory_count));
                     }
                     if linear_count > 0 {
                         combined_content.push_str(&format!("- {} Linear Issue(s)\n", linear_count));
@@ -826,6 +1033,10 @@ fn build_claude_args(
     // Debug env vars
     env_vars.push(("JEAN_SESSION_ID".to_string(), session_id.to_string()));
     env_vars.push(("JEAN_WORKTREE_ID".to_string(), worktree_id.to_string()));
+    // Jean MCP recursion-depth chain. Always set so a Claude spawned by another
+    // Jean-spawned Claude can be capped at the configured depth.
+    let (depth_key, depth_val) = super::jean_mcp::child_depth_env();
+    env_vars.push((depth_key, depth_val));
     env_vars.push((
         "JEAN_MODEL".to_string(),
         model.unwrap_or("default").to_string(),
@@ -839,6 +1050,34 @@ fn build_claude_args(
     }
 
     (args, env_vars)
+}
+
+fn append_mcp_config_args(args: &mut Vec<String>, mcp_config: Option<&str>) {
+    let Some(config) = mcp_config else {
+        return;
+    };
+    if config.is_empty() {
+        return;
+    }
+
+    args.push("--mcp-config".to_string());
+    args.push(config.to_string());
+    args.push("--strict-mcp-config".to_string());
+
+    // Auto-allow all tools from configured MCP servers. Claude CLI has accepted
+    // both the server-level form and the wildcard form across releases; include
+    // both so non-interactive `--print` runs can actually execute MCP calls
+    // instead of stopping after emitting a tool_use that Jean cannot approve.
+    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(config) {
+        if let Some(servers) = parsed.get("mcpServers").and_then(|v| v.as_object()) {
+            for server_name in servers.keys() {
+                args.push("--allowedTools".to_string());
+                args.push(format!("mcp__{server_name}"));
+                args.push("--allowedTools".to_string());
+                args.push(format!("mcp__{server_name}__*"));
+            }
+        }
+    }
 }
 
 /// Execute Claude CLI in detached mode.
@@ -878,7 +1117,7 @@ pub fn execute_claude_detached(
     // Get CLI path
     let cli_path = resolve_cli_binary(app);
 
-    if !cli_path.exists() {
+    if !crate::platform::resolved_cli_exists(&cli_path) {
         let error_msg = format!(
             "Claude CLI not found at {}. Please complete setup in Settings > Advanced.",
             cli_path.display()
@@ -960,7 +1199,7 @@ pub fn execute_claude_detached(
     }
 
     // Register the process for cancellation (returns false if pending cancel exists)
-    if !super::registry::register_process(session_id.to_string(), pid) {
+    if !super::registry::register_detached_process(session_id.to_string(), pid) {
         // Process was killed by pending cancel — return cancelled response
         return Ok((
             pid,
@@ -1020,6 +1259,10 @@ pub fn tail_claude_output(
 
     log::trace!("Starting to tail NDJSON output for session: {session_id}");
     log::trace!("Output file: {output_file:?}, PID: {pid}");
+    let run_id = output_file
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .map(|stem| stem.to_string());
 
     // Create tailer starting from beginning (we want all content)
     let mut tailer = NdjsonTailer::new_from_start(output_file)?;
@@ -1028,6 +1271,11 @@ pub fn tail_claude_output(
     let mut claude_session_id = String::new();
     let mut tool_calls: Vec<ToolCall> = Vec::new();
     let mut content_blocks: Vec<ContentBlock> = Vec::new();
+    let mut seen_tool_use_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut pending_stream_tools: std::collections::HashMap<usize, StreamToolUse> =
+        std::collections::HashMap::new();
+    let mut pending_stream_tool_inputs: std::collections::HashMap<usize, String> =
+        std::collections::HashMap::new();
     let mut completed = false;
     let mut cancelled = false;
     let mut user_cancelled = false; // True only for explicit user cancel (not process death)
@@ -1145,6 +1393,108 @@ pub fn tail_claude_output(
 
             let msg_type = msg.get("type").and_then(|v| v.as_str()).unwrap_or("");
 
+            if msg_type == "stream_event" {
+                if let Some(tool) = stream_event_tool_use(&msg) {
+                    pending_stream_tool_inputs.remove(&tool.index);
+                    pending_stream_tools.insert(tool.index, tool);
+                    continue;
+                }
+
+                if let Some((index, partial_json)) = stream_event_input_delta(&msg) {
+                    let Some(pending_tool) = pending_stream_tools.get(&index).cloned() else {
+                        continue;
+                    };
+
+                    if seen_tool_use_ids.contains(&pending_tool.id) {
+                        continue;
+                    }
+
+                    let input_buf = pending_stream_tool_inputs.entry(index).or_default();
+                    input_buf.push_str(partial_json);
+
+                    let input = if input_buf.trim().is_empty() {
+                        pending_tool.input.clone()
+                    } else {
+                        match serde_json::from_str::<serde_json::Value>(input_buf) {
+                            Ok(value) => value,
+                            Err(_) => continue,
+                        }
+                    };
+
+                    if pending_tool.name == "AskUserQuestion" || pending_tool.name == "ExitPlanMode"
+                    {
+                        let id = pending_tool.id.clone();
+                        let name = pending_tool.name.clone();
+                        seen_tool_use_ids.insert(id.clone());
+                        tool_calls.push(ToolCall {
+                            id: id.clone(),
+                            name: name.clone(),
+                            input: input.clone(),
+                            output: None,
+                            parent_tool_use_id: current_parent_tool_use_id.clone(),
+                        });
+                        content_blocks.push(ContentBlock::ToolUse {
+                            tool_call_id: id.clone(),
+                        });
+
+                        let event = ToolUseEvent {
+                            session_id: session_id.to_string(),
+                            worktree_id: worktree_id.to_string(),
+                            id: id.clone(),
+                            name: name.clone(),
+                            input: input.clone(),
+                            parent_tool_use_id: current_parent_tool_use_id.clone(),
+                        };
+                        if let Err(e) = app.emit_all("chat:tool_use", &event) {
+                            log::error!("Failed to emit tool_use: {e}");
+                        }
+
+                        let block_event = ToolBlockEvent {
+                            session_id: session_id.to_string(),
+                            worktree_id: worktree_id.to_string(),
+                            tool_call_id: id,
+                        };
+                        if let Err(e) = app.emit_all("chat:tool_block", &block_event) {
+                            log::error!("Failed to emit tool_block: {e}");
+                        }
+
+                        log::trace!(
+                            "Detected blocking tool {name} from stream_event, killing detached process"
+                        );
+                        #[cfg(unix)]
+                        unsafe {
+                            libc::kill(pid as i32, libc::SIGKILL);
+                        }
+                        #[cfg(windows)]
+                        {
+                            let _ = crate::platform::silent_command("taskkill")
+                                .args(["/F", "/PID", &pid.to_string()])
+                                .output();
+                        }
+
+                        let done_event = DoneEvent {
+                            session_id: session_id.to_string(),
+                            worktree_id: worktree_id.to_string(),
+                            waiting_for_plan: false,
+                        };
+                        if let Err(e) = app.emit_all("chat:done", &done_event) {
+                            log::error!("Failed to emit done event: {e}");
+                        }
+
+                        return Ok(ClaudeResponse {
+                            content: full_content,
+                            session_id: claude_session_id,
+                            tool_calls,
+                            content_blocks,
+                            cancelled: false,
+                            usage: None,
+                        });
+                    }
+
+                    continue;
+                }
+            }
+
             match msg_type {
                 "assistant" => {
                     // Route assistant text to a Monitor's event log when this
@@ -1174,7 +1524,9 @@ pub fn tail_claude_output(
                                         {
                                             // Skip CLI placeholder text emitted when extended
                                             // thinking starts before any real text content
-                                            if text == "(no content)" {
+                                            if text == "(no content)"
+                                                || is_claude_compaction_summary_text(text)
+                                            {
                                                 continue;
                                             }
 
@@ -1216,6 +1568,7 @@ pub fn tail_claude_output(
                                                             session_id: session_id.to_string(),
                                                             worktree_id: worktree_id.to_string(),
                                                             content: chat_buf.clone(),
+                                                            run_id: run_id.clone(),
                                                         };
                                                         if let Err(e) =
                                                             app.emit_all("chat:chunk", &chunk)
@@ -1263,6 +1616,7 @@ pub fn tail_claude_output(
                                                     session_id: session_id.to_string(),
                                                     worktree_id: worktree_id.to_string(),
                                                     content: chat_buf,
+                                                    run_id: run_id.clone(),
                                                 };
                                                 if let Err(e) = app.emit_all("chat:chunk", &chunk) {
                                                     log::error!("Failed to emit chunk: {e}");
@@ -1286,6 +1640,11 @@ pub fn tail_claude_output(
                                             .get("input")
                                             .cloned()
                                             .unwrap_or(serde_json::Value::Null);
+
+                                        if seen_tool_use_ids.contains(&id) {
+                                            continue;
+                                        }
+                                        seen_tool_use_ids.insert(id.clone());
 
                                         tool_calls.push(ToolCall {
                                             id: id.clone(),
@@ -1779,18 +2138,14 @@ pub fn tail_claude_output(
                         }
 
                         // Emit compacted event with metadata if available
-                        if let Some(metadata_val) = msg.get("compactMetadata") {
-                            if let Ok(metadata) =
-                                serde_json::from_value::<CompactMetadata>(metadata_val.clone())
-                            {
-                                let compacted_event = CompactedEvent {
-                                    session_id: session_id.to_string(),
-                                    worktree_id: worktree_id.to_string(),
-                                    metadata,
-                                };
-                                if let Err(e) = app.emit_all("chat:compacted", &compacted_event) {
-                                    log::error!("Failed to emit compacted: {e}");
-                                }
+                        if let Some(metadata) = compact_metadata_from_system_message(&msg) {
+                            let compacted_event = CompactedEvent {
+                                session_id: session_id.to_string(),
+                                worktree_id: worktree_id.to_string(),
+                                metadata,
+                            };
+                            if let Err(e) = app.emit_all("chat:compacted", &compacted_event) {
+                                log::error!("Failed to emit compacted: {e}");
                             }
                         }
                     }
@@ -2036,6 +2391,23 @@ mod tests {
     use super::*;
 
     #[test]
+    fn compact_metadata_accepts_snake_case_from_claude_cli() {
+        let msg = serde_json::json!({
+            "type": "system",
+            "subtype": "compact_boundary",
+            "compact_metadata": {
+                "trigger": "auto",
+                "pre_tokens": 170298
+            }
+        });
+
+        let metadata = compact_metadata_from_system_message(&msg).unwrap();
+
+        assert_eq!(metadata.trigger, "auto");
+        assert_eq!(metadata.pre_tokens, 170298);
+    }
+
+    #[test]
     fn split_fast_model_strips_suffix() {
         assert_eq!(split_fast_model("opus-fast"), ("opus", true));
         assert_eq!(
@@ -2053,5 +2425,113 @@ mod tests {
         );
         assert_eq!(split_fast_model("sonnet"), ("sonnet", false));
         assert_eq!(split_fast_model("haiku"), ("haiku", false));
+        assert_eq!(
+            split_fast_model("claude-fable-5"),
+            ("claude-fable-5", false)
+        );
+    }
+
+    #[test]
+    fn custom_profile_env_vars_reads_string_env_entries() {
+        let settings = r#"{
+            "env": {
+                "ANTHROPIC_BASE_URL": "https://api.minimax.io/anthropic",
+                "ANTHROPIC_AUTH_TOKEN": "secret",
+                "IGNORED_NON_STRING": 123
+            }
+        }"#;
+
+        let env_vars = custom_profile_env_vars_from_settings(settings).unwrap();
+
+        assert!(env_vars.contains(&(
+            "ANTHROPIC_BASE_URL".to_string(),
+            "https://api.minimax.io/anthropic".to_string()
+        )));
+        assert!(env_vars.contains(&("ANTHROPIC_AUTH_TOKEN".to_string(), "secret".to_string())));
+        assert!(!env_vars.iter().any(|(key, _)| key == "IGNORED_NON_STRING"));
+    }
+
+    #[test]
+    fn default_global_system_prompt_prefers_interactive_plan_questions() {
+        assert!(DEFAULT_GLOBAL_SYSTEM_PROMPT.contains("backend-native interactive question UI"));
+        assert!(DEFAULT_GLOBAL_SYSTEM_PROMPT.contains("Claude AskUserQuestion"));
+        assert!(DEFAULT_GLOBAL_SYSTEM_PROMPT.contains("Codex request_user_input"));
+        assert!(DEFAULT_GLOBAL_SYSTEM_PROMPT
+            .contains("when the current execution mode is plan: after the user answers native `request_user_input`"));
+        assert!(DEFAULT_GLOBAL_SYSTEM_PROMPT.contains("Every Codex response that contains or revises a plan while the current execution mode is plan"));
+        assert!(DEFAULT_GLOBAL_SYSTEM_PROMPT.contains("OpenCode question"));
+        assert!(DEFAULT_GLOBAL_SYSTEM_PROMPT.contains("Jean Worktree Policy"));
+        assert!(DEFAULT_GLOBAL_SYSTEM_PROMPT.contains("Do NOT create git worktrees manually"));
+        assert!(DEFAULT_GLOBAL_SYSTEM_PROMPT.contains("Jean MCP/tools"));
+        assert!(DEFAULT_GLOBAL_SYSTEM_PROMPT.contains("VERY IMPORTANT: Keep Code Simple"));
+        assert!(DEFAULT_GLOBAL_SYSTEM_PROMPT
+            .contains("Always implement the simplest maintainable solution"));
+        assert!(DEFAULT_GLOBAL_SYSTEM_PROMPT.contains("Clickable References"));
+        assert!(DEFAULT_GLOBAL_SYSTEM_PROMPT.contains("include clickable links when available"));
+    }
+
+    #[test]
+    fn extracts_tool_use_from_stream_event_content_block_start() {
+        let msg = serde_json::json!({
+            "type": "stream_event",
+            "event": {
+                "type": "content_block_start",
+                "index": 2,
+                "content_block": {
+                    "type": "tool_use",
+                    "id": "toolu_question",
+                    "name": "AskUserQuestion",
+                    "input": {
+                        "questions": "[{\"question\":\"Pick one\",\"options\":[{\"label\":\"A\"}]}]"
+                    }
+                }
+            }
+        });
+
+        let tool = stream_event_tool_use(&msg).expect("tool_use should be extracted");
+
+        assert_eq!(tool.id, "toolu_question");
+        assert_eq!(tool.name, "AskUserQuestion");
+        assert_eq!(
+            tool.input.get("questions").and_then(|value| value.as_str()),
+            Some("[{\"question\":\"Pick one\",\"options\":[{\"label\":\"A\"}]}]")
+        );
+    }
+
+    #[test]
+    fn extracts_stream_event_input_json_delta() {
+        let msg = serde_json::json!({
+            "type": "stream_event",
+            "event": {
+                "type": "content_block_delta",
+                "index": 2,
+                "delta": {
+                    "type": "input_json_delta",
+                    "partial_json": "{\"questions\":"
+                }
+            }
+        });
+
+        assert_eq!(stream_event_input_delta(&msg), Some((2, "{\"questions\":")));
+    }
+
+    #[test]
+    fn mcp_config_auto_allows_server_and_wildcard_tools() {
+        let config = r#"{
+            "mcpServers": {
+                "jean-dev": { "type": "stdio", "command": "jean" },
+                "github": { "type": "stdio", "command": "github-mcp" }
+            }
+        }"#;
+        let mut args = Vec::new();
+
+        append_mcp_config_args(&mut args, Some(config));
+
+        assert!(args.contains(&"--mcp-config".to_string()));
+        assert!(args.contains(&"--strict-mcp-config".to_string()));
+        assert!(args.contains(&"mcp__jean-dev".to_string()));
+        assert!(args.contains(&"mcp__jean-dev__*".to_string()));
+        assert!(args.contains(&"mcp__github".to_string()));
+        assert!(args.contains(&"mcp__github__*".to_string()));
     }
 }

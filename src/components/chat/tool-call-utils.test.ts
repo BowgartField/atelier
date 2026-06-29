@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest'
 import {
   buildTimeline,
   coalesceContentBlocks,
+  getIntroTextBeforeDuplicatePlan,
   isDuplicatePlanTextBlock,
   resolvePlanContent,
   splitTextAroundPlan,
@@ -164,6 +165,26 @@ describe('isDuplicatePlanTextBlock', () => {
   })
 })
 
+describe('getIntroTextBeforeDuplicatePlan', () => {
+  it('returns null when the whole assistant text is the rendered plan', () => {
+    expect(
+      getIntroTextBeforeDuplicatePlan(
+        'Short answer: goal is separate from plan mode.',
+        'Short answer: goal is separate from plan mode.'
+      )
+    ).toBeNull()
+  })
+
+  it('returns prose before a matching trailing plan section', () => {
+    expect(
+      getIntroTextBeforeDuplicatePlan(
+        'Repo inspected.\n\nPlan:\n- Implement changes',
+        'Plan:\n- Implement changes'
+      )
+    ).toBe('Repo inspected.')
+  })
+})
+
 describe('coalesceContentBlocks', () => {
   it('merges consecutive text blocks into one', () => {
     const input: ContentBlock[] = [
@@ -218,6 +239,77 @@ describe('coalesceContentBlocks', () => {
 })
 
 describe('buildTimeline with fragmented text deltas', () => {
+  it('renders native Codex request_user_input in the inline question timeline slot', () => {
+    const tools: ToolCall[] = [
+      {
+        id: 'codex-user-input-1',
+        name: 'request_user_input',
+        input: {
+          questions: [
+            {
+              id: 'scope',
+              header: 'Scope',
+              question: 'Which scope?',
+              options: [{ label: 'Backend' }],
+            },
+          ],
+        },
+      },
+    ]
+    const blocks: ContentBlock[] = [
+      { type: 'text', text: 'Need one decision first.' },
+      { type: 'tool_use', tool_call_id: 'codex-user-input-1' },
+      { type: 'text', text: 'request_user_input UI unavailable here' },
+    ]
+
+    const timeline = buildTimeline(blocks, tools)
+
+    expect(timeline).toHaveLength(1)
+    expect(timeline[0]).toMatchObject({
+      type: 'askUserQuestion',
+      introText: 'Need one decision first.',
+      tool: expect.objectContaining({ id: 'codex-user-input-1' }),
+    })
+  })
+
+
+  it('renders Claude AskUserQuestion when questions are encoded as JSON string', () => {
+    const tools: ToolCall[] = [
+      {
+        id: 'claude-question-1',
+        name: 'AskUserQuestion',
+        input: {
+          questions:
+            '[{"question":"Pick one","header":"Choice","multiSelect":false,"options":[{"label":"A"}]}]',
+        },
+      },
+    ]
+    const blocks: ContentBlock[] = [
+      { type: 'text', text: 'Need one decision.' },
+      { type: 'tool_use', tool_call_id: 'claude-question-1' },
+    ]
+
+    const timeline = buildTimeline(blocks, tools)
+
+    expect(timeline).toHaveLength(1)
+    expect(timeline[0]).toMatchObject({
+      type: 'askUserQuestion',
+      introText: 'Need one decision.',
+      tool: {
+        input: {
+          questions: [
+            {
+              question: 'Pick one',
+              header: 'Choice',
+              multiSelect: false,
+              options: [{ label: 'A' }],
+            },
+          ],
+        },
+      },
+    })
+  })
+
   it('renders fragmented text as one paragraph item', () => {
     const blocks: ContentBlock[] = [
       { type: 'text', text: 'para1' },

@@ -22,15 +22,31 @@ export type ThinkingLevel = 'off' | 'think' | 'megathink' | 'ultrathink'
  * - low: Minimal thinking, skips for simple tasks
  * - medium: Moderate thinking, may skip for very simple queries
  * - high: Deep reasoning (default), almost always thinks
- * - xhigh: Extra high effort (Opus 4.7 recommended default for coding/agentic)
+ * - xhigh: Extra high effort (Opus 4.8 recommended default for coding/agentic)
  * - max: No constraints on thinking depth
+ * - ultracode: Claude Code ultracode mode (xhigh + Dynamic Workflows)
  */
-export type EffortLevel = 'low' | 'medium' | 'high' | 'xhigh' | 'max'
+export type EffortLevel =
+  | 'off'
+  | 'minimal'
+  | 'low'
+  | 'medium'
+  | 'high'
+  | 'xhigh'
+  | 'max'
+  | 'ultracode'
 
 /**
- * Backend for a chat session (Claude CLI, Codex CLI, OpenCode, or Cursor)
+ * Backend for a chat session (Claude CLI, Codex CLI, OpenCode, Cursor, PI, or Command Code)
  */
-export type Backend = 'claude' | 'codex' | 'opencode' | 'cursor'
+export type Backend =
+  | 'claude'
+  | 'codex'
+  | 'opencode'
+  | 'cursor'
+  | 'pi'
+  | 'commandcode'
+  | 'grok'
 
 /**
  * Execution mode for Claude CLI permission handling
@@ -108,7 +124,7 @@ export interface PlanToolInput {
   plan_preview?: string
   explanation?: string
   steps?: PlanStep[]
-  source?: 'claude' | 'codex'
+  source?: 'claude' | 'codex' | 'grok'
 }
 
 /**
@@ -120,6 +136,7 @@ export type ContentBlock =
   | { type: 'text'; text: string }
   | { type: 'tool_use'; tool_call_id: string }
   | { type: 'thinking'; thinking: string }
+  | { type: 'user_input'; text: string }
 
 /**
  * A single chat message
@@ -189,20 +206,30 @@ export interface Session {
   messages: ChatMessage[]
   /** Message count (populated separately for efficiency when full messages not needed) */
   message_count?: number
-  /** Backend for this session (claude, codex, opencode, or cursor) */
+  /** Backend for this session (claude, codex, opencode, cursor, or grok) */
   backend?: Backend
   /** Claude CLI session ID for resuming conversations */
   claude_session_id?: string
   /** Codex CLI thread ID for resuming conversations */
   codex_thread_id?: string
+  /** Codex /goal long-horizon objective (codex backend only) */
+  codex_goal?: string
   /** OpenCode session ID for resuming conversations */
   opencode_session_id?: string
   /** Cursor chat ID for resuming conversations */
   cursor_chat_id?: string
+  /** PI session ID for resuming conversations */
+  pi_session_id?: string
+  /** Command Code uses standalone headless invocations; stores no native resume id */
+  commandcode_session_id?: string
+  /** Grok headless session ID for resuming conversations */
+  grok_session_id?: string
   /** Selected model for this session */
   selected_model?: string
   /** Selected thinking level for this session */
   selected_thinking_level?: ThinkingLevel
+  /** Selected effort level for this session */
+  selected_effort_level?: EffortLevel
   /** Selected provider (custom CLI profile name) for this session */
   selected_provider?: string
   /** Selected execution mode for this session (plan/build/yolo) */
@@ -254,12 +281,18 @@ export interface Session {
   pending_plan_message_id?: string
   /** Per-session MCP server override (undefined = inherit from project/global) */
   enabled_mcp_servers?: string[]
-  /** Persisted session digest (recap summary) */
-  digest?: SessionDigest
   /** Per-table checklist state: tableKey -> checked row indices */
   table_checked_rows?: Record<string, number[]>
   /** Unix timestamp when session was last opened/viewed by the user */
   last_opened_at?: number
+  /** Primary surface for this session. Terminal sessions render as full-screen CLI sessions. */
+  primary_surface?: 'chat' | 'terminal'
+  /** Command used by full-screen terminal sessions. Undefined/null means default shell. */
+  terminal_command?: string | null
+  /** Extra command args for full-screen terminal sessions. */
+  terminal_command_args?: string[]
+  /** Display label for the terminal tab/session. */
+  terminal_label?: string
   /** Status of the last run (for immediate status on app restart) */
   last_run_status?: RunStatus
   /** Execution mode of the last run (plan/build/yolo) */
@@ -419,6 +452,7 @@ export interface ChunkEvent {
   session_id: string
   worktree_id: string // Kept for backward compatibility
   content: string
+  run_id?: string
 }
 
 /**
@@ -478,6 +512,7 @@ export interface CancelledEvent {
   worktree_id: string // Kept for backward compatibility
   undo_send: boolean // True if user message should be restored to input (instant cancellation)
   emitted_at_ms: number
+  run_id?: string
 }
 
 /**
@@ -553,6 +588,16 @@ export interface PermissionDeniedEvent {
 }
 
 export interface CodexRequestedFileSystemPermissions {
+  entries?:
+    | {
+        access: 'read' | 'write' | 'none'
+        path:
+          | { type: 'path'; path: string }
+          | { type: 'globPattern'; pattern: string }
+          | { type: 'special'; value: unknown }
+      }[]
+    | null
+  globScanMaxDepth?: number | null
   read?: string[] | null
   write?: string[] | null
 }
@@ -568,6 +613,7 @@ export interface CodexPermissionRequest {
     fileSystem?: CodexRequestedFileSystemPermissions | null
     network?: CodexRequestedNetworkPermissions | null
   }
+  cwd?: string | null
   reason?: string | null
 }
 
@@ -606,6 +652,8 @@ export interface CodexCommandApprovalRequest {
   cwd?: string | null
   reason?: string | null
   network_approval_context?: CodexNetworkApprovalContext | null
+  additional_permissions?: unknown
+  available_decisions?: unknown[] | null
   proposed_execpolicy_amendment?: string[] | null
   proposed_network_policy_amendments?: CodexNetworkPolicyAmendment[] | null
 }
@@ -622,8 +670,8 @@ export interface CodexUserInputOption {
 }
 
 export interface CodexUserInputQuestion {
-  header: string
-  id: string
+  header?: string
+  id?: string
   question: string
   options?: CodexUserInputOption[] | null
   isOther?: boolean
@@ -664,6 +712,7 @@ export interface CodexMcpElicitationRequestEvent {
 export interface CodexDynamicToolCallRequest {
   rpc_id: number
   call_id: string
+  namespace?: string | null
   tool: string
   arguments: unknown
 }
@@ -738,6 +787,71 @@ export function normalizeCodexQuestions(questions: unknown): Question[] {
   })
 }
 
+export type CodexUserInputAnswerMap = Record<string, { answers: string[] }>
+
+export function buildCodexUserInputAnswerMap(
+  rawQuestions: unknown[],
+  answers: QuestionAnswer[]
+): CodexUserInputAnswerMap {
+  return Object.fromEntries(
+    rawQuestions.map((rawQuestion, index) => {
+      const question =
+        typeof rawQuestion === 'object' && rawQuestion !== null
+          ? (rawQuestion as Record<string, unknown>)
+          : {}
+      const rawOptions = Array.isArray(question.options) ? question.options : []
+      const answer = answers.find(item => item.questionIndex === index)
+      const selected = answer?.customText?.trim()
+        ? [answer.customText.trim()]
+        : (answer?.selectedOptions ?? [])
+            .map(optionIndex => {
+              const rawOption = rawOptions[optionIndex]
+              const option =
+                typeof rawOption === 'object' && rawOption !== null
+                  ? (rawOption as Record<string, unknown>)
+                  : {}
+              return typeof option.label === 'string' ? option.label : undefined
+            })
+            .filter((label): label is string => !!label)
+      const questionId =
+        typeof question.id === 'string' && question.id.length > 0
+          ? question.id
+          : String(index)
+      return [questionId, { answers: selected }]
+    })
+  )
+}
+
+
+export function getAskUserQuestions(input: unknown): Question[] | null {
+  if (typeof input !== 'object' || input === null || !('questions' in input)) {
+    return null
+  }
+
+  const rawQuestions = (input as { questions?: unknown }).questions
+  if (Array.isArray(rawQuestions)) return rawQuestions as Question[]
+
+  if (typeof rawQuestions === 'string') {
+    try {
+      const parsed = JSON.parse(rawQuestions)
+      return Array.isArray(parsed) ? (parsed as Question[]) : null
+    } catch {
+      return null
+    }
+  }
+
+  return null
+}
+
+export function normalizeQuestionMultipleField(
+  questions: (Question & { multiple?: boolean })[]
+): Question[] {
+  return questions.map(q => ({
+    ...q,
+    multiSelect: q.multiSelect ?? q.multiple === true,
+  }))
+}
+
 /**
  * Input structure for AskUserQuestion tool
  */
@@ -753,11 +867,10 @@ export function isAskUserQuestion(
   toolCall: ToolCall
 ): toolCall is ToolCall & { input: AskUserQuestionInput } {
   return (
-    (toolCall.name === 'AskUserQuestion' || toolCall.name === 'question') &&
-    typeof toolCall.input === 'object' &&
-    toolCall.input !== null &&
-    'questions' in toolCall.input &&
-    Array.isArray((toolCall.input as AskUserQuestionInput).questions)
+    (toolCall.name === 'AskUserQuestion' ||
+      toolCall.name === 'question' ||
+      toolCall.name === 'request_user_input') &&
+    getAskUserQuestions(toolCall.input) !== null
   )
 }
 
@@ -1002,6 +1115,12 @@ export interface PendingFile {
   id: string
   /** Relative path from worktree root */
   relativePath: string
+  /** Absolute root path that relativePath is scoped to (linked project path or active worktree path) */
+  sourceRootPath?: string
+  /** Project ID when the file came from a linked/current project scope */
+  sourceProjectId?: string
+  /** Project display name when the file came from a linked/current project scope */
+  sourceProjectName?: string
   /** File extension */
   extension: string
   /** Whether this is a directory mention */
@@ -1332,29 +1451,12 @@ export interface SessionDebugInfo {
   total_usage: UsageData
 }
 
-// ============================================================================
-// Session Digest Types (for context recall after switching)
-// ============================================================================
-
-/**
- * A brief digest of a session for context recall
- * Generated when user opens a session that had activity while out of focus
- */
-export interface SessionDigest {
-  /** One sentence summarizing the overall chat goal and progress */
-  chat_summary: string
-  /** One sentence describing what was just completed */
-  last_action: string
-  /** When the digest was created (unix epoch seconds) */
-  created_at?: number
-  /** Number of messages when this digest was generated */
-  message_count?: number
-}
-
 /** User-assigned label with color for session cards */
 export interface LabelData {
   /** Label name (e.g. "Needs testing") */
   name: string
   /** Background color hex value (e.g. "#eab308") */
   color: string
+  /** Show this worktree label as a project-view filter tab when used in the current project */
+  pinned?: boolean
 }

@@ -16,6 +16,7 @@ import {
   DEFAULT_INVESTIGATE_WORKFLOW_RUN_PROMPT,
   DEFAULT_INVESTIGATE_LINEAR_ISSUE_PROMPT,
   DEFAULT_PARALLEL_EXECUTION_PROMPT,
+  DEFAULT_MAGIC_PROMPT_MODES,
   resolveMagicPromptBackend,
   resolveMagicPromptProvider,
 } from '@/types/preferences'
@@ -71,6 +72,10 @@ interface UseInvestigateHandlersParams {
         onError?: (error: unknown) => void
       }
     ) => void
+    mutateAsync: (args: {
+      worktreeId: string
+      worktreePath: string
+    }) => Promise<Session>
   }
   resolveCustomProfile: (
     model: string,
@@ -183,6 +188,19 @@ export function useInvestigateHandlers({
               : type === 'linear-issue'
                 ? 'investigate_linear_issue_backend'
                 : ('investigate_advisory_backend' as const)
+      const modeKey =
+        type === 'issue'
+          ? 'investigate_issue_mode'
+          : type === 'pr'
+            ? 'investigate_pr_mode'
+            : type === 'security-alert'
+              ? 'investigate_security_alert_mode'
+              : type === 'linear-issue'
+                ? 'investigate_linear_issue_mode'
+                : ('investigate_advisory_mode' as const)
+      const investigateMode =
+        preferences?.magic_prompt_modes?.[modeKey] ??
+        DEFAULT_MAGIC_PROMPT_MODES[modeKey]
       const investigateModel =
         override?.model ??
         preferences?.magic_prompt_models?.[modelKey] ??
@@ -210,6 +228,10 @@ export function useInvestigateHandlers({
             }),
           staleTime: 0,
         })
+        if ((contexts ?? []).length === 0) {
+          toast.error('No issue context loaded for this worktree')
+          return
+        }
         const refs = (contexts ?? []).map(c => `#${c.number}`).join(', ')
         const word = (contexts ?? []).length === 1 ? 'issue' : 'issues'
         const customPrompt = preferences?.magic_prompts?.investigate_issue
@@ -229,6 +251,10 @@ export function useInvestigateHandlers({
             }),
           staleTime: 0,
         })
+        if ((contexts ?? []).length === 0) {
+          toast.error('No PR context loaded for this worktree')
+          return
+        }
         const refs = (contexts ?? []).map(c => `#${c.number}`).join(', ')
         const word = (contexts ?? []).length === 1 ? 'PR' : 'PRs'
         const customPrompt = preferences?.magic_prompts?.investigate_pr
@@ -352,7 +378,7 @@ export function useInvestigateHandlers({
       addSendingSession(activeSessionId)
       setSelectedModel(activeSessionId, investigateModel)
       setSelectedProvider(activeSessionId, investigateProvider)
-      setExecutingMode(activeSessionId, executionModeRef.current)
+      setExecutingMode(activeSessionId, investigateMode)
 
       setSessionProvider.mutate({
         sessionId: activeSessionId,
@@ -412,7 +438,7 @@ export function useInvestigateHandlers({
           worktreePath: activeWorktreePath,
           message: prompt,
           model: investigateModel,
-          executionMode: executionModeRef.current,
+          executionMode: investigateMode,
           thinkingLevel: selectedThinkingLevelRef.current,
           effortLevel: investigateUseAdaptive
             ? selectedEffortLevelRef.current
@@ -452,6 +478,7 @@ export function useInvestigateHandlers({
       preferences?.magic_prompt_models,
       preferences?.magic_prompt_providers,
       preferences?.magic_prompt_backends,
+      preferences?.magic_prompt_modes,
       preferences?.chrome_enabled,
       preferences?.ai_language,
       setSessionProvider,
@@ -490,6 +517,9 @@ export function useInvestigateHandlers({
       const investigateModel =
         preferences?.magic_prompt_models?.investigate_workflow_run_model ??
         selectedModelRef.current
+      const investigateMode =
+        preferences?.magic_prompt_modes?.investigate_workflow_run_mode ??
+        DEFAULT_MAGIC_PROMPT_MODES.investigate_workflow_run_mode
       const investigateProvider = resolveMagicPromptProvider(
         preferences?.magic_prompt_providers,
         'investigate_workflow_run_provider',
@@ -617,7 +647,7 @@ export function useInvestigateHandlers({
         addSendingSession(targetSessionId)
         setSelectedModel(targetSessionId, investigateModel)
         setSelectedProvider(targetSessionId, investigateProvider)
-        setExecutingMode(targetSessionId, 'yolo')
+        setExecutingMode(targetSessionId, investigateMode)
 
         setSessionBackend.mutate({
           sessionId: targetSessionId,
@@ -659,7 +689,7 @@ export function useInvestigateHandlers({
             worktreePath,
             message: prompt,
             model: investigateModel,
-            executionMode: 'yolo',
+            executionMode: investigateMode,
             thinkingLevel: selectedThinkingLevelRef.current,
             effortLevel: investigateUseAdaptive
               ? selectedEffortLevelRef.current
@@ -735,6 +765,7 @@ export function useInvestigateHandlers({
       preferences?.magic_prompts?.parallel_execution,
       preferences?.magic_prompt_providers,
       preferences?.magic_prompt_backends,
+      preferences?.magic_prompt_modes,
       preferences?.chrome_enabled,
       preferences?.ai_language,
       setSessionProvider,
@@ -757,7 +788,10 @@ export function useInvestigateHandlers({
   )
 
   const handleReviewComments = useCallback(
-    async (prompt: string) => {
+    async (
+      promptOrPrompts: string | string[],
+      options?: { executionMode?: ExecutionMode }
+    ) => {
       const worktreeId = activeWorktreeIdRef.current
       const worktreePath = activeWorktreePathRef.current
       if (!worktreeId || !worktreePath) return
@@ -787,14 +821,25 @@ export function useInvestigateHandlers({
           defaultBackend
         ) ?? resolveBackend(reviewCommentsModel)
 
+      const prompts = Array.isArray(promptOrPrompts)
+        ? promptOrPrompts.filter(prompt => prompt.trim().length > 0)
+        : [promptOrPrompts].filter(prompt => prompt.trim().length > 0)
+      if (prompts.length === 0) return
+
+      const requestedExecutionMode =
+        options?.executionMode ??
+        preferences?.magic_prompt_modes?.review_comments_mode ??
+        DEFAULT_MAGIC_PROMPT_MODES.review_comments_mode
+
       // Helper to send the message once we have a session ID
-      const sendInSession = (sessionId: string) => {
+      const sendInSession = (sessionId: string, prompt: string) => {
         const {
           addSendingSession,
           setLastSentMessage,
           setError,
           setSelectedModel,
           setSelectedProvider,
+          setExecutionMode,
           setExecutingMode,
           setSelectedBackend: setZustandBackend,
         } = useChatStore.getState()
@@ -804,7 +849,8 @@ export function useInvestigateHandlers({
         addSendingSession(sessionId)
         setSelectedModel(sessionId, reviewCommentsModel)
         setSelectedProvider(sessionId, reviewCommentsProvider)
-        setExecutingMode(sessionId, executionModeRef.current)
+        setExecutionMode(sessionId, requestedExecutionMode)
+        setExecutingMode(sessionId, requestedExecutionMode)
         setZustandBackend(sessionId, reviewCommentsBackend)
 
         useChatStore.getState().setSelectedModel(sessionId, reviewCommentsModel)
@@ -858,7 +904,7 @@ export function useInvestigateHandlers({
             worktreePath,
             message: prompt,
             model: reviewCommentsModel,
-            executionMode: executionModeRef.current,
+            executionMode: requestedExecutionMode,
             thinkingLevel: selectedThinkingLevelRef.current,
             effortLevel: useAdaptive
               ? selectedEffortLevelRef.current
@@ -882,43 +928,49 @@ export function useInvestigateHandlers({
         )
       }
 
-      // Create a new session for review comments
-      createSession.mutate(
-        { worktreeId, worktreePath },
-        {
-          onSuccess: session => {
-            const { setActiveSession, copySessionSettings, activeSessionIds } =
-              useChatStore.getState()
-            const currentSessionId = activeSessionIds[worktreeId]
-            if (currentSessionId) {
-              copySessionSettings(currentSessionId, session.id)
-            }
-            useChatStore
-              .getState()
-              .setSelectedBackend(session.id, reviewCommentsBackend)
-            useChatStore
-              .getState()
-              .setSelectedModel(session.id, reviewCommentsModel)
-            useChatStore
-              .getState()
-              .setSelectedProvider(session.id, reviewCommentsProvider)
-            primeSessionSelection(
-              session.id,
-              reviewCommentsBackend,
-              reviewCommentsModel,
-              reviewCommentsProvider
-            )
-            setActiveSession(worktreeId, session.id)
-            queryClient.invalidateQueries({
-              queryKey: chatQueryKeys.sessions(worktreeId),
-            })
-            sendInSession(session.id)
-          },
-          onError: error => {
-            console.error('[REVIEW-COMMENTS] Failed to create session:', error)
-          },
+      // Create one session per selected review comment prompt. Use mutateAsync
+      // instead of repeated mutate(..., { onSuccess }) calls because TanStack
+      // Query only guarantees per-call callbacks for the latest consecutive
+      // mutate observer, which can leave earlier/later sessions empty.
+      const baseSessionId = useChatStore.getState().activeSessionIds[worktreeId]
+      for (const prompt of prompts) {
+        let session: Session
+        try {
+          session = await createSession.mutateAsync({
+            worktreeId,
+            worktreePath,
+          })
+        } catch (error) {
+          console.error('[REVIEW-COMMENTS] Failed to create session:', error)
+          continue
         }
-      )
+
+        const { setActiveSession, copySessionSettings } =
+          useChatStore.getState()
+        if (baseSessionId) {
+          copySessionSettings(baseSessionId, session.id)
+        }
+        useChatStore
+          .getState()
+          .setSelectedBackend(session.id, reviewCommentsBackend)
+        useChatStore
+          .getState()
+          .setSelectedModel(session.id, reviewCommentsModel)
+        useChatStore
+          .getState()
+          .setSelectedProvider(session.id, reviewCommentsProvider)
+        primeSessionSelection(
+          session.id,
+          reviewCommentsBackend,
+          reviewCommentsModel,
+          reviewCommentsProvider
+        )
+        setActiveSession(worktreeId, session.id)
+        queryClient.invalidateQueries({
+          queryKey: chatQueryKeys.sessions(worktreeId),
+        })
+        sendInSession(session.id, prompt)
+      }
     },
     [
       sendMessage,
@@ -930,6 +982,7 @@ export function useInvestigateHandlers({
       preferences?.magic_prompt_models?.review_comments_model,
       preferences?.magic_prompt_providers,
       preferences?.magic_prompt_backends,
+      preferences?.magic_prompt_modes,
       preferences?.chrome_enabled,
       preferences?.ai_language,
       setSessionProvider,

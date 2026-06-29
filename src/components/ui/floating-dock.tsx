@@ -13,7 +13,6 @@ import {
   Plus,
   Archive,
   Terminal,
-  Sparkles,
   FileText,
   Github,
   GitPullRequest,
@@ -207,6 +206,11 @@ export function FloatingDock() {
   const activeSessionId = useChatStore(state =>
     currentWorktreeId ? state.activeSessionIds[currentWorktreeId] : undefined
   )
+  const isTerminalSession = useUIStore(state =>
+    activeSessionId
+      ? state.sessionPrimarySurface[activeSessionId] === 'terminal'
+      : false
+  )
   const selectedBackend = useChatStore(state =>
     activeSessionId ? state.selectedBackends[activeSessionId] : undefined
   )
@@ -217,7 +221,13 @@ export function FloatingDock() {
 
   const activeBackend = (selectedBackend ??
     preferences?.default_backend ??
-    'claude') as 'claude' | 'codex' | 'opencode' | 'cursor'
+    'claude') as
+    | 'claude'
+    | 'codex'
+    | 'opencode'
+    | 'cursor'
+    | 'pi'
+    | 'commandcode'
 
   const codexStatus = useCodexCliStatus()
   const codexAuth = useCodexCliAuth({
@@ -408,11 +418,13 @@ export function FloatingDock() {
   // When the chat toolbar is mounted, the DockBurgerButton there exposes the
   // same menu — hide this corner dock to avoid duplicate UI and overlap with
   // the chat textarea.
-  if (chatToolbarMounted) return null
+  // Terminal sessions are full-screen inside the chat bounds and have no
+  // bottom input/toolbar, so the corner dock would cover terminal output.
+  if (chatToolbarMounted || isTerminalSession) return null
 
   return (
     <div
-      className="absolute right-4 z-10 flex flex-row items-center gap-0.5 rounded-lg border border-border bg-muted/50 backdrop-blur-md px-1 py-0.5 transition-[bottom] duration-200 sm:left-4 sm:right-auto sm:flex-col sm:px-0.5 sm:py-1 xl:flex-row xl:px-1 xl:py-0.5"
+      className="absolute right-4 z-10 flex flex-row items-center gap-0.5 rounded-lg border border-border bg-muted/50 px-1 py-0.5 transition-[bottom] duration-200 sm:left-4 sm:right-auto sm:flex-col sm:px-0.5 sm:py-1 xl:flex-row xl:px-1 xl:py-0.5"
       style={{ bottom: bottomOffset }}
     >
       <DropdownMenu open={menuOpen} onOpenChange={handleQuickMenuOpenChange}>
@@ -477,12 +489,7 @@ export function FloatingDock() {
             </>
           )}
           <DropdownMenuSeparator />
-          <DropdownMenuItem
-            onClick={() => window.dispatchEvent(new CustomEvent('open-recap'))}
-          >
-            <Sparkles className="mr-2 h-4 w-4" />
-            View Recap
-          </DropdownMenuItem>
+
           <DropdownMenuItem
             onClick={() => window.dispatchEvent(new CustomEvent('open-plan'))}
           >

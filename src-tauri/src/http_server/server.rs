@@ -1,6 +1,7 @@
 use axum::{
+    body::Body,
     extract::{ws::WebSocketUpgrade, Path as AxumPath, Query, State},
-    http::StatusCode,
+    http::{header, HeaderMap, HeaderValue, StatusCode, Uri},
     response::{IntoResponse, Response},
     routing::get,
     Json, Router,
@@ -14,9 +15,9 @@ use std::sync::Arc;
 use tauri::{AppHandle, Manager};
 use tokio::sync::Mutex;
 use tower_http::compression::CompressionLayer;
-use tower_http::cors::{Any, CorsLayer};
-use tower_http::services::{ServeDir, ServeFile};
+use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 
+use super::assets;
 use super::auth;
 use super::websocket::handle_ws_connection;
 use super::EmitExt;
@@ -28,6 +29,8 @@ struct AppState {
     app: AppHandle,
     token: String,
     token_required: bool,
+    localhost_only: bool,
+    dist_path: std::path::PathBuf,
 }
 
 /// Server handle for shutdown coordination.
@@ -55,6 +58,9 @@ pub struct ServerStatus {
 #[derive(Deserialize)]
 struct WsAuth {
     token: Option<String>,
+    /// `reconnect` returns the smallest payload needed after a WebSocket drop.
+    /// Full page loads omit this and receive the broader bootstrap payload.
+    mode: Option<String>,
     /// Comma-separated worktreeId:sessionId pairs from the browser's current state.
     /// Used by /api/init to load the correct active sessions even when
     /// ui_state.json on disk is stale (debounced save hasn't flushed yet).
@@ -65,10 +71,78 @@ struct WsAuth {
     selected_project: Option<String>,
 }
 
+impl WsAuth {
+    fn is_reconnect(&self) -> bool {
+        self.mode.as_deref() == Some("reconnect")
+    }
+}
+
+fn selected_project_id_for_init(
+    selected_project: Option<&str>,
+    ui_state: Option<&crate::UIState>,
+) -> Option<String> {
+    selected_project
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .or_else(|| {
+            ui_state
+                .and_then(|u| u.active_project_id.clone())
+                .filter(|s| !s.is_empty())
+        })
+}
+
 #[derive(Serialize, Clone)]
 pub struct BindHostOption {
     pub host: String,
     pub label: String,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct WebBuildInfo {
+    web_build_id: String,
+    app_version: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    git_sha: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    built_at: Option<String>,
+}
+
+impl Default for WebBuildInfo {
+    fn default() -> Self {
+        Self {
+            web_build_id: env!("CARGO_PKG_VERSION").to_string(),
+            app_version: env!("CARGO_PKG_VERSION").to_string(),
+            git_sha: None,
+            built_at: None,
+        }
+    }
+}
+
+fn server_platform_name() -> &'static str {
+    if cfg!(target_os = "windows") {
+        "windows"
+    } else if cfg!(target_os = "macos") {
+        "mac"
+    } else {
+        "linux"
+    }
+}
+
+async fn read_web_build_info(dist_path: &std::path::Path) -> WebBuildInfo {
+    let path = dist_path.join("jean-build.json");
+    match tokio::fs::read_to_string(&path).await {
+        Ok(contents) => serde_json::from_str::<WebBuildInfo>(&contents).unwrap_or_else(|e| {
+            log::warn!("Failed to parse {}: {e}", path.display());
+            WebBuildInfo::default()
+        }),
+        Err(e) => {
+            log::debug!("No filesystem web build info at {}: {e}", path.display());
+            assets::get("jean-build.json")
+                .and_then(|data| serde_json::from_slice::<WebBuildInfo>(&data).ok())
+                .unwrap_or_default()
+        }
+    }
 }
 
 /// Resolve the dist directory path at runtime.
@@ -140,31 +214,30 @@ pub async fn start_server(
 ) -> Result<HttpServerHandle, String> {
     let bind_ip = parse_bind_ip(&bind_host)?;
     let localhost_only = bind_ip.is_loopback();
+
+    // Resolve the dist directory at runtime for static file serving
+    let dist_path = resolve_dist_path(&app);
+
     let state = AppState {
         app: app.clone(),
         token: token.clone(),
         token_required,
+        localhost_only,
+        dist_path: dist_path.clone(),
     };
 
-    let cors = CorsLayer::new()
-        .allow_origin(Any)
-        .allow_methods(Any)
-        .allow_headers(Any);
-
-    // Resolve the dist directory at runtime for static file serving
-    let dist_path = resolve_dist_path(&app);
-    let index_path = dist_path.join("index.html");
-
-    let serve_dir = ServeDir::new(&dist_path)
-        .append_index_html_on_directories(true)
-        .fallback(ServeFile::new(&index_path));
+    let cors = cors_layer_from_env();
 
     let router = Router::new()
+        .route("/healthz", get(health_handler))
+        .route("/readyz", get(ready_handler))
         .route("/ws", get(ws_handler))
         .route("/api/auth", get(auth_handler))
         .route("/api/init", get(init_handler))
+        .route("/api/version", get(version_handler))
         .route("/api/files/{*filepath}", get(file_handler))
-        .fallback_service(serve_dir)
+        .route("/api/project-files/{*filepath}", get(project_file_handler))
+        .fallback(get(static_handler))
         .layer(CompressionLayer::new().br(true).gzip(true))
         .layer(cors)
         .with_state(state);
@@ -208,18 +281,66 @@ pub async fn start_server(
     })
 }
 
+fn cors_layer_from_env() -> CorsLayer {
+    let mut layer = CorsLayer::new().allow_methods(Any).allow_headers(Any);
+    let raw = std::env::var("JEAN_ALLOWED_ORIGINS").unwrap_or_default();
+    let origins: Vec<HeaderValue> = raw
+        .split(',')
+        .map(str::trim)
+        .filter(|origin| !origin.is_empty())
+        .filter_map(|origin| match HeaderValue::from_str(origin) {
+            Ok(value) => Some(value),
+            Err(e) => {
+                log::warn!("Ignoring invalid JEAN_ALLOWED_ORIGINS entry '{origin}': {e}");
+                None
+            }
+        })
+        .collect();
+
+    if raw.trim() == "*" {
+        layer = layer.allow_origin(AllowOrigin::any());
+    } else if !origins.is_empty() {
+        layer = layer.allow_origin(AllowOrigin::list(origins));
+    }
+
+    layer
+}
+
+async fn health_handler() -> Response {
+    Json(serde_json::json!({ "ok": true })).into_response()
+}
+
+async fn ready_handler(State(state): State<AppState>) -> Response {
+    let broadcaster_ready = state.app.try_state::<WsBroadcaster>().is_some();
+    let status = if broadcaster_ready {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+
+    (
+        status,
+        Json(serde_json::json!({
+            "ok": broadcaster_ready,
+            "http": true,
+            "websocket_broadcaster": broadcaster_ready,
+        })),
+    )
+        .into_response()
+}
+
 /// WebSocket upgrade handler with token auth.
 async fn ws_handler(
     ws: WebSocketUpgrade,
+    headers: HeaderMap,
     Query(params): Query<WsAuth>,
     State(state): State<AppState>,
 ) -> Response {
     // Validate token (skip if token not required)
-    if state.token_required {
-        let provided = params.token.unwrap_or_default();
-        if !auth::validate_token(&provided, &state.token) {
-            return (StatusCode::UNAUTHORIZED, "Invalid token").into_response();
-        }
+    if state.token_required
+        && !request_is_authorized(params.token.as_deref(), &headers, &state.token)
+    {
+        return (StatusCode::UNAUTHORIZED, "Invalid token").into_response();
     }
 
     // Get broadcast receiver for this client
@@ -237,15 +358,31 @@ async fn ws_handler(
 
 /// Token validation endpoint. Returns 200 with { ok: true } on success,
 /// or 401 with { ok: false, error: "..." } on failure.
-async fn auth_handler(Query(params): Query<WsAuth>, State(state): State<AppState>) -> Response {
+async fn auth_handler(
+    headers: HeaderMap,
+    Query(params): Query<WsAuth>,
+    State(state): State<AppState>,
+) -> Response {
+    let build_info = read_web_build_info(&state.dist_path).await;
+
     // If token not required, always return success
     if !state.token_required {
-        return Json(serde_json::json!({ "ok": true, "token_required": false })).into_response();
+        return Json(serde_json::json!({
+            "ok": true,
+            "token_required": false,
+            "webBuildId": build_info.web_build_id,
+            "appVersion": build_info.app_version,
+        }))
+        .into_response();
     }
 
-    let provided = params.token.unwrap_or_default();
-    if auth::validate_token(&provided, &state.token) {
-        Json(serde_json::json!({ "ok": true })).into_response()
+    if request_is_authorized(params.token.as_deref(), &headers, &state.token) {
+        Json(serde_json::json!({
+            "ok": true,
+            "webBuildId": build_info.web_build_id,
+            "appVersion": build_info.app_version,
+        }))
+        .into_response()
     } else {
         (
             StatusCode::UNAUTHORIZED,
@@ -253,6 +390,20 @@ async fn auth_handler(Query(params): Query<WsAuth>, State(state): State<AppState
         )
             .into_response()
     }
+}
+
+async fn version_handler(
+    headers: HeaderMap,
+    Query(params): Query<WsAuth>,
+    State(state): State<AppState>,
+) -> Response {
+    if state.token_required
+        && !request_is_authorized(params.token.as_deref(), &headers, &state.token)
+    {
+        return (StatusCode::UNAUTHORIZED, "Invalid token").into_response();
+    }
+
+    Json(read_web_build_info(&state.dist_path).await).into_response()
 }
 
 /// Maximum number of chat messages loaded per active session at init.
@@ -265,17 +416,243 @@ const INIT_MESSAGE_WINDOW: usize = 50;
 /// continues over the WebSocket connection.
 const INIT_REPLAY_EVENT_CAP: usize = 200;
 
+type WorktreesByProject = std::collections::HashMap<String, Vec<crate::projects::types::Worktree>>;
+type SessionsByWorktree = std::collections::HashMap<String, crate::chat::types::WorktreeSessions>;
+
+async fn load_selected_project_bootstrap(
+    app: AppHandle,
+    project_id: String,
+) -> (WorktreesByProject, SessionsByWorktree) {
+    let worktrees = crate::projects::list_worktrees(app.clone(), project_id.clone())
+        .await
+        .unwrap_or_default();
+
+    let sessions_futures: Vec<_> = worktrees
+        .iter()
+        .map(|wt| {
+            let app = app.clone();
+            let worktree_id = wt.id.clone();
+            let worktree_path = wt.path.clone();
+            async move {
+                let sessions = crate::chat::get_sessions(
+                    app,
+                    worktree_id.clone(),
+                    worktree_path,
+                    None,       // include_archived
+                    Some(true), // include_message_counts
+                )
+                .await
+                .unwrap_or_default();
+                (worktree_id, sessions)
+            }
+        })
+        .collect();
+
+    let sessions_by_worktree = futures_util::future::join_all(sessions_futures)
+        .await
+        .into_iter()
+        .collect();
+
+    let mut worktrees_by_project = std::collections::HashMap::new();
+    worktrees_by_project.insert(project_id, worktrees);
+    (worktrees_by_project, sessions_by_worktree)
+}
+
+fn parse_active_sessions_param(value: Option<&str>) -> std::collections::HashMap<String, String> {
+    value
+        .unwrap_or("")
+        .split(',')
+        .filter_map(|pair| {
+            let pair = pair.trim();
+            let (wt, sess) = pair.split_once(':')?;
+            if wt.is_empty() || sess.is_empty() {
+                return None;
+            }
+            Some((wt.to_string(), sess.to_string()))
+        })
+        .collect()
+}
+
+async fn reconnect_init_response(params: WsAuth, state: AppState) -> Response {
+    let mut response = serde_json::json!({});
+    let build_info = read_web_build_info(&state.dist_path).await;
+    response["webBuildId"] = Value::String(build_info.web_build_id);
+    response["appVersion"] = Value::String(build_info.app_version);
+
+    if let Ok(app_data_dir) = state.app.path().app_data_dir() {
+        response["appDataDir"] = Value::String(app_data_dir.to_string_lossy().to_string());
+    }
+
+    let (projects_result, preferences_result, ui_state_result) = tokio::join!(
+        crate::projects::list_projects(state.app.clone()),
+        crate::load_preferences(state.app.clone()),
+        crate::load_ui_state(state.app.clone()),
+    );
+
+    let projects = match projects_result {
+        Ok(projects) => projects,
+        Err(e) => {
+            log::error!("Failed to load projects for reconnect /api/init: {e}");
+            vec![]
+        }
+    };
+    let ui_state = match ui_state_result {
+        Ok(ui_state) => Some(ui_state),
+        Err(e) => {
+            log::error!("Failed to load ui_state for reconnect /api/init: {e}");
+            None
+        }
+    };
+
+    if let Ok(val) = serde_json::to_value(&projects) {
+        response["projects"] = val;
+    }
+    if let Some(ref ui) = ui_state {
+        if let Ok(val) = serde_json::to_value(ui) {
+            response["uiState"] = val;
+        }
+    }
+    match preferences_result {
+        Ok(preferences) => {
+            if let Ok(val) = serde_json::to_value(&preferences) {
+                response["preferences"] = val;
+            }
+        }
+        Err(e) => {
+            log::error!("Failed to load preferences for reconnect /api/init: {e}");
+            response["preferences"] = Value::Null;
+        }
+    }
+
+    let selected_project_id =
+        selected_project_id_for_init(params.selected_project.as_deref(), ui_state.as_ref());
+    let selected_project = selected_project_id
+        .as_deref()
+        .and_then(|id| projects.iter().find(|p| p.id == id && !p.is_folder));
+    if let Some(project) = selected_project {
+        let (worktrees_by_project, sessions_by_worktree) =
+            load_selected_project_bootstrap(state.app.clone(), project.id.clone()).await;
+        if let Ok(val) = serde_json::to_value(&worktrees_by_project) {
+            response["worktreesByProject"] = val;
+        }
+        if let Ok(val) = serde_json::to_value(&sessions_by_worktree) {
+            response["sessionsByWorktree"] = val;
+        }
+    }
+
+    let browser_active_sessions = parse_active_sessions_param(params.active_sessions.as_deref());
+
+    if !browser_active_sessions.is_empty() {
+        let session_futures: Vec<_> = browser_active_sessions
+            .iter()
+            .map(|(worktree_id, session_id)| {
+                let app = state.app.clone();
+                let wt_id = worktree_id.clone();
+                let sess_id = session_id.clone();
+                async move {
+                    let worktree =
+                        crate::projects::get_worktree(app.clone(), wt_id.clone()).await?;
+                    let session = crate::chat::get_session(
+                        app,
+                        wt_id.clone(),
+                        worktree.path,
+                        sess_id.clone(),
+                        Some(INIT_MESSAGE_WINDOW),
+                    )
+                    .await?;
+                    Ok::<_, String>((sess_id, wt_id, session))
+                }
+            })
+            .collect();
+
+        let mut active_sessions = serde_json::Map::new();
+        let mut active_session_worktree_ids = serde_json::Map::new();
+
+        for result in futures_util::future::join_all(session_futures).await {
+            match result {
+                Ok((session_id, worktree_id, session)) => {
+                    if let Ok(value) = serde_json::to_value(session) {
+                        active_sessions.insert(session_id.clone(), value);
+                        active_session_worktree_ids.insert(session_id, Value::String(worktree_id));
+                    }
+                }
+                Err(e) => {
+                    log::warn!("Failed to load reconnect active session: {e}");
+                }
+            }
+        }
+
+        if !active_sessions.is_empty() {
+            response["activeSessions"] = Value::Object(active_sessions);
+            response["activeSessionWorktreeIds"] = Value::Object(active_session_worktree_ids);
+        }
+    }
+
+    let running_sessions = crate::chat::registry::get_running_sessions();
+    response["runningSessions"] = serde_json::to_value(&running_sessions).unwrap_or_default();
+
+    if !running_sessions.is_empty() && !browser_active_sessions.is_empty() {
+        let focused: HashSet<&String> = browser_active_sessions
+            .values()
+            .filter(|session_id| running_sessions.contains(session_id))
+            .collect();
+
+        if !focused.is_empty() {
+            let mut replay_events: Vec<Value> = state
+                .app
+                .try_state::<WsBroadcaster>()
+                .map(|broadcaster| {
+                    let mut events: Vec<Value> = focused
+                        .iter()
+                        .flat_map(|session_id| {
+                            let buffered = broadcaster.replay_events(session_id, 0);
+                            let start = buffered.len().saturating_sub(INIT_REPLAY_EVENT_CAP);
+                            buffered[start..].to_vec()
+                        })
+                        .filter_map(|(_, json)| serde_json::from_str::<Value>(&json).ok())
+                        .collect();
+                    events.sort_by_key(|event| {
+                        event
+                            .get("seq")
+                            .and_then(|seq| seq.as_u64())
+                            .unwrap_or_default()
+                    });
+                    events
+                })
+                .unwrap_or_default();
+
+            replay_events.dedup_by(|a, b| {
+                a.get("seq").and_then(|seq| seq.as_u64())
+                    == b.get("seq").and_then(|seq| seq.as_u64())
+            });
+
+            if !replay_events.is_empty() {
+                response["replayEvents"] = Value::Array(replay_events);
+            }
+        }
+    }
+
+    Json(response).into_response()
+}
+
 /// Initial data endpoint. Returns only the data needed to render the view the
 /// user lands on (project list + currently-selected project's worktrees +
 /// windowed messages for the focused session). Additional data is lazy-loaded
 /// by the frontend via TanStack Query hooks when the user navigates.
-async fn init_handler(Query(params): Query<WsAuth>, State(state): State<AppState>) -> Response {
+async fn init_handler(
+    headers: HeaderMap,
+    Query(params): Query<WsAuth>,
+    State(state): State<AppState>,
+) -> Response {
     // Validate token (skip if token not required)
-    if state.token_required {
-        let provided = params.token.unwrap_or_default();
-        if !auth::validate_token(&provided, &state.token) {
-            return (StatusCode::UNAUTHORIZED, "Invalid token").into_response();
-        }
+    if state.token_required
+        && !request_is_authorized(params.token.as_deref(), &headers, &state.token)
+    {
+        return (StatusCode::UNAUTHORIZED, "Invalid token").into_response();
+    }
+
+    if params.is_reconnect() {
+        return reconnect_init_response(params, state).await;
     }
 
     // Fetch base (always-included) data in parallel
@@ -286,6 +663,10 @@ async fn init_handler(Query(params): Query<WsAuth>, State(state): State<AppState
     );
 
     let mut response = serde_json::json!({});
+    let build_info = read_web_build_info(&state.dist_path).await;
+    response["webBuildId"] = Value::String(build_info.web_build_id.clone());
+    response["appVersion"] = Value::String(build_info.app_version.clone());
+    response["serverPlatform"] = Value::String(server_platform_name().to_string());
 
     let projects = match projects_result {
         Ok(projects) => projects,
@@ -303,17 +684,8 @@ async fn init_handler(Query(params): Query<WsAuth>, State(state): State<AppState
     // Resolve the "focused" project to scope the payload around.
     // Priority: browser override query param > ui_state.active_project_id.
     // Fall back to active_worktree_id's parent project if no active_project_id.
-    let selected_project_id: Option<String> = params
-        .selected_project
-        .as_deref()
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_string())
-        .or_else(|| {
-            ui_state
-                .as_ref()
-                .and_then(|u| u.active_project_id.clone())
-                .filter(|s| !s.is_empty())
-        });
+    let selected_project_id: Option<String> =
+        selected_project_id_for_init(params.selected_project.as_deref(), ui_state.as_ref());
 
     // Validate the selected project exists and is a real project (not a folder).
     let selected_project = selected_project_id
@@ -323,52 +695,15 @@ async fn init_handler(Query(params): Query<WsAuth>, State(state): State<AppState
     // Fetch worktrees + sessions (counts only) ONLY for the selected project.
     // All other projects' worktrees/sessions are lazy-loaded by the frontend
     // when the user navigates.
-    let (worktrees_by_project, sessions_by_worktree): (
-        std::collections::HashMap<String, Vec<crate::projects::types::Worktree>>,
-        std::collections::HashMap<String, crate::chat::types::WorktreeSessions>,
-    ) = if let Some(project) = selected_project {
-        let worktrees = crate::projects::list_worktrees(state.app.clone(), project.id.clone())
-            .await
-            .unwrap_or_default();
-
-        let sessions_futures: Vec<_> = worktrees
-            .iter()
-            .map(|wt| {
-                let app = state.app.clone();
-                let worktree_id = wt.id.clone();
-                let worktree_path = wt.path.clone();
-                async move {
-                    let sessions = crate::chat::get_sessions(
-                        app,
-                        worktree_id.clone(),
-                        worktree_path,
-                        None,       // include_archived
-                        Some(true), // include_message_counts
-                    )
-                    .await
-                    .unwrap_or_default();
-                    (worktree_id, sessions)
-                }
-            })
-            .collect();
-
-        let sessions_by_wt: std::collections::HashMap<
-            String,
-            crate::chat::types::WorktreeSessions,
-        > = futures_util::future::join_all(sessions_futures)
-            .await
-            .into_iter()
-            .collect();
-
-        let mut wt_map = std::collections::HashMap::new();
-        wt_map.insert(project.id.clone(), worktrees);
-        (wt_map, sessions_by_wt)
-    } else {
-        (
-            std::collections::HashMap::new(),
-            std::collections::HashMap::new(),
-        )
-    };
+    let (worktrees_by_project, sessions_by_worktree): (WorktreesByProject, SessionsByWorktree) =
+        if let Some(project) = selected_project {
+            load_selected_project_bootstrap(state.app.clone(), project.id.clone()).await
+        } else {
+            (
+                std::collections::HashMap::new(),
+                std::collections::HashMap::new(),
+            )
+        };
 
     // Only worktrees in the selected project are "known" for validation/cleanup.
     // Entries in ui_state.active_session_ids for worktrees outside this scope
@@ -387,20 +722,7 @@ async fn init_handler(Query(params): Query<WsAuth>, State(state): State<AppState
 
     // Parse browser-provided active session IDs (worktreeId:sessionId pairs).
     // These override ui_state.json which may be stale due to debounced save.
-    let browser_active_sessions: std::collections::HashMap<String, String> = params
-        .active_sessions
-        .as_deref()
-        .unwrap_or("")
-        .split(',')
-        .filter_map(|pair| {
-            let pair = pair.trim();
-            let (wt, sess) = pair.split_once(':')?;
-            if wt.is_empty() || sess.is_empty() {
-                return None;
-            }
-            Some((wt.to_string(), sess.to_string()))
-        })
-        .collect();
+    let browser_active_sessions = parse_active_sessions_param(params.active_sessions.as_deref());
 
     // Merge browser's active sessions into ui_state (browser is more recent
     // than disk when ui_state.json save is debounced). Only merge entries we
@@ -689,15 +1011,15 @@ fn mime_from_extension(path: &std::path::Path) -> &'static str {
 /// that Tauri's asset:// protocol would serve in native mode.
 async fn file_handler(
     AxumPath(filepath): AxumPath<String>,
+    headers: HeaderMap,
     Query(params): Query<WsAuth>,
     State(state): State<AppState>,
 ) -> Response {
     // Validate token
-    if state.token_required {
-        let provided = params.token.unwrap_or_default();
-        if !auth::validate_token(&provided, &state.token) {
-            return (StatusCode::UNAUTHORIZED, "Invalid token").into_response();
-        }
+    if state.token_required
+        && !request_is_authorized(params.token.as_deref(), &headers, &state.token)
+    {
+        return (StatusCode::UNAUTHORIZED, "Invalid token").into_response();
     }
 
     // Resolve app data directory
@@ -746,6 +1068,211 @@ async fn file_handler(
             .into_response(),
         Err(_) => (StatusCode::NOT_FOUND, "Cannot read file").into_response(),
     }
+}
+
+fn validate_token(params: &WsAuth, headers: &HeaderMap, state: &AppState) -> Result<(), Response> {
+    if state.token_required
+        && !request_is_authorized(params.token.as_deref(), headers, &state.token)
+    {
+        return Err((StatusCode::UNAUTHORIZED, "Invalid token").into_response());
+    }
+    Ok(())
+}
+
+fn canonicalize_known_project_roots(app: &AppHandle) -> Result<Vec<std::path::PathBuf>, Response> {
+    let data = crate::projects::storage::load_projects_data(app).map_err(|e| {
+        log::warn!("Failed to load projects for project file request: {e}");
+        (StatusCode::INTERNAL_SERVER_ERROR, "Cannot load projects").into_response()
+    })?;
+
+    let mut roots = Vec::new();
+    for project in data.projects {
+        if project.is_folder || project.path.is_empty() {
+            continue;
+        }
+        if let Ok(path) = std::path::Path::new(&project.path).canonicalize() {
+            roots.push(path);
+        }
+    }
+    for worktree in data.worktrees {
+        if let Ok(path) = std::path::Path::new(&worktree.path).canonicalize() {
+            roots.push(path);
+        }
+    }
+
+    Ok(roots)
+}
+
+fn path_is_in_known_roots(path: &std::path::Path, roots: &[std::path::PathBuf]) -> bool {
+    roots.iter().any(|root| path.starts_with(root))
+}
+
+/// Serve files from known project/worktree directories (authenticated).
+/// Used by browser-mode clients for auto-detected project avatars, matching
+/// the native asset protocol's project directory allowlist.
+async fn project_file_handler(
+    AxumPath(filepath): AxumPath<String>,
+    headers: HeaderMap,
+    Query(params): Query<WsAuth>,
+    State(state): State<AppState>,
+) -> Response {
+    if let Err(response) = validate_token(&params, &headers, &state) {
+        return response;
+    }
+
+    let requested = std::path::PathBuf::from(&filepath);
+    if !requested.is_absolute() {
+        return (StatusCode::BAD_REQUEST, "Expected absolute file path").into_response();
+    }
+
+    let canonical = match requested.canonicalize() {
+        Ok(path) => path,
+        Err(_) => return (StatusCode::NOT_FOUND, "File not found").into_response(),
+    };
+    if !canonical.is_file() {
+        return (StatusCode::NOT_FOUND, "Not a file").into_response();
+    }
+
+    let roots = match canonicalize_known_project_roots(&state.app) {
+        Ok(roots) => roots,
+        Err(response) => return response,
+    };
+    if !path_is_in_known_roots(&canonical, &roots) {
+        return (StatusCode::FORBIDDEN, "Access denied").into_response();
+    }
+
+    let mime = mime_from_extension(&canonical);
+    match tokio::fs::read(&canonical).await {
+        Ok(bytes) => Response::builder()
+            .header("Content-Type", mime)
+            .header("Cache-Control", "private, max-age=3600")
+            .body(Body::from(bytes))
+            .unwrap()
+            .into_response(),
+        Err(_) => (StatusCode::NOT_FOUND, "Cannot read file").into_response(),
+    }
+}
+
+fn static_mime_from_extension(path: &std::path::Path) -> &'static str {
+    match path.extension().and_then(|e| e.to_str()) {
+        Some("html") => "text/html; charset=utf-8",
+        Some("js" | "mjs") => "text/javascript; charset=utf-8",
+        Some("css") => "text/css; charset=utf-8",
+        Some("json" | "map") => "application/json; charset=utf-8",
+        Some("svg") => "image/svg+xml",
+        Some("png") => "image/png",
+        Some("jpg" | "jpeg") => "image/jpeg",
+        Some("webp") => "image/webp",
+        Some("ico") => "image/x-icon",
+        Some("woff") => "font/woff",
+        Some("woff2") => "font/woff2",
+        _ => "application/octet-stream",
+    }
+}
+
+async fn static_handler(uri: Uri, State(state): State<AppState>) -> Response {
+    let raw_path = uri.path().trim_start_matches('/');
+    if raw_path.split('/').any(|part| part == "..") {
+        return (StatusCode::FORBIDDEN, "Access denied").into_response();
+    }
+
+    if let Some(response) = try_static_filesystem_response(raw_path, &state.dist_path).await {
+        return response;
+    }
+
+    embedded_static_response(raw_path)
+}
+
+async fn try_static_filesystem_response(
+    raw_path: &str,
+    dist_path: &std::path::Path,
+) -> Option<Response> {
+    let index_path = dist_path.join("index.html");
+    let requested_path = if raw_path.is_empty() {
+        index_path.clone()
+    } else {
+        dist_path.join(raw_path)
+    };
+
+    let path = match tokio::fs::metadata(&requested_path).await {
+        Ok(metadata) if metadata.is_file() => requested_path,
+        Ok(metadata) if metadata.is_dir() => requested_path.join("index.html"),
+        _ => index_path.clone(),
+    };
+
+    let canonical_base = match tokio::fs::canonicalize(dist_path).await {
+        Ok(path) => path,
+        Err(_) => return None,
+    };
+    let canonical_path = match tokio::fs::canonicalize(&path).await {
+        Ok(path) => path,
+        Err(_) => return None,
+    };
+    if !canonical_path.starts_with(canonical_base) {
+        return Some((StatusCode::FORBIDDEN, "Access denied").into_response());
+    }
+
+    let bytes = match tokio::fs::read(&canonical_path).await {
+        Ok(bytes) => bytes,
+        Err(_) => return None,
+    };
+
+    let canonical_index = index_path.canonicalize().unwrap_or(index_path);
+    let is_index = canonical_path == canonical_index;
+    let cache_control = if is_index || canonical_path.ends_with("jean-build.json") {
+        "no-store"
+    } else {
+        "public, max-age=31536000, immutable"
+    };
+
+    Some(
+        Response::builder()
+            .header(
+                header::CONTENT_TYPE,
+                static_mime_from_extension(&canonical_path),
+            )
+            .header(header::CACHE_CONTROL, cache_control)
+            .body(Body::from(bytes))
+            .unwrap()
+            .into_response(),
+    )
+}
+
+fn embedded_asset_path_for_request(raw_path: &str) -> &str {
+    if raw_path.is_empty() || !raw_path.contains('.') {
+        "index.html"
+    } else {
+        raw_path
+    }
+}
+
+fn embedded_static_response(raw_path: &str) -> Response {
+    let asset_path = embedded_asset_path_for_request(raw_path);
+    let data = assets::get(asset_path).or_else(|| assets::get("index.html"));
+
+    let Some(data) = data else {
+        return (
+            StatusCode::NOT_FOUND,
+            "Frontend assets not found. Run `bun run build` before building jean-server.",
+        )
+            .into_response();
+    };
+
+    let is_index = asset_path == "index.html";
+    let cache_control = if is_index || asset_path == "jean-build.json" {
+        "no-store"
+    } else {
+        "public, max-age=31536000, immutable"
+    };
+
+    Response::builder()
+        .header(
+            header::CONTENT_TYPE,
+            static_mime_from_extension(std::path::Path::new(asset_path)),
+        )
+        .header(header::CACHE_CONTROL, cache_control)
+        .body(Body::from(data.into_owned()))
+        .unwrap()
 }
 
 fn parse_bind_ip(host: &str) -> Result<IpAddr, String> {
@@ -830,6 +1357,26 @@ fn format_http_url(host: &str, port: u16) -> String {
     } else {
         format!("http://{host}:{port}")
     }
+}
+
+fn token_from_query_or_bearer(query_token: Option<&str>, headers: &HeaderMap) -> Option<String> {
+    if let Some(token) = query_token.filter(|token| !token.is_empty()) {
+        return Some(token.to_string());
+    }
+
+    let value = headers.get(header::AUTHORIZATION)?.to_str().ok()?.trim();
+    value
+        .strip_prefix("Bearer ")
+        .or_else(|| value.strip_prefix("bearer "))
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn request_is_authorized(query_token: Option<&str>, headers: &HeaderMap, expected: &str) -> bool {
+    token_from_query_or_bearer(query_token, headers)
+        .as_deref()
+        .is_some_and(|provided| auth::validate_token(provided, expected))
 }
 
 pub fn list_bind_host_options() -> Vec<BindHostOption> {
@@ -950,9 +1497,11 @@ pub async fn get_server_status(app: AppHandle) -> ServerStatus {
 mod tests {
     use super::{
         bind_host_option_label, bind_host_option_rank, display_host_for_bind_ip,
-        display_ip_for_bind_ip_with_candidates, format_http_url, is_tailscale_ipv4, parse_bind_ip,
+        display_ip_for_bind_ip_with_candidates, embedded_asset_path_for_request, format_http_url,
+        is_tailscale_ipv4, parse_bind_ip, path_is_in_known_roots, token_from_query_or_bearer,
         validate_bind_host,
     };
+    use axum::http::{HeaderMap, HeaderValue};
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
     #[test]
@@ -972,12 +1521,56 @@ mod tests {
     }
 
     #[test]
+    fn token_auth_accepts_bearer_authorization_header() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer secret-token"),
+        );
+
+        assert_eq!(
+            token_from_query_or_bearer(None, &headers),
+            Some("secret-token".to_string())
+        );
+    }
+
+    #[test]
+    fn token_auth_prefers_query_token_for_browser_compatibility() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer header-token"),
+        );
+
+        assert_eq!(
+            token_from_query_or_bearer(Some("query-token"), &headers),
+            Some("query-token".to_string())
+        );
+    }
+
+    #[test]
     fn parse_bind_ip_rejects_invalid_values() {
         let error = parse_bind_ip("tailscale").unwrap_err();
         assert!(error.contains("Invalid bind address"));
 
         let empty_error = parse_bind_ip("").unwrap_err();
         assert!(empty_error.contains("cannot be empty"));
+    }
+
+    #[test]
+    fn reconnect_init_response_includes_preferences() {
+        let source = include_str!("server.rs");
+        let start = source
+            .find("async fn reconnect_init_response")
+            .expect("reconnect_init_response should exist");
+        let rest = &source[start..];
+        let end = rest
+            .find("async fn init_handler")
+            .expect("init_handler should follow reconnect_init_response");
+        let body = &rest[..end];
+
+        assert!(body.contains("crate::load_preferences"));
+        assert!(body.contains("response[\"preferences\"]"));
     }
 
     #[test]
@@ -1059,6 +1652,23 @@ mod tests {
     }
 
     #[test]
+    fn embedded_asset_path_maps_root_and_spa_routes_to_index() {
+        assert_eq!(embedded_asset_path_for_request(""), "index.html");
+        assert_eq!(
+            embedded_asset_path_for_request("projects/abc"),
+            "index.html"
+        );
+    }
+
+    #[test]
+    fn embedded_asset_path_keeps_asset_paths() {
+        assert_eq!(
+            embedded_asset_path_for_request("assets/app.js"),
+            "assets/app.js"
+        );
+    }
+
+    #[test]
     fn wildcard_display_urls_never_use_unspecified_hosts() {
         let ipv6_url = format_http_url(
             &display_ip_for_bind_ip_with_candidates(
@@ -1114,5 +1724,84 @@ mod tests {
         let options = super::list_bind_host_options();
         assert!(options.iter().any(|option| option.host == "127.0.0.1"));
         assert!(options.iter().any(|option| option.host == "0.0.0.0"));
+    }
+
+    #[test]
+    fn selected_project_id_for_init_prefers_browser_state() {
+        let ui_state = crate::UIState {
+            active_project_id: Some("disk-project".to_string()),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            super::selected_project_id_for_init(Some("browser-project"), Some(&ui_state)),
+            Some("browser-project".to_string())
+        );
+    }
+
+    #[test]
+    fn selected_project_id_for_init_falls_back_to_ui_state() {
+        let ui_state = crate::UIState {
+            active_project_id: Some("disk-project".to_string()),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            super::selected_project_id_for_init(None, Some(&ui_state)),
+            Some("disk-project".to_string())
+        );
+    }
+
+    #[test]
+    fn selected_project_id_for_init_ignores_empty_values() {
+        let ui_state = crate::UIState {
+            active_project_id: Some(String::new()),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            super::selected_project_id_for_init(Some(""), Some(&ui_state)),
+            None
+        );
+    }
+
+    #[test]
+    fn server_platform_name_matches_supported_frontend_values() {
+        assert!(matches!(
+            super::server_platform_name(),
+            "mac" | "windows" | "linux"
+        ));
+    }
+
+    #[test]
+    fn test_path_is_in_known_roots_allows_nested_project_file() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().join("project");
+        let nested = root.join("public").join("favicon.png");
+        std::fs::create_dir_all(nested.parent().expect("nested parent")).expect("create dirs");
+        std::fs::write(&nested, "png").expect("write file");
+
+        let canonical_root = root.canonicalize().expect("canonical root");
+        let canonical_nested = nested.canonicalize().expect("canonical nested");
+
+        assert!(path_is_in_known_roots(&canonical_nested, &[canonical_root]));
+    }
+
+    #[test]
+    fn test_path_is_in_known_roots_rejects_sibling_prefix() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().join("project");
+        let sibling = dir.path().join("project-other").join("favicon.png");
+        std::fs::create_dir_all(&root).expect("create root");
+        std::fs::create_dir_all(sibling.parent().expect("sibling parent")).expect("create sibling");
+        std::fs::write(&sibling, "png").expect("write file");
+
+        let canonical_root = root.canonicalize().expect("canonical root");
+        let canonical_sibling = sibling.canonicalize().expect("canonical sibling");
+
+        assert!(!path_is_in_known_roots(
+            &canonical_sibling,
+            &[canonical_root]
+        ));
     }
 }

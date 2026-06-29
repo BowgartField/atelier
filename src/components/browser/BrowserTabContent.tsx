@@ -24,6 +24,21 @@ const TOP_SAFETY = 0
  * off-screen guarantees only the active one paints over the visible pane. */
 const OFFSCREEN_BOUNDS = { x: -100000, y: -100000, width: 1, height: 1 }
 
+async function parkAndHideIfActive(tabId: string): Promise<void> {
+  try {
+    const exists = await browserBackend.hasActive(tabId)
+    if (!exists) return
+    await browserBackend.setBounds(tabId, OFFSCREEN_BOUNDS)
+    await browserBackend.setVisible(tabId, false)
+  } catch (err) {
+    // Cleanup races are expected when a tab is intentionally closed: the store
+    // removes React content while `browser_close` unregisters the native
+    // webview. Log instead of letting a rejected cleanup promise hit the global
+    // unhandled-rejection toast.
+    console.warn(`[browser] cleanup failed for tab ${tabId}:`, err)
+  }
+}
+
 /**
  * Renders an empty placeholder div whose bounding rect drives the position of
  * the underlying native child Webview. The webview itself lives in Rust.
@@ -237,8 +252,7 @@ export const BrowserTabContent = memo(function BrowserTabContent({
   // On unmount: park off-screen + hide (keeps webview alive in Rust for re-mount)
   useEffect(() => {
     return () => {
-      void browserBackend.setBounds(tabId, OFFSCREEN_BOUNDS)
-      void browserBackend.setVisible(tabId, false)
+      void parkAndHideIfActive(tabId)
     }
   }, [tabId])
 
@@ -249,9 +263,11 @@ export const BrowserTabContent = memo(function BrowserTabContent({
     if (!isNativeApp()) return
     const win = getCurrentWindow()
     let unlisten: (() => void) | null = null
-    void win.onScaleChanged(() => scheduleFlush()).then(fn => {
-      unlisten = fn
-    })
+    void win
+      .onScaleChanged(() => scheduleFlush())
+      .then(fn => {
+        unlisten = fn
+      })
     return () => {
       if (unlisten) unlisten()
     }

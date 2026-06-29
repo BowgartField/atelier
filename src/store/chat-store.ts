@@ -22,7 +22,6 @@ import {
   type CodexMcpElicitationRequest,
   type CodexDynamicToolCallRequest,
   type ExecutionMode,
-  type SessionDigest,
   type LabelData,
   type ScheduledWakeup,
   EXECUTION_MODE_CYCLE,
@@ -36,14 +35,14 @@ export interface ScheduledWakeupState extends ScheduledWakeup {
 }
 import type { ReviewResponse } from '@/types/projects'
 import { invoke } from '@/lib/transport'
-import type { ClaudeModel, CodexModel } from '@/types/preferences'
+import type { ClaudeModel, CodexModel, CliBackend } from '@/types/preferences'
 export type { ClaudeModel, CodexModel }
 
 /** Default model to use when none is selected (fallback only - preferences take priority) */
-export const DEFAULT_MODEL: ClaudeModel = 'claude-opus-4-7'
+export const DEFAULT_MODEL: ClaudeModel = 'claude-opus-4-8[1m]'
 
 /** Default Codex model */
-export const DEFAULT_CODEX_MODEL: CodexModel = 'gpt-5.4'
+export const DEFAULT_CODEX_MODEL: CodexModel = 'gpt-5.5'
 
 /** Default thinking level */
 export const DEFAULT_THINKING_LEVEL: ThinkingLevel = 'off'
@@ -60,6 +59,14 @@ function hasActiveStreamingState(
     (state.streamingContentBlocks[sessionId]?.length ?? 0) > 0 ||
     (state.activeToolCalls[sessionId]?.length ?? 0) > 0
   )
+}
+
+function compactReplayBlocks(blocks: ContentBlock[]): ContentBlock[] {
+  return blocks.filter(block => {
+    if (block.type === 'text') return block.text.length > 0
+    if (block.type === 'thinking') return block.thinking.length > 0
+    return block.type === 'tool_use'
+  })
 }
 
 interface ChatUIState {
@@ -123,6 +130,10 @@ interface ChatUIState {
   // Streaming content blocks per session (preserves text/tool order)
   streamingContentBlocks: Record<string, ContentBlock[]>
 
+  // Hydrated running snapshots that a recovered backend may replay.
+  // Matching replayed events are consumed before they can duplicate/reorder UI.
+  streamingReplayContentBlocks: Record<string, ContentBlock[]>
+
   // Streaming thinking content per session (extended thinking)
   streamingThinkingContent: Record<string, string>
 
@@ -139,7 +150,7 @@ interface ChatUIState {
   effortLevels: Record<string, EffortLevel>
 
   // Selected backend per session (claude, codex, opencode, or cursor)
-  selectedBackends: Record<string, 'claude' | 'codex' | 'opencode' | 'cursor'>
+  selectedBackends: Record<string, CliBackend>
 
   // Selected model per session (for tracking what model was used)
   selectedModels: Record<string, string>
@@ -258,22 +269,29 @@ interface ChatUIState {
   // Sessions where user skipped questions (auto-skip all subsequent questions)
   skippedQuestionSessions: Record<string, boolean>
 
-  // Sessions that completed while out of focus, need digest on open (persisted)
-  pendingDigestSessionIds: Record<string, boolean>
-
-  // Generated session digests (cached until dismissed)
-  sessionDigests: Record<string, SessionDigest>
-
   // Worktree loading operations (commit, pr, review, merge, pull)
   worktreeLoadingOperations: Record<string, string | null>
 
   // User-assigned labels per session (e.g. "Needs testing")
   sessionLabels: Record<string, LabelData>
 
+  // Codex `/goal` long-horizon objectives keyed by sessionId (codex backend only)
+  codexGoals: Record<string, string>
+
   // Pending magic command to execute when ChatWindow mounts (from canvas navigation)
-  pendingMagicCommand: { command: string; prompt?: string } | null
+  pendingMagicCommand: {
+    command: string
+    prompt?: string
+    prompts?: string[]
+    executionMode?: ExecutionMode
+  } | null
   setPendingMagicCommand: (
-    cmd: { command: string; prompt?: string } | null
+    cmd: {
+      command: string
+      prompt?: string
+      prompts?: string[]
+      executionMode?: ExecutionMode
+    } | null
   ) => void
 
   // Actions - Session management
@@ -322,6 +340,10 @@ interface ChatUIState {
   // Actions - Plan file path management (persisted)
   setPlanFilePath: (sessionId: string, path: string | null) => void
   getPlanFilePath: (sessionId: string) => string | null
+
+  // Actions - Codex /goal objective management (persisted via session metadata)
+  setCodexGoal: (sessionId: string, goal: string | null) => void
+  getCodexGoal: (sessionId: string) => string | null
 
   // Actions - Pending plan message ID management (persisted)
   setPendingPlanMessageId: (sessionId: string, messageId: string | null) => void
@@ -386,9 +408,24 @@ interface ChatUIState {
   // Actions - Content blocks (session-based, for inline tool rendering)
   addTextBlock: (sessionId: string, text: string) => void
   addToolBlock: (sessionId: string, toolCallId: string) => void
+  addUserInputBlock: (sessionId: string, text: string) => void
   addThinkingBlock: (sessionId: string, thinking: string) => void
   clearStreamingContentBlocks: (sessionId: string) => void
   getStreamingContentBlocks: (sessionId: string) => ContentBlock[]
+  setStreamingReplayContentBlocks: (
+    sessionId: string,
+    blocks: ContentBlock[]
+  ) => void
+  consumeStreamingReplayText: (sessionId: string, text: string) => string
+  consumeStreamingReplayThinking: (
+    sessionId: string,
+    thinking: string
+  ) => string
+  consumeStreamingReplayToolBlock: (
+    sessionId: string,
+    toolCallId: string
+  ) => boolean
+  clearStreamingReplayContentBlocks: (sessionId: string) => void
 
   // Actions - Thinking content (session-based, for extended thinking)
   appendThinkingContent: (sessionId: string, content: string) => void
@@ -412,10 +449,7 @@ interface ChatUIState {
   getEffortLevel: (sessionId: string) => EffortLevel
 
   // Actions - Selected backend (session-based)
-  setSelectedBackend: (
-    sessionId: string,
-    backend: 'claude' | 'codex' | 'opencode' | 'cursor'
-  ) => void
+  setSelectedBackend: (sessionId: string, backend: CliBackend) => void
 
   // Actions - Selected model (session-based)
   setSelectedModel: (sessionId: string, model: string) => void
@@ -527,6 +561,7 @@ interface ChatUIState {
   enqueueMessage: (sessionId: string, message: QueuedMessage) => void
   dequeueMessage: (sessionId: string) => QueuedMessage | undefined
   removeQueuedMessage: (sessionId: string, messageId: string) => void
+  moveQueuedMessageFront: (sessionId: string, messageId: string) => void
   clearQueue: (sessionId: string) => void
   getQueueLength: (sessionId: string) => number
   getQueuedMessages: (sessionId: string) => QueuedMessage[]
@@ -632,13 +667,6 @@ interface ChatUIState {
   setSavingContext: (sessionId: string, saving: boolean) => void
   isSavingContext: (sessionId: string) => boolean
 
-  // Actions - Session digest (context recall after switching)
-  markSessionNeedsDigest: (sessionId: string) => void
-  clearPendingDigest: (sessionId: string) => void
-  setSessionDigest: (sessionId: string, digest: SessionDigest) => void
-  hasPendingDigest: (sessionId: string) => boolean
-  getSessionDigest: (sessionId: string) => SessionDigest | undefined
-
   // Actions - Worktree loading operations (commit, pr, review, merge, pull)
   setWorktreeLoading: (worktreeId: string, operation: string) => void
   clearWorktreeLoading: (worktreeId: string) => void
@@ -675,6 +703,7 @@ export const useChatStore = create<ChatUIState>()(
       streamingContents: {},
       activeToolCalls: {},
       streamingContentBlocks: {},
+      streamingReplayContentBlocks: {},
       streamingThinkingContent: {},
       inputDrafts: {},
       executionModes: {},
@@ -715,60 +744,48 @@ export const useChatStore = create<ChatUIState>()(
       pendingPlanMessageIds: {},
       savingContext: {},
       skippedQuestionSessions: {},
-      pendingDigestSessionIds: {},
-      sessionDigests: {},
       worktreeLoadingOperations: {},
       sessionLabels: {},
+      codexGoals: {},
       pendingMagicCommand: null,
 
       // Session management
       setActiveSession: (worktreeId, sessionId, options) => {
         set(
-          state => ({
-            activeSessionIds: {
-              ...state.activeSessionIds,
-              [worktreeId]: sessionId,
-            },
-            // Also track which worktree this session belongs to
-            sessionWorktreeMap: {
-              ...state.sessionWorktreeMap,
-              [sessionId]: worktreeId,
-            },
-          }),
+          state => {
+            const activeUnchanged =
+              state.activeSessionIds[worktreeId] === sessionId
+            const mapUnchanged =
+              state.sessionWorktreeMap[sessionId] === worktreeId
+            if (activeUnchanged && mapUnchanged) return state
+            return {
+              activeSessionIds: activeUnchanged
+                ? state.activeSessionIds
+                : {
+                    ...state.activeSessionIds,
+                    [worktreeId]: sessionId,
+                  },
+              // Also track which worktree this session belongs to
+              sessionWorktreeMap: mapUnchanged
+                ? state.sessionWorktreeMap
+                : {
+                    ...state.sessionWorktreeMap,
+                    [sessionId]: worktreeId,
+                  },
+            }
+          },
           undefined,
           'setActiveSession'
         )
 
         if (options?.markOpened !== false) {
-          // Update last_opened_at on the backend; for non-Claude waiting sessions
-          // this also transitions to review (returns true when transitioned).
-          invoke<boolean>('set_session_last_opened', { sessionId })
-            .then(transitioned => {
-              window.dispatchEvent(new CustomEvent('session-opened'))
-              if (transitioned) {
-                // Sync Zustand state to match the backend transition
-                const s = get()
-                set(
-                  {
-                    reviewingSessions: {
-                      ...s.reviewingSessions,
-                      [sessionId]: true,
-                    },
-                    waitingForInputSessionIds: Object.fromEntries(
-                      Object.entries(s.waitingForInputSessionIds).filter(
-                        ([k]) => k !== sessionId
-                      )
-                    ),
-                    pendingPlanMessageIds: Object.fromEntries(
-                      Object.entries(s.pendingPlanMessageIds).filter(
-                        ([k]) => k !== sessionId
-                      )
-                    ),
-                  },
-                  undefined,
-                  'autoTransitionToReview'
-                )
-              }
+          invoke('set_session_last_opened', { sessionId })
+            .then(() => {
+              window.dispatchEvent(
+                new CustomEvent('session-opened', {
+                  detail: { sessionIds: [sessionId] },
+                })
+              )
             })
             .catch(() => undefined)
         }
@@ -987,7 +1004,15 @@ export const useChatStore = create<ChatUIState>()(
       setSessionLabel: (sessionId, label) =>
         set(
           state => {
+            const current = state.sessionLabels[sessionId]
             if (label) {
+              if (
+                current?.name === label.name &&
+                current?.color === label.color &&
+                current?.pinned === label.pinned
+              ) {
+                return state
+              }
               return {
                 sessionLabels: {
                   ...state.sessionLabels,
@@ -995,6 +1020,7 @@ export const useChatStore = create<ChatUIState>()(
                 },
               }
             } else {
+              if (!current) return state
               const { [sessionId]: _, ...rest } = state.sessionLabels
               return { sessionLabels: rest }
             }
@@ -1024,6 +1050,28 @@ export const useChatStore = create<ChatUIState>()(
         ),
 
       getPlanFilePath: sessionId => get().planFilePaths[sessionId] ?? null,
+
+      // Codex /goal objective management (server is source of truth; we mirror
+      // the latest value in the store so the banner can re-render without a
+      // round-trip after every notification).
+      setCodexGoal: (sessionId, goal) =>
+        set(
+          state => {
+            if (goal) {
+              if (state.codexGoals[sessionId] === goal) return state
+              return {
+                codexGoals: { ...state.codexGoals, [sessionId]: goal },
+              }
+            }
+            if (!(sessionId in state.codexGoals)) return state
+            const { [sessionId]: _, ...rest } = state.codexGoals
+            return { codexGoals: rest }
+          },
+          undefined,
+          'setCodexGoal'
+        ),
+
+      getCodexGoal: sessionId => get().codexGoals[sessionId] ?? null,
 
       // Pending plan message ID management
       setPendingPlanMessageId: (sessionId, messageId) =>
@@ -1106,9 +1154,12 @@ export const useChatStore = create<ChatUIState>()(
 
       registerWorktreePath: (worktreeId, path) =>
         set(
-          state => ({
-            worktreePaths: { ...state.worktreePaths, [worktreeId]: path },
-          }),
+          state =>
+            state.worktreePaths[worktreeId] === path
+              ? state
+              : {
+                  worktreePaths: { ...state.worktreePaths, [worktreeId]: path },
+                },
           undefined,
           'registerWorktreePath'
         ),
@@ -1140,8 +1191,9 @@ export const useChatStore = create<ChatUIState>()(
       removeSendingSession: sessionId =>
         set(
           state => {
+            if (!(sessionId in state.sendingSessionIds)) return state
             console.log(`[Store] removeSendingSession id=${sessionId}`, {
-              wasSending: !!state.sendingSessionIds[sessionId],
+              wasSending: true,
               currentSending: Object.keys(state.sendingSessionIds),
             })
             const { [sessionId]: _, ...rest } = state.sendingSessionIds
@@ -1494,6 +1546,22 @@ export const useChatStore = create<ChatUIState>()(
           'addToolBlock'
         ),
 
+      // User text injected into a running turn (Codex turn/steer)
+      addUserInputBlock: (sessionId, text) =>
+        set(
+          state => ({
+            streamingContentBlocks: {
+              ...state.streamingContentBlocks,
+              [sessionId]: [
+                ...(state.streamingContentBlocks[sessionId] ?? []),
+                { type: 'user_input', text },
+              ],
+            },
+          }),
+          undefined,
+          'addUserInputBlock'
+        ),
+
       addThinkingBlock: (sessionId, thinking) =>
         set(
           state => {
@@ -1539,6 +1607,116 @@ export const useChatStore = create<ChatUIState>()(
       getStreamingContentBlocks: sessionId =>
         get().streamingContentBlocks[sessionId] ?? [],
 
+      setStreamingReplayContentBlocks: (sessionId, blocks) =>
+        set(
+          state => {
+            const normalized = compactReplayBlocks(blocks)
+            if (normalized.length === 0) {
+              if (!(sessionId in state.streamingReplayContentBlocks)) {
+                return state
+              }
+              const { [sessionId]: _, ...rest } =
+                state.streamingReplayContentBlocks
+              return { streamingReplayContentBlocks: rest }
+            }
+            return {
+              streamingReplayContentBlocks: {
+                ...state.streamingReplayContentBlocks,
+                [sessionId]: normalized,
+              },
+            }
+          },
+          undefined,
+          'setStreamingReplayContentBlocks'
+        ),
+
+      consumeStreamingReplayText: (sessionId, text) => {
+        if (!text) return text
+        const blocks = get().streamingReplayContentBlocks[sessionId]
+        const first = blocks?.[0]
+        if (!blocks?.length || !first) return text
+
+        if (first.type !== 'text') {
+          get().clearStreamingReplayContentBlocks(sessionId)
+          return text
+        }
+
+        if (first.text.startsWith(text)) {
+          const remaining = first.text.slice(text.length)
+          const nextBlocks = remaining
+            ? [{ type: 'text' as const, text: remaining }, ...blocks.slice(1)]
+            : blocks.slice(1)
+          get().setStreamingReplayContentBlocks(sessionId, nextBlocks)
+          return ''
+        }
+
+        if (text.startsWith(first.text)) {
+          get().setStreamingReplayContentBlocks(sessionId, blocks.slice(1))
+          return text.slice(first.text.length)
+        }
+
+        get().clearStreamingReplayContentBlocks(sessionId)
+        return text
+      },
+
+      consumeStreamingReplayThinking: (sessionId, thinking) => {
+        if (!thinking) return thinking
+        const blocks = get().streamingReplayContentBlocks[sessionId]
+        const first = blocks?.[0]
+        if (!blocks?.length || !first) return thinking
+
+        if (first.type !== 'thinking') {
+          get().clearStreamingReplayContentBlocks(sessionId)
+          return thinking
+        }
+
+        if (first.thinking.startsWith(thinking)) {
+          const remaining = first.thinking.slice(thinking.length)
+          const nextBlocks = remaining
+            ? [
+                { type: 'thinking' as const, thinking: remaining },
+                ...blocks.slice(1),
+              ]
+            : blocks.slice(1)
+          get().setStreamingReplayContentBlocks(sessionId, nextBlocks)
+          return ''
+        }
+
+        if (thinking.startsWith(first.thinking)) {
+          get().setStreamingReplayContentBlocks(sessionId, blocks.slice(1))
+          return thinking.slice(first.thinking.length)
+        }
+
+        get().clearStreamingReplayContentBlocks(sessionId)
+        return thinking
+      },
+
+      consumeStreamingReplayToolBlock: (sessionId, toolCallId) => {
+        const blocks = get().streamingReplayContentBlocks[sessionId]
+        const first = blocks?.[0]
+        if (!blocks?.length || !first) return false
+
+        if (first.type === 'tool_use' && first.tool_call_id === toolCallId) {
+          get().setStreamingReplayContentBlocks(sessionId, blocks.slice(1))
+          return true
+        }
+
+        get().clearStreamingReplayContentBlocks(sessionId)
+        return false
+      },
+
+      clearStreamingReplayContentBlocks: sessionId =>
+        set(
+          state => {
+            if (!(sessionId in state.streamingReplayContentBlocks)) return state
+            const { [sessionId]: _, ...rest } =
+              state.streamingReplayContentBlocks
+            return { streamingReplayContentBlocks: rest }
+          },
+          undefined,
+          'clearStreamingReplayContentBlocks'
+        ),
+
       // Thinking content (session-based, for extended thinking)
       appendThinkingContent: (sessionId, content) =>
         set(
@@ -1569,9 +1747,12 @@ export const useChatStore = create<ChatUIState>()(
       // Input drafts (session-based)
       setInputDraft: (sessionId, value) =>
         set(
-          state => ({
-            inputDrafts: { ...state.inputDrafts, [sessionId]: value },
-          }),
+          state =>
+            state.inputDrafts[sessionId] === value
+              ? state
+              : {
+                  inputDrafts: { ...state.inputDrafts, [sessionId]: value },
+                },
           undefined,
           'setInputDraft'
         ),
@@ -1609,17 +1790,37 @@ export const useChatStore = create<ChatUIState>()(
       setExecutionMode: (sessionId, mode) =>
         set(
           state => {
-            const newState: Partial<ChatUIState> = {
-              executionModes: {
-                ...state.executionModes,
-                [sessionId]: mode,
-              },
-            }
-            // Clear pending denials when switching to yolo mode (no approvals needed)
+            const modeUnchanged = state.executionModes[sessionId] === mode
+            const hasClassicDenials =
+              (state.pendingPermissionDenials[sessionId]?.length ?? 0) > 0
+            const hasCodexApprovals =
+              (state.pendingCodexCommandApprovalRequests[sessionId]?.length ??
+                0) > 0 ||
+              (state.pendingCodexPermissionRequests[sessionId]?.length ?? 0) >
+                0 ||
+              (state.pendingCodexUserInputRequests[sessionId]?.length ?? 0) >
+                0 ||
+              (state.pendingCodexMcpElicitationRequests[sessionId]?.length ??
+                0) > 0 ||
+              (state.pendingCodexDynamicToolCallRequests[sessionId]?.length ??
+                0) > 0
             if (
-              mode === 'yolo' &&
-              state.pendingPermissionDenials[sessionId]?.length
+              modeUnchanged &&
+              (mode !== 'yolo' || (!hasClassicDenials && !hasCodexApprovals))
             ) {
+              return state
+            }
+
+            const newState: Partial<ChatUIState> = modeUnchanged
+              ? {}
+              : {
+                  executionModes: {
+                    ...state.executionModes,
+                    [sessionId]: mode,
+                  },
+                }
+            // Clear pending denials when switching to yolo mode (no approvals needed)
+            if (mode === 'yolo' && hasClassicDenials) {
               const { [sessionId]: _, ...restDenials } =
                 state.pendingPermissionDenials
               newState.pendingPermissionDenials = restDenials
@@ -1627,7 +1828,7 @@ export const useChatStore = create<ChatUIState>()(
                 state.deniedMessageContext
               newState.deniedMessageContext = restContext
             }
-            if (mode === 'yolo') {
+            if (mode === 'yolo' && hasCodexApprovals) {
               const { [sessionId]: _cmd, ...restCommandApprovals } =
                 state.pendingCodexCommandApprovalRequests
               const { [sessionId]: _, ...restPermissionRequests } =
@@ -1656,12 +1857,15 @@ export const useChatStore = create<ChatUIState>()(
       // Thinking level (session-based)
       setThinkingLevel: (sessionId, level) =>
         set(
-          state => ({
-            thinkingLevels: {
-              ...state.thinkingLevels,
-              [sessionId]: level,
-            },
-          }),
+          state =>
+            state.thinkingLevels[sessionId] === level
+              ? state
+              : {
+                  thinkingLevels: {
+                    ...state.thinkingLevels,
+                    [sessionId]: level,
+                  },
+                },
           undefined,
           'setThinkingLevel'
         ),
@@ -1671,12 +1875,15 @@ export const useChatStore = create<ChatUIState>()(
       // Effort level (session-based, for Opus 4.6 adaptive thinking)
       setEffortLevel: (sessionId, level) =>
         set(
-          state => ({
-            effortLevels: {
-              ...state.effortLevels,
-              [sessionId]: level,
-            },
-          }),
+          state =>
+            state.effortLevels[sessionId] === level
+              ? state
+              : {
+                  effortLevels: {
+                    ...state.effortLevels,
+                    [sessionId]: level,
+                  },
+                },
           undefined,
           'setEffortLevel'
         ),
@@ -1686,12 +1893,15 @@ export const useChatStore = create<ChatUIState>()(
       // Selected backend (session-based)
       setSelectedBackend: (sessionId, backend) =>
         set(
-          state => ({
-            selectedBackends: {
-              ...state.selectedBackends,
-              [sessionId]: backend,
-            },
-          }),
+          state =>
+            state.selectedBackends[sessionId] === backend
+              ? state
+              : {
+                  selectedBackends: {
+                    ...state.selectedBackends,
+                    [sessionId]: backend,
+                  },
+                },
           undefined,
           'setSelectedBackend'
         ),
@@ -1699,12 +1909,15 @@ export const useChatStore = create<ChatUIState>()(
       // Selected model (session-based)
       setSelectedModel: (sessionId, model) =>
         set(
-          state => ({
-            selectedModels: {
-              ...state.selectedModels,
-              [sessionId]: model,
-            },
-          }),
+          state =>
+            state.selectedModels[sessionId] === model
+              ? state
+              : {
+                  selectedModels: {
+                    ...state.selectedModels,
+                    [sessionId]: model,
+                  },
+                },
           undefined,
           'setSelectedModel'
         ),
@@ -1714,9 +1927,11 @@ export const useChatStore = create<ChatUIState>()(
         set(
           state => {
             if (provider === undefined) {
+              if (!(sessionId in state.selectedProviders)) return state
               const { [sessionId]: _, ...rest } = state.selectedProviders
               return { selectedProviders: rest }
             }
+            if (state.selectedProviders[sessionId] === provider) return state
             return {
               selectedProviders: {
                 ...state.selectedProviders,
@@ -1780,12 +1995,22 @@ export const useChatStore = create<ChatUIState>()(
       // MCP servers (session-based)
       setEnabledMcpServers: (sessionId, servers) =>
         set(
-          state => ({
-            enabledMcpServers: {
-              ...state.enabledMcpServers,
-              [sessionId]: servers,
-            },
-          }),
+          state => {
+            const current = state.enabledMcpServers[sessionId]
+            if (
+              current &&
+              current.length === servers.length &&
+              current.every((server, index) => server === servers[index])
+            ) {
+              return state
+            }
+            return {
+              enabledMcpServers: {
+                ...state.enabledMcpServers,
+                [sessionId]: servers,
+              },
+            }
+          },
           undefined,
           'setEnabledMcpServers'
         ),
@@ -2045,8 +2270,18 @@ export const useChatStore = create<ChatUIState>()(
         set(
           state => {
             const existing = state.pendingFiles[sessionId] ?? []
-            // Deduplicate by relativePath - don't add if already present
-            if (existing.some(f => f.relativePath === file.relativePath)) {
+            // Deduplicate by source scope + relativePath - linked projects can share paths
+            const fileSource = file.sourceRootPath ?? file.sourceProjectId ?? ''
+            if (
+              existing.some(f => {
+                const existingSource =
+                  f.sourceRootPath ?? f.sourceProjectId ?? ''
+                return (
+                  existingSource === fileSource &&
+                  f.relativePath === file.relativePath
+                )
+              })
+            ) {
               return state
             }
             return {
@@ -2306,6 +2541,30 @@ export const useChatStore = create<ChatUIState>()(
           }),
           undefined,
           'removeQueuedMessage'
+        ),
+
+      moveQueuedMessageFront: (sessionId, messageId) =>
+        set(
+          state => {
+            const queue = state.messageQueues[sessionId] ?? []
+            const idx = queue.findIndex(m => m.id === messageId)
+            if (idx <= 0) return state // Not found or already first — no-op
+            const msg = queue[idx]
+            if (!msg) return state
+            const reordered = [
+              msg,
+              ...queue.slice(0, idx),
+              ...queue.slice(idx + 1),
+            ]
+            return {
+              messageQueues: {
+                ...state.messageQueues,
+                [sessionId]: reordered,
+              },
+            }
+          },
+          undefined,
+          'moveQueuedMessageFront'
         ),
 
       clearQueue: sessionId =>
@@ -2628,6 +2887,8 @@ export const useChatStore = create<ChatUIState>()(
               state.streamingContents
             const { [sessionId]: _sb, ...streamingContentBlocks } =
               state.streamingContentBlocks
+            const { [sessionId]: _srb, ...streamingReplayContentBlocks } =
+              state.streamingReplayContentBlocks
             const { [sessionId]: _tc, ...activeToolCalls } =
               state.activeToolCalls
             const { [sessionId]: _ss, ...sendingSessionIds } =
@@ -2637,22 +2898,17 @@ export const useChatStore = create<ChatUIState>()(
             const { [sessionId]: _sp, ...streamingPlanApprovals } =
               state.streamingPlanApprovals
             const { [sessionId]: _em, ...executingModes } = state.executingModes
-            const { [sessionId]: _pd, ...pendingPermissionDenials } =
-              state.pendingPermissionDenials
-            const { [sessionId]: _dc, ...deniedMessageContext } =
-              state.deniedMessageContext
             const { [sessionId]: _sa, ...sendStartedAtRest } =
               state.sendStartedAt
             return {
               streamingContents,
               streamingContentBlocks,
+              streamingReplayContentBlocks,
               activeToolCalls,
               sendingSessionIds,
               waitingForInputSessionIds,
               streamingPlanApprovals,
               executingModes,
-              pendingPermissionDenials,
-              deniedMessageContext,
               sendStartedAt: sendStartedAtRest,
               completedDurations:
                 sendStarted > 0
@@ -2677,6 +2933,8 @@ export const useChatStore = create<ChatUIState>()(
               state.streamingContents
             const { [sessionId]: _sb, ...streamingContentBlocks } =
               state.streamingContentBlocks
+            const { [sessionId]: _srb, ...streamingReplayContentBlocks } =
+              state.streamingReplayContentBlocks
             const { [sessionId]: _tc, ...activeToolCalls } =
               state.activeToolCalls
             const { [sessionId]: _ss, ...sendingSessionIds } =
@@ -2711,6 +2969,7 @@ export const useChatStore = create<ChatUIState>()(
             return {
               streamingContents,
               streamingContentBlocks,
+              streamingReplayContentBlocks,
               activeToolCalls,
               sendingSessionIds,
               waitingForInputSessionIds,
@@ -2754,6 +3013,8 @@ export const useChatStore = create<ChatUIState>()(
             }
             const { [sessionId]: _sc, ...streamingContents } =
               state.streamingContents
+            const { [sessionId]: _srb, ...streamingReplayContentBlocks } =
+              state.streamingReplayContentBlocks
             const { [sessionId]: _ss, ...sendingSessionIds } =
               state.sendingSessionIds
             const { [sessionId]: _em, ...executingModes } = state.executingModes
@@ -2761,6 +3022,7 @@ export const useChatStore = create<ChatUIState>()(
               state.sendStartedAt
             return {
               streamingContents,
+              streamingReplayContentBlocks,
               sendingSessionIds,
               executingModes,
               sendStartedAt: sendStartedAtRest,
@@ -2789,27 +3051,28 @@ export const useChatStore = create<ChatUIState>()(
               state.streamingContents
             const { [sessionId]: _sb, ...streamingContentBlocks } =
               state.streamingContentBlocks
+            const { [sessionId]: _srb, ...streamingReplayContentBlocks } =
+              state.streamingReplayContentBlocks
             const { [sessionId]: _tc, ...activeToolCalls } =
               state.activeToolCalls
             const { [sessionId]: _ss, ...sendingSessionIds } =
               state.sendingSessionIds
             const { [sessionId]: _wi, ...waitingForInputSessionIds } =
               state.waitingForInputSessionIds
-            const { [sessionId]: _pd, ...pendingPermissionDenials } =
-              state.pendingPermissionDenials
-            const { [sessionId]: _dc, ...deniedMessageContext } =
-              state.deniedMessageContext
             const { [sessionId]: _sa, ...sendStartedAtRest } =
               state.sendStartedAt
             return {
               streamingContents,
               streamingContentBlocks,
+              streamingReplayContentBlocks,
               activeToolCalls,
               sendingSessionIds,
               waitingForInputSessionIds,
-              pendingPermissionDenials,
-              deniedMessageContext,
               sendStartedAt: sendStartedAtRest,
+              completedDurations:
+                sendStarted > 0
+                  ? { ...state.completedDurations, [sessionId]: elapsed }
+                  : state.completedDurations,
               reviewingSessions: {
                 ...state.reviewingSessions,
                 [sessionId]: true,
@@ -2852,6 +3115,11 @@ export const useChatStore = create<ChatUIState>()(
             const { [sessionId]: _effort, ...restEffort } = state.effortLevels
             const { [sessionId]: _mcp, ...restMcp } = state.enabledMcpServers
             const { [sessionId]: _label, ...restLabels } = state.sessionLabels
+            const { [sessionId]: _goal, ...restCodexGoals } = state.codexGoals
+            const { [sessionId]: _duration, ...restDurations } =
+              state.completedDurations
+            const { [sessionId]: _replay, ...restReplayContentBlocks } =
+              state.streamingReplayContentBlocks
 
             return {
               approvedTools: restApproved,
@@ -2870,6 +3138,9 @@ export const useChatStore = create<ChatUIState>()(
               effortLevels: restEffort,
               enabledMcpServers: restMcp,
               sessionLabels: restLabels,
+              codexGoals: restCodexGoals,
+              completedDurations: restDurations,
+              streamingReplayContentBlocks: restReplayContentBlocks,
             }
           },
           undefined,
@@ -2937,51 +3208,6 @@ export const useChatStore = create<ChatUIState>()(
         ),
 
       isSavingContext: sessionId => get().savingContext[sessionId] ?? false,
-
-      // Session digest actions (context recall after switching)
-      markSessionNeedsDigest: sessionId =>
-        set(
-          state => ({
-            pendingDigestSessionIds: {
-              ...state.pendingDigestSessionIds,
-              [sessionId]: true,
-            },
-          }),
-          undefined,
-          'markSessionNeedsDigest'
-        ),
-
-      clearPendingDigest: sessionId =>
-        set(
-          state => {
-            const { [sessionId]: _, ...restPending } =
-              state.pendingDigestSessionIds
-            const { [sessionId]: __, ...restDigests } = state.sessionDigests
-            return {
-              pendingDigestSessionIds: restPending,
-              sessionDigests: restDigests,
-            }
-          },
-          undefined,
-          'clearPendingDigest'
-        ),
-
-      setSessionDigest: (sessionId, digest) =>
-        set(
-          state => ({
-            sessionDigests: {
-              ...state.sessionDigests,
-              [sessionId]: digest,
-            },
-          }),
-          undefined,
-          'setSessionDigest'
-        ),
-
-      hasPendingDigest: sessionId =>
-        get().pendingDigestSessionIds[sessionId] ?? false,
-
-      getSessionDigest: sessionId => get().sessionDigests[sessionId],
 
       // Worktree loading operations (commit, pr, review, merge, pull)
       setWorktreeLoading: (worktreeId, operation) =>

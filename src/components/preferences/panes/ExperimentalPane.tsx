@@ -1,15 +1,7 @@
 import React from 'react'
 import { Label } from '@/components/ui/label'
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from '@/components/ui/select'
 import { Switch } from '@/components/ui/switch'
 import { usePreferences, usePatchPreferences } from '@/services/preferences'
-import { modelOptions, type ClaudeModel } from '@/types/preferences'
 import { SettingsSection } from '../SettingsSection'
 
 const InlineField: React.FC<{
@@ -18,7 +10,7 @@ const InlineField: React.FC<{
   children: React.ReactNode
 }> = ({ label, description, children }) => (
   <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:gap-4">
-    <div className="space-y-0.5 sm:w-96 sm:shrink-0">
+    <div className="space-y-0.5 sm:w-56 sm:shrink-0 lg:w-72">
       <Label className="text-sm text-foreground">{label}</Label>
       {description && (
         <div className="text-xs text-muted-foreground">{description}</div>
@@ -39,71 +31,6 @@ export const ExperimentalPane: React.FC = () => {
           versions. Use at your own risk.
         </p>
       </div>
-
-      <SettingsSection
-        title="AI Behavior"
-        anchorId="pref-experimental-section-ai-behavior"
-      >
-        <div className="space-y-4">
-          <InlineField
-            label="Parallel execution prompting"
-            description="Add system prompt encouraging sub-agent parallelization for faster task execution"
-          >
-            <Switch
-              checked={preferences?.parallel_execution_prompt_enabled ?? false}
-              onCheckedChange={checked => {
-                patchPreferences.mutate({
-                  parallel_execution_prompt_enabled: checked,
-                })
-              }}
-            />
-          </InlineField>
-
-          <InlineField
-            label="Automatic session recap"
-            description="Auto-generate AI summary when returning to unfocused sessions. Press R on canvas to generate on-demand."
-          >
-            <Switch
-              checked={preferences?.session_recap_enabled ?? false}
-              onCheckedChange={checked => {
-                patchPreferences.mutate({ session_recap_enabled: checked })
-              }}
-            />
-          </InlineField>
-
-          <InlineField
-            label="Recap model"
-            description="Claude model for automatic and on-demand session recaps"
-          >
-            <Select
-              value={
-                preferences?.magic_prompt_models.session_recap_model ?? 'haiku'
-              }
-              onValueChange={(value: ClaudeModel) => {
-                if (preferences) {
-                  patchPreferences.mutate({
-                    magic_prompt_models: {
-                      ...preferences.magic_prompt_models,
-                      session_recap_model: value,
-                    },
-                  })
-                }
-              }}
-            >
-              <SelectTrigger className="w-full sm:min-w-96">
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                {modelOptions.map(option => (
-                  <SelectItem key={option.value} value={option.value}>
-                    {option.label}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-          </InlineField>
-        </div>
-      </SettingsSection>
 
       <SettingsSection
         title="Developer Tools"

@@ -1,5 +1,6 @@
 import type {
   Backend,
+  EffortLevel,
   ExecutionMode,
   Session,
   ThinkingLevel,
@@ -9,6 +10,7 @@ export type SessionSettingKey =
   | 'backend'
   | 'model'
   | 'thinkingLevel'
+  | 'effortLevel'
   | 'executionMode'
   | 'waitingForInput'
 
@@ -32,6 +34,11 @@ export function applySessionSettingToSession(
       return {
         ...session,
         selected_thinking_level: value as ThinkingLevel,
+      }
+    case 'effortLevel':
+      return {
+        ...session,
+        selected_effort_level: value as EffortLevel,
       }
     case 'executionMode':
       return {

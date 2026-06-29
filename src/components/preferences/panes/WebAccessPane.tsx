@@ -27,7 +27,6 @@ import { usePreferences, usePatchPreferences } from '@/services/preferences'
 import type { AppPreferences } from '@/types/preferences'
 import { invoke } from '@/lib/transport'
 import { toast } from 'sonner'
-import { isNativeApp } from '@/lib/environment'
 import { openExternal } from '@/lib/platform'
 import { copyToClipboard } from '@/lib/clipboard'
 import { SettingsSection } from '../SettingsSection'
@@ -78,7 +77,7 @@ const InlineField: React.FC<{
   children: React.ReactNode
 }> = ({ label, description, children }) => (
   <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:gap-4">
-    <div className="space-y-0.5 sm:w-96 sm:shrink-0">
+    <div className="space-y-0.5 sm:w-56 sm:shrink-0 lg:w-72">
       <Label className="text-sm text-foreground">{label}</Label>
       {description && (
         <div className="text-xs text-muted-foreground">{description}</div>
@@ -115,7 +114,6 @@ export const WebAccessPane: React.FC = () => {
 
   // Poll server status
   const refreshStatus = useCallback(async () => {
-    if (!isNativeApp()) return
     try {
       const status = await invoke<ServerStatus>('get_http_server_status')
       setServerStatus(status)
@@ -131,8 +129,6 @@ export const WebAccessPane: React.FC = () => {
   }, [refreshStatus])
 
   useEffect(() => {
-    if (!isNativeApp()) return
-
     let cancelled = false
     const loadBindHostOptions = async () => {
       try {
@@ -344,18 +340,6 @@ export const WebAccessPane: React.FC = () => {
     isLoopbackBindHost(activeBindHost) || isWildcardBindHost(activeBindHost)
   const showBoundUrl =
     hasUsableBoundUrl(boundUrl) && !isLoopbackBindHost(activeBindHost)
-
-  if (!isNativeApp()) {
-    return (
-      <div className="space-y-6">
-        <div className="rounded-lg border border-muted p-4">
-          <p className="text-sm text-muted-foreground">
-            Web Access settings are only available in the desktop app.
-          </p>
-        </div>
-      </div>
-    )
-  }
 
   return (
     <div className="space-y-6">

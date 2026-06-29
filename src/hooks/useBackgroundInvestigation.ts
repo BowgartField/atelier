@@ -3,7 +3,7 @@ import { invoke } from '@/lib/transport'
 import { useChatStore } from '@/store/chat-store'
 import { useUIStore } from '@/store/ui-store'
 import { usePreferences } from '@/services/preferences'
-import { useSendMessage, chatQueryKeys } from '@/services/chat'
+import { chatQueryKeys } from '@/services/chat'
 import { resolveBackend, supportsAdaptiveThinking } from '@/lib/model-utils'
 import {
   DEFAULT_INVESTIGATE_ISSUE_PROMPT,
@@ -12,9 +12,9 @@ import {
   DEFAULT_INVESTIGATE_ADVISORY_PROMPT,
   DEFAULT_INVESTIGATE_LINEAR_ISSUE_PROMPT,
   DEFAULT_PARALLEL_EXECUTION_PROMPT,
+  DEFAULT_MAGIC_PROMPT_MODES,
   resolveMagicPromptProvider,
 } from '@/types/preferences'
-import type { WorktreeSessions } from '@/types/chat'
 import { logger } from '@/lib/logger'
 import { useQueryClient } from '@tanstack/react-query'
 import { projectsQueryKeys } from '@/services/projects'
@@ -33,22 +33,18 @@ type InvestigationType =
  * When a worktree is created via CMD+Click with auto-investigate, the ChatWindow
  * never mounts (no modal opens), so the auto-investigate flag is never consumed.
  * This hook watches those flags, builds the investigation prompt, and sends it
- * directly via sendMessage — no modal needed.
+ * through the shared backend background-investigation command — no modal needed.
  *
  * Must be mounted at App level alongside useQueueProcessor.
  */
 export function useBackgroundInvestigation(): void {
   const { data: preferences } = usePreferences()
   const queryClient = useQueryClient()
-  const sendMessage = useSendMessage()
   const processingRef = useRef<Set<string>>(new Set())
   const retryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const [retryTick, setRetryTick] = useState(0)
 
-  // Refs for unstable dependencies — sendMessage is a new object every render,
-  // preferences changes when data loads. Using refs keeps the effect deps stable.
-  const sendMessageRef = useRef(sendMessage)
-  sendMessageRef.current = sendMessage
+  // Ref for unstable preferences dependency; keeps effect deps stable.
   const preferencesRef = useRef(preferences)
   preferencesRef.current = preferences
 
@@ -108,33 +104,23 @@ export function useBackgroundInvestigation(): void {
       return true
     }
 
-    for (const worktreeId of autoInvestigateWorktreeIds) {
-      if (checkCandidate(worktreeId))
-        candidates.push({ worktreeId, type: 'issue' })
-    }
+    const sources: { ids: Set<string>; type: InvestigationType }[] = [
+      { ids: autoInvestigateWorktreeIds, type: 'issue' },
+      { ids: autoInvestigatePRWorktreeIds, type: 'pr' },
+      { ids: autoInvestigateSecurityAlertWorktreeIds, type: 'security-alert' },
+      { ids: autoInvestigateAdvisoryWorktreeIds, type: 'advisory' },
+      { ids: autoInvestigateLinearIssueWorktreeIds, type: 'linear-issue' },
+    ]
 
-    for (const worktreeId of autoInvestigatePRWorktreeIds) {
-      if (candidates.some(c => c.worktreeId === worktreeId)) continue
-      if (checkCandidate(worktreeId))
-        candidates.push({ worktreeId, type: 'pr' })
-    }
-
-    for (const worktreeId of autoInvestigateSecurityAlertWorktreeIds) {
-      if (candidates.some(c => c.worktreeId === worktreeId)) continue
-      if (checkCandidate(worktreeId))
-        candidates.push({ worktreeId, type: 'security-alert' })
-    }
-
-    for (const worktreeId of autoInvestigateAdvisoryWorktreeIds) {
-      if (candidates.some(c => c.worktreeId === worktreeId)) continue
-      if (checkCandidate(worktreeId))
-        candidates.push({ worktreeId, type: 'advisory' })
-    }
-
-    for (const worktreeId of autoInvestigateLinearIssueWorktreeIds) {
-      if (candidates.some(c => c.worktreeId === worktreeId)) continue
-      if (checkCandidate(worktreeId))
-        candidates.push({ worktreeId, type: 'linear-issue' })
+    const queuedWorktreeIds = new Set<string>()
+    for (const { ids, type } of sources) {
+      for (const worktreeId of ids) {
+        if (queuedWorktreeIds.has(worktreeId) || !checkCandidate(worktreeId)) {
+          continue
+        }
+        queuedWorktreeIds.add(worktreeId)
+        candidates.push({ worktreeId, type })
+      }
     }
 
     // Clear any pending retry timer
@@ -159,25 +145,21 @@ export function useBackgroundInvestigation(): void {
 
       // Consume the flag immediately so we don't re-process
       const uiStore = useUIStore.getState()
-      if (type === 'issue') {
-        uiStore.consumeAutoInvestigate(worktreeId)
-      } else if (type === 'pr') {
-        uiStore.consumeAutoInvestigatePR(worktreeId)
-      } else if (type === 'security-alert') {
-        uiStore.consumeAutoInvestigateSecurityAlert(worktreeId)
-      } else if (type === 'linear-issue') {
-        uiStore.consumeAutoInvestigateLinearIssue(worktreeId)
-      } else {
-        uiStore.consumeAutoInvestigateAdvisory(worktreeId)
-      }
+      const consumeByType = {
+        issue: uiStore.consumeAutoInvestigate,
+        pr: uiStore.consumeAutoInvestigatePR,
+        'security-alert': uiStore.consumeAutoInvestigateSecurityAlert,
+        advisory: uiStore.consumeAutoInvestigateAdvisory,
+        'linear-issue': uiStore.consumeAutoInvestigateLinearIssue,
+      } satisfies Record<InvestigationType, (worktreeId: string) => void>
+      consumeByType[type](worktreeId)
 
       processBackgroundInvestigation(
         worktreeId,
         type,
         preferencesRef.current,
         null,
-        queryClient,
-        sendMessageRef.current
+        queryClient
       )
         .catch(err => {
           logger.error('Background investigation failed', { worktreeId, err })
@@ -303,81 +285,70 @@ async function buildPrompt(
     .replace(/\{advisoryRefs\}/g, refs)
 }
 
-/**
- * Resolve model/provider keys for the given investigation type.
- */
-function resolveModelProviderKeys(type: InvestigationType) {
-  switch (type) {
-    case 'issue':
-      return {
-        modelKey: 'investigate_issue_model' as const,
-        providerKey: 'investigate_issue_provider' as const,
-      }
-    case 'pr':
-      return {
-        modelKey: 'investigate_pr_model' as const,
-        providerKey: 'investigate_pr_provider' as const,
-      }
-    case 'security-alert':
-      return {
-        modelKey: 'investigate_security_alert_model' as const,
-        providerKey: 'investigate_security_alert_provider' as const,
-      }
-    case 'advisory':
-      return {
-        modelKey: 'investigate_advisory_model' as const,
-        providerKey: 'investigate_advisory_provider' as const,
-      }
-    case 'linear-issue':
-      return {
-        modelKey: 'investigate_linear_issue_model' as const,
-        providerKey: 'investigate_linear_issue_provider' as const,
-      }
+const investigationConfig = {
+  issue: {
+    modelKey: 'investigate_issue_model',
+    providerKey: 'investigate_issue_provider',
+    effortKey: 'investigate_issue_effort',
+    modeKey: 'investigate_issue_mode',
+  },
+  pr: {
+    modelKey: 'investigate_pr_model',
+    providerKey: 'investigate_pr_provider',
+    effortKey: 'investigate_pr_effort',
+    modeKey: 'investigate_pr_mode',
+  },
+  'security-alert': {
+    modelKey: 'investigate_security_alert_model',
+    providerKey: 'investigate_security_alert_provider',
+    effortKey: 'investigate_security_alert_effort',
+    modeKey: 'investigate_security_alert_mode',
+  },
+  advisory: {
+    modelKey: 'investigate_advisory_model',
+    providerKey: 'investigate_advisory_provider',
+    effortKey: 'investigate_advisory_effort',
+    modeKey: 'investigate_advisory_mode',
+  },
+  'linear-issue': {
+    modelKey: 'investigate_linear_issue_model',
+    providerKey: 'investigate_linear_issue_provider',
+    effortKey: 'investigate_linear_issue_effort',
+    modeKey: 'investigate_linear_issue_mode',
+  },
+} as const satisfies Record<
+  InvestigationType,
+  {
+    modelKey: keyof NonNullable<
+      ReturnType<typeof usePreferences>['data']
+    >['magic_prompt_models']
+    providerKey: keyof NonNullable<
+      ReturnType<typeof usePreferences>['data']
+    >['magic_prompt_providers']
+    effortKey: keyof NonNullable<
+      ReturnType<typeof usePreferences>['data']
+    >['magic_prompt_efforts']
+    modeKey: keyof NonNullable<
+      ReturnType<typeof usePreferences>['data']
+    >['magic_prompt_modes']
   }
-}
+>
 
 /**
- * Process a single background investigation: fetch session, build prompt, send directly.
- *
- * Sends via sendMessage.mutateAsync() instead of the message queue to avoid a race
- * condition where useQueueProcessor calls persistDequeue before persistEnqueue
- * completes on the backend, causing the message to be lost.
+ * Process a single background investigation: build prompt, then ask the backend
+ * to reuse the same active/first session selection and send flow as Jean MCP.
  */
 async function processBackgroundInvestigation(
   worktreeId: string,
   type: InvestigationType,
   preferences: ReturnType<typeof usePreferences>['data'],
   cliVersion: string | null,
-  queryClient: ReturnType<typeof useQueryClient>,
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  sendMessage: { mutateAsync: (args: any) => Promise<any> }
+  queryClient: ReturnType<typeof useQueryClient>
 ): Promise<void> {
   const worktreePath = useChatStore.getState().worktreePaths[worktreeId]
   if (!worktreePath) return
 
   logger.info('Starting background investigation', { worktreeId, type })
-
-  // Fetch sessions — auto-creates "Session 1" if none exist
-  const sessions = await invoke<WorktreeSessions>('get_sessions', {
-    worktreeId,
-    worktreePath,
-    includeMessageCounts: false,
-  })
-
-  const sessionId = sessions.active_session_id ?? sessions.sessions[0]?.id
-  if (!sessionId) {
-    logger.error('Background investigation: no session found', { worktreeId })
-    return
-  }
-
-  // Register session-worktree mapping so streaming events can find the worktree
-  const { setActiveSession } = useChatStore.getState()
-  setActiveSession(worktreeId, sessionId)
-
-  // Invalidate sessions query so ProjectCanvasView picks up the session
-  queryClient.invalidateQueries({
-    queryKey: chatQueryKeys.sessions(worktreeId),
-  })
 
   // Resolve projectId for Linear issue investigations
   const cachedWorktree = queryClient.getQueryData<Worktree>([
@@ -391,7 +362,8 @@ async function processBackgroundInvestigation(
   const prompt = await buildPrompt(worktreeId, type, preferences, projectId)
 
   // Resolve model, provider, backend
-  const { modelKey, providerKey } = resolveModelProviderKeys(type)
+  const { modelKey, providerKey, effortKey, modeKey } =
+    investigationConfig[type]
 
   const selectedModel =
     preferences?.magic_prompt_models?.[modelKey] ??
@@ -413,30 +385,44 @@ async function processBackgroundInvestigation(
     customProfileName = profile?.name
   }
 
-  // Set session config on backend
-  await Promise.all([
-    invoke('set_session_backend', {
-      worktreeId,
-      worktreePath,
-      sessionId,
-      backend,
-    }),
-    invoke('set_session_model', {
-      worktreeId,
-      worktreePath,
-      sessionId,
-      model: selectedModel,
-    }),
-    invoke('set_session_provider', {
-      worktreeId,
-      worktreePath,
-      sessionId,
-      provider,
-    }),
-  ])
+  // Determine adaptive thinking
+  const isCustomProvider = Boolean(provider && provider !== '__anthropic__')
+  const useAdaptive =
+    !isCustomProvider && supportsAdaptiveThinking(selectedModel, cliVersion)
+  const effortLevel =
+    preferences?.magic_prompt_efforts?.[effortKey] ??
+    (useAdaptive ? 'high' : undefined)
+  const executionMode =
+    preferences?.magic_prompt_modes?.[modeKey] ??
+    DEFAULT_MAGIC_PROMPT_MODES[modeKey]
 
-  // Set Zustand state for the session
+  const result = await invoke<{
+    sessionId: string
+    worktreeId: string
+    status: string
+  }>('start_background_investigation', {
+    worktreeId,
+    worktreePath,
+    message: prompt,
+    model: selectedModel,
+    backend,
+    provider,
+    effortLevel,
+    customProfileName,
+    parallelExecutionPrompt: preferences?.parallel_execution_prompt_enabled
+      ? (preferences.magic_prompts?.parallel_execution ??
+        DEFAULT_PARALLEL_EXECUTION_PROMPT)
+      : undefined,
+    chromeEnabled: preferences?.chrome_enabled ?? false,
+    aiLanguage: preferences?.ai_language,
+    executionMode,
+  })
+
+  const sessionId = result.sessionId
+
+  // Register session-worktree mapping so streaming events can find the worktree
   const {
+    setActiveSession,
     setSelectedModel,
     setSelectedProvider,
     setSelectedBackend,
@@ -449,48 +435,26 @@ async function processBackgroundInvestigation(
     setSessionReviewing,
   } = useChatStore.getState()
 
+  setActiveSession(worktreeId, sessionId)
+
+  // Invalidate sessions query so ProjectCanvasView picks up the session
+  queryClient.invalidateQueries({
+    queryKey: chatQueryKeys.sessions(worktreeId),
+  })
+
+  // Mirror local pre-send state while backend owns session selection/config + send.
   setSelectedModel(sessionId, selectedModel)
   setSelectedProvider(sessionId, provider)
   setSelectedBackend(sessionId, backend)
-  setExecutingMode(sessionId, 'plan')
-
-  // Determine adaptive thinking
-  const isCustomProvider = Boolean(provider && provider !== '__anthropic__')
-  const useAdaptive =
-    !isCustomProvider && supportsAdaptiveThinking(selectedModel, cliVersion)
-
-  // Pre-send state setup (mirrors useQueueProcessor)
+  setExecutingMode(sessionId, executionMode)
   clearStreamingContent(sessionId)
   clearToolCalls(sessionId)
   clearStreamingContentBlocks(sessionId)
   setLastSentMessage(sessionId, prompt)
   setError(sessionId, null)
   setSessionReviewing(sessionId, false)
-  // Note: addSendingSession is handled by sendMessage's onMutate
 
-  // Send the message directly — no queue involved.
-  // This avoids the race condition where useQueueProcessor's persistDequeue
-  // runs before persistEnqueue completes, causing the message to be lost.
-  await sendMessage.mutateAsync({
-    sessionId,
-    worktreeId,
-    worktreePath,
-    message: prompt,
-    model: selectedModel,
-    executionMode: 'plan',
-    thinkingLevel: 'think',
-    effortLevel: useAdaptive ? 'high' : undefined,
-    customProfileName,
-    parallelExecutionPrompt: preferences?.parallel_execution_prompt_enabled
-      ? (preferences.magic_prompts?.parallel_execution ??
-        DEFAULT_PARALLEL_EXECUTION_PROMPT)
-      : undefined,
-    chromeEnabled: preferences?.chrome_enabled ?? false,
-    aiLanguage: preferences?.ai_language,
-    backend,
-  })
-
-  logger.info('Background investigation sent', {
+  logger.info('Background investigation started', {
     worktreeId,
     sessionId,
     type,

@@ -6,7 +6,7 @@
  * interactive terminal access.
  */
 
-import { useCallback, useEffect, useRef, useMemo, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { toast } from 'sonner'
 import { invoke, listen } from '@/lib/transport'
 import { useQueryClient } from '@tanstack/react-query'
@@ -16,6 +16,10 @@ import { ghCliQueryKeys } from '@/services/gh-cli'
 import { codexCliQueryKeys } from '@/services/codex-cli'
 import { opencodeCliQueryKeys } from '@/services/opencode-cli'
 import { cursorCliQueryKeys } from '@/services/cursor-cli'
+import { piCliQueryKeys } from '@/services/pi-cli'
+import { commandcodeCliQueryKeys } from '@/services/commandcode-cli'
+import { grokCliQueryKeys } from '@/services/grok-cli'
+import { coderabbitCliQueryKeys } from '@/services/coderabbit-cli'
 import { githubQueryKeys } from '@/services/github'
 import {
   Dialog,
@@ -27,8 +31,10 @@ import { Button } from '@/components/ui/button'
 import { useUIStore } from '@/store/ui-store'
 import { useShallow } from 'zustand/react/shallow'
 import { useTerminal } from '@/hooks/useTerminal'
+import { useTerminalBackgroundColor } from '@/hooks/useTerminalThemeSync'
 import { disposeTerminal, setOnStopped } from '@/lib/terminal-instances'
 import { BackendLabel } from '@/components/ui/backend-label'
+import { generateId } from '@/lib/uuid'
 
 export function CliLoginModal() {
   const [retryKey, setRetryKey] = useState(0)
@@ -61,7 +67,17 @@ export function CliLoginModal() {
 }
 
 interface CliLoginModalContentProps {
-  cliType: 'claude' | 'gh' | 'codex' | 'opencode' | 'cursor' | null
+  cliType:
+    | 'claude'
+    | 'gh'
+    | 'codex'
+    | 'opencode'
+    | 'cursor'
+    | 'pi'
+    | 'commandcode'
+    | 'grok'
+    | 'coderabbit'
+    | null
   command: string
   commandArgs: string[] | null
   action: 'login' | 'update' | 'install'
@@ -90,15 +106,26 @@ function CliLoginModalContent({
       ? 'Claude CLI'
       : cliType === 'codex'
         ? 'Codex CLI'
-        : cliType === 'opencode'
-          ? 'OpenCode CLI'
-          : cliType === 'cursor'
-            ? 'Cursor CLI'
-            : 'GitHub CLI'
+        : cliType === 'coderabbit'
+          ? 'CodeRabbit CLI'
+          : cliType === 'opencode'
+            ? 'OpenCode CLI'
+            : cliType === 'cursor'
+              ? 'Cursor CLI'
+              : cliType === 'pi'
+                ? 'PI CLI'
+                : cliType === 'commandcode'
+                  ? 'Command Code CLI'
+                  : cliType === 'grok'
+                    ? 'Grok CLI'
+                    : 'GitHub CLI'
   const cliTitle =
-    cliType === 'cursor' ? (
+    cliType === 'cursor' ||
+    cliType === 'pi' ||
+    cliType === 'commandcode' ||
+    cliType === 'grok' ? (
       <span className="inline-flex items-center gap-2">
-        <BackendLabel backend="cursor" />
+        <BackendLabel backend={cliType} />
         <span>CLI</span>
       </span>
     ) : (
@@ -106,11 +133,7 @@ function CliLoginModalContent({
     )
 
   // Generate unique terminal ID for this login session
-  const terminalId = useMemo(() => {
-    // eslint-disable-next-line react-hooks/purity
-    const id = `cli-login-${Date.now()}`
-    return id
-  }, [])
+  const [terminalId] = useState(() => `cli-login-${generateId()}`)
 
   // Buffer last N lines of terminal output for debug logging on error
   const outputBufferRef = useRef<string[]>([])
@@ -142,6 +165,8 @@ function CliLoginModalContent({
     command,
     commandArgs,
   })
+
+  const terminalBg = useTerminalBackgroundColor()
 
   // Use callback ref to detect when container is mounted (Dialog uses portal)
   const containerCallbackRef = useCallback(
@@ -224,6 +249,18 @@ function CliLoginModalContent({
           queryClient.invalidateQueries({ queryKey: opencodeCliQueryKeys.all })
         } else if (cliType === 'cursor') {
           queryClient.invalidateQueries({ queryKey: cursorCliQueryKeys.all })
+        } else if (cliType === 'pi') {
+          queryClient.invalidateQueries({ queryKey: piCliQueryKeys.all })
+        } else if (cliType === 'commandcode') {
+          queryClient.invalidateQueries({
+            queryKey: commandcodeCliQueryKeys.all,
+          })
+        } else if (cliType === 'grok') {
+          queryClient.invalidateQueries({ queryKey: grokCliQueryKeys.all })
+        } else if (cliType === 'coderabbit') {
+          queryClient.invalidateQueries({
+            queryKey: coderabbitCliQueryKeys.all,
+          })
         }
 
         // Dismiss any lingering update toast for this CLI type
@@ -271,7 +308,10 @@ function CliLoginModalContent({
           </DialogTitle>
         </DialogHeader>
 
-        <div className="flex-1 min-h-0 w-full overflow-hidden rounded-md border border-border bg-background p-3 sm:p-4">
+        <div
+          className="flex-1 min-h-0 w-full overflow-hidden rounded-md border border-border p-3 sm:p-4"
+          style={{ backgroundColor: terminalBg }}
+        >
           <div ref={containerCallbackRef} className="h-full w-full" />
         </div>
 

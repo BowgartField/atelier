@@ -50,6 +50,7 @@ import {
 import { GhAuthError } from '@/components/shared/GhAuthError'
 import { IssuePreviewModal } from '@/components/worktree/IssuePreviewModal'
 import { useGhLogin } from '@/hooks/useGhLogin'
+import { useGhCliAuth } from '@/services/gh-cli'
 import { invoke } from '@/lib/transport'
 import type {
   GitHubIssue,
@@ -75,6 +76,11 @@ interface PreviewState {
   type: 'issue' | 'pr' | 'security' | 'advisory'
   number: number
   ghsaId?: string
+}
+
+function getDashboardErrorMessage(error: unknown): string {
+  if (!error) return 'Failed to load GitHub dashboard data'
+  return error instanceof Error ? error.message : String(error)
 }
 
 // =============================================================================
@@ -500,7 +506,7 @@ function ProjectSection({
 }) {
   return (
     <div>
-      <div className="sticky top-0 z-10 flex items-center gap-2 px-3 py-1.5 bg-muted/80 backdrop-blur-sm border-b border-border">
+      <div className="sticky top-0 z-10 flex items-center gap-2 px-3 py-1.5 bg-muted/80 border-b border-border">
         <span className="text-xs font-semibold text-muted-foreground uppercase tracking-wide">
           {project.name}
         </span>
@@ -874,7 +880,29 @@ export function GitHubDashboardModal() {
           ? securityResults
           : advisoryResults
 
-  const authError = activeResults.find(r => isGhAuthError(r.error))
+  const commandAuthError = activeResults.find(r => isGhAuthError(r.error))
+  const {
+    data: ghAuthStatus,
+    isLoading: isLoadingGhAuth,
+    isFetching: isFetchingGhAuth,
+  } = useGhCliAuth({
+    enabled: githubDashboardOpen && !!commandAuthError,
+    staleTime: 0,
+    refetchOnMount: 'always',
+  })
+  const isCheckingGhAuth = isLoadingGhAuth || isFetchingGhAuth
+  const authError =
+    commandAuthError &&
+    !isCheckingGhAuth &&
+    ghAuthStatus?.authenticated === false
+      ? commandAuthError
+      : undefined
+  const commandError =
+    commandAuthError &&
+    !isCheckingGhAuth &&
+    ghAuthStatus?.authenticated === true
+      ? commandAuthError.error
+      : undefined
 
   const filteredProjects = useMemo(
     () =>
@@ -1017,6 +1045,17 @@ export function GitHubDashboardModal() {
         <ScrollArea className="flex-1 min-h-0">
           {authError ? (
             <GhAuthError onLogin={triggerLogin} isGhInstalled={isGhInstalled} />
+          ) : commandAuthError && isCheckingGhAuth ? (
+            <div className="flex items-center justify-center py-16">
+              <Loader2 className="h-5 w-5 animate-spin text-muted-foreground" />
+            </div>
+          ) : commandError ? (
+            <div className="flex flex-col items-center justify-center py-16 px-4 text-center gap-2">
+              <AlertCircle className="h-5 w-5 text-destructive" />
+              <p className="text-sm text-muted-foreground">
+                {getDashboardErrorMessage(commandError)}
+              </p>
+            </div>
           ) : isLoading ? (
             <div className="flex items-center justify-center py-16">
               <Loader2 className="h-5 w-5 animate-spin text-muted-foreground" />

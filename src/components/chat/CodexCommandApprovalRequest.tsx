@@ -16,6 +16,17 @@ export function CodexCommandApprovalRequestCard({
   onDecline,
   onCancel,
 }: CodexCommandApprovalRequestProps) {
+  const availableDecisionStrings = new Set(
+    request.available_decisions?.filter(
+      (decision): decision is string => typeof decision === 'string'
+    ) ?? []
+  )
+  const isDecisionAvailable = (
+    decision: 'accept' | 'acceptForSession' | 'decline' | 'cancel'
+  ) =>
+    !request.available_decisions?.length ||
+    availableDecisionStrings.has(decision)
+
   return (
     <div className="my-3 rounded border border-muted bg-muted/30 p-4 font-mono text-sm">
       <div className="mb-2 font-semibold">Codex wants to run a command</div>
@@ -59,19 +70,35 @@ export function CodexCommandApprovalRequestCard({
             </ul>
           </div>
         ) : null}
+        {request.additional_permissions ? (
+          <div>
+            <div className="font-medium text-foreground">
+              Additional permissions
+            </div>
+            <pre className="overflow-x-auto rounded bg-background/60 p-2 text-[11px] whitespace-pre-wrap break-words">
+              {JSON.stringify(request.additional_permissions, null, 2)}
+            </pre>
+          </div>
+        ) : null}
       </div>
 
       <div className="mt-4 flex flex-wrap gap-2">
-        <Button size="sm" onClick={onApprove}>
-          Approve
-        </Button>
-        <Button size="sm" variant="destructive" onClick={onApproveYolo}>
-          Approve (yolo)
-        </Button>
-        <Button size="sm" variant="secondary" onClick={onDecline}>
-          Decline
-        </Button>
-        {onCancel ? (
+        {isDecisionAvailable('accept') ? (
+          <Button size="sm" onClick={onApprove}>
+            Approve
+          </Button>
+        ) : null}
+        {isDecisionAvailable('acceptForSession') ? (
+          <Button size="sm" variant="destructive" onClick={onApproveYolo}>
+            Approve (yolo)
+          </Button>
+        ) : null}
+        {isDecisionAvailable('decline') ? (
+          <Button size="sm" variant="secondary" onClick={onDecline}>
+            Decline
+          </Button>
+        ) : null}
+        {onCancel && isDecisionAvailable('cancel') ? (
           <Button size="sm" variant="ghost" onClick={onCancel}>
             Cancel turn
           </Button>

@@ -332,7 +332,8 @@ export function ReleaseNotesDialog() {
               {!isLoadingReleases && !releasesError && releases.length > 0 && (
                 <div className="py-1">
                   <div className="px-4 py-1 text-xs text-muted-foreground">
-                    Select a release to compare changes since:
+                    Select a release to compare changes since. Jean will inspect
+                    matched merged PRs and closing issue references.
                   </div>
                   {releases.map((release, index) => (
                     <ReleaseItem
@@ -391,12 +392,13 @@ export function ReleaseNotesDialog() {
               />
             </div>
 
-            <div className="flex items-center gap-2">
+            <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
               <Button
                 variant="outline"
                 size="sm"
                 onClick={handleRegenerate}
                 disabled={isGenerating}
+                className="w-full sm:w-auto"
               >
                 <RefreshCw
                   className={cn(
@@ -406,18 +408,23 @@ export function ReleaseNotesDialog() {
                 />
                 Regenerate
               </Button>
-              <div className="flex-1" />
+              <div className="hidden sm:block sm:flex-1" />
               {repoUrl && (
                 <Button
                   variant="outline"
                   size="sm"
                   onClick={handleCreateRelease}
+                  className="w-full sm:w-auto"
                 >
                   <ExternalLink className="h-3.5 w-3.5 mr-1.5" />
                   Create on GitHub
                 </Button>
               )}
-              <Button size="sm" onClick={handleCopy}>
+              <Button
+                size="sm"
+                onClick={handleCopy}
+                className="w-full sm:w-auto"
+              >
                 {copied ? (
                   <Check className="h-3.5 w-3.5 mr-1.5" />
                 ) : (

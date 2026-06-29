@@ -8,6 +8,10 @@ use tauri::AppHandle;
 use crate::gh_cli::config::resolve_gh_binary;
 use crate::platform::silent_command;
 
+fn gh_command(gh: &Path, project_path: &str) -> std::process::Command {
+    crate::platform::resolved_cli_command(gh, Some(Path::new(project_path)))
+}
+
 pub type PrIssueRefsMap = BTreeMap<u32, BTreeMap<String, BTreeSet<u32>>>;
 
 static PR_NUMBER_IN_SUBJECT_RE: Lazy<Regex> =
@@ -195,7 +199,7 @@ fn load_pull_requests(
     tag_date: &str,
 ) -> Result<Vec<GitHubPullRequestCandidate>, String> {
     let search = format!("merged:>={tag_date}");
-    let output = silent_command(gh)
+    let output = gh_command(gh, project_path)
         .args([
             "pr",
             "list",
@@ -208,7 +212,6 @@ fn load_pull_requests(
             "--json",
             "number,title,body,closingIssuesReferences,mergeCommit",
         ])
-        .current_dir(project_path)
         .output()
         .map_err(|e| format!("Failed to run gh pr list: {e}"))?;
 
@@ -230,9 +233,8 @@ fn load_pull_request_commits(
     project_path: &str,
     pr_number: u32,
 ) -> Result<Vec<GitHubPullRequestCommit>, String> {
-    let output = silent_command(gh)
+    let output = gh_command(gh, project_path)
         .args(["pr", "view", &pr_number.to_string(), "--json", "commits"])
-        .current_dir(project_path)
         .output()
         .map_err(|e| format!("Failed to run gh pr view for #{pr_number}: {e}"))?;
 
@@ -276,7 +278,7 @@ fn load_pull_request_detail(
         commits: Vec<GitHubPullRequestCommit>,
     }
 
-    let output = silent_command(gh)
+    let output = gh_command(gh, project_path)
         .args([
             "pr",
             "view",
@@ -284,7 +286,6 @@ fn load_pull_request_detail(
             "--json",
             "number,title,body,closingIssuesReferences,commits",
         ])
-        .current_dir(project_path)
         .output()
         .map_err(|e| format!("Failed to run gh pr view for #{pr_number}: {e}"))?;
 
@@ -375,6 +376,7 @@ fn collect_issue_refs(
 ) -> Vec<IssueRef> {
     let mut issue_keywords = BTreeMap::new();
 
+    merge_issue_keywords(&mut issue_keywords, parse_issue_keywords(&pr.title));
     merge_issue_keywords(&mut issue_keywords, parse_issue_keywords(&pr.body));
 
     for commit in pr_commits {
@@ -528,6 +530,82 @@ pub fn format_issue_groups(grouped: &BTreeMap<String, BTreeSet<u32>>) -> String 
         .join(", ")
 }
 
+pub fn build_pr_prompt_context_from_revision_range(
+    app: &AppHandle,
+    project_path: &str,
+    revision_range: &str,
+) -> Result<ReleaseNotesPromptContext, String> {
+    let gh = resolve_gh_binary(app);
+    let commits = load_git_commits_for_range(project_path, revision_range)?;
+    build_pr_prompt_context_from_commits_with_github(&gh, project_path, &commits)
+}
+
+fn build_pr_prompt_context_from_commits_with_github(
+    gh: &Path,
+    project_path: &str,
+    commits: &[GitCommitRecord],
+) -> Result<ReleaseNotesPromptContext, String> {
+    let pr_numbers = collect_pr_numbers_from_subjects(commits);
+    let mut prs = Vec::new();
+    let mut pr_commits_by_number = BTreeMap::new();
+
+    for pr_number in pr_numbers {
+        let (pr, pr_commits) = load_pull_request_detail(gh, project_path, pr_number)?;
+        prs.push(pr);
+        pr_commits_by_number.insert(pr_number, pr_commits);
+    }
+
+    Ok(build_pr_prompt_context_from_commit_records(
+        commits,
+        prs,
+        pr_commits_by_number,
+    ))
+}
+
+fn build_pr_prompt_context_from_commit_records(
+    commits: &[GitCommitRecord],
+    prs: Vec<GitHubPullRequestCandidate>,
+    pr_commits_by_number: BTreeMap<u32, Vec<GitHubPullRequestCommit>>,
+) -> ReleaseNotesPromptContext {
+    let sha_set: HashSet<&str> = commits
+        .iter()
+        .filter_map(|commit| (!commit.oid.is_empty()).then_some(commit.oid.as_str()))
+        .collect();
+    let subjects_with_pr_numbers = collect_pr_numbers_from_subjects(commits);
+    let mut matched_prs = Vec::new();
+
+    for pr in prs {
+        let pr_commits = pr_commits_by_number
+            .get(&pr.number)
+            .cloned()
+            .unwrap_or_default();
+        let matched_commits = collect_matched_commits(&pr_commits, commits, &sha_set);
+        let subject_match = subjects_with_pr_numbers.contains(&pr.number);
+        let merge_commit_match = pr
+            .merge_commit
+            .as_ref()
+            .map(|merge_commit| sha_set.contains(merge_commit.oid.as_str()))
+            .unwrap_or(false);
+
+        if !subject_match && !merge_commit_match && matched_commits.is_empty() {
+            continue;
+        }
+
+        let issue_refs = collect_issue_refs(&pr, &pr_commits, &matched_commits);
+        matched_prs.push(MatchedPullRequest {
+            number: pr.number,
+            title: pr.title,
+            matched_commits,
+            issue_refs,
+        });
+    }
+
+    ReleaseNotesPromptContext {
+        pull_requests: format_pull_requests_prompt(&matched_prs),
+        pr_issue_refs: build_pr_issue_refs_map(&matched_prs),
+    }
+}
+
 pub fn build_pr_issue_refs_from_commit_range(
     app: &AppHandle,
     project_path: &str,
@@ -678,6 +756,88 @@ mod tests {
         }];
         let subject_pr_numbers = collect_pr_numbers_from_subjects(&commits);
         assert!(subject_pr_numbers.contains(&42));
+    }
+
+    #[test]
+    fn collects_issue_refs_from_pr_title_body_and_commits() {
+        let refs = collect_issue_refs(
+            &GitHubPullRequestCandidate {
+                number: 42,
+                title: "Add thing, fixes #11".to_string(),
+                body: "Closes #12".to_string(),
+                closing_issues_references: vec![],
+                merge_commit: None,
+            },
+            &[GitHubPullRequestCommit {
+                oid: "abc123".to_string(),
+                message_headline: "implementation".to_string(),
+                message_body: "Resolved #13".to_string(),
+            }],
+            &[GitCommitRecord {
+                oid: "abc123".to_string(),
+                subject: "squash subject".to_string(),
+                body: "FIXED #14".to_string(),
+            }],
+        );
+
+        assert_eq!(
+            refs,
+            vec![
+                IssueRef {
+                    number: 11,
+                    keyword: "fixes".to_string(),
+                },
+                IssueRef {
+                    number: 12,
+                    keyword: "closes".to_string(),
+                },
+                IssueRef {
+                    number: 13,
+                    keyword: "resolves".to_string(),
+                },
+                IssueRef {
+                    number: 14,
+                    keyword: "fixes".to_string(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn builds_prompt_context_from_commit_records_with_pr_metadata_issue_refs() {
+        let commits = vec![GitCommitRecord {
+            oid: "abc123".to_string(),
+            subject: "feat: add thing (#42)".to_string(),
+            body: "Fixes #99".to_string(),
+        }];
+        let prs = vec![GitHubPullRequestCandidate {
+            number: 42,
+            title: "Add thing".to_string(),
+            body: "Closes #12".to_string(),
+            closing_issues_references: vec![],
+            merge_commit: None,
+        }];
+        let pr_commits = vec![(
+            42,
+            vec![GitHubPullRequestCommit {
+                oid: "abc123".to_string(),
+                message_headline: "implementation".to_string(),
+                message_body: "Resolved #13".to_string(),
+            }],
+        )]
+        .into_iter()
+        .collect::<BTreeMap<_, _>>();
+
+        let context = build_pr_prompt_context_from_commit_records(&commits, prs, pr_commits);
+
+        assert!(context.pull_requests.contains("- PR #42: Add thing"));
+        assert!(context
+            .pull_requests
+            .contains("Related issues: closes #12, fixes #99, resolves #13"));
+        assert_eq!(
+            context.pr_issue_refs.get(&42).map(format_issue_groups),
+            Some("closes #12, fixes #99, resolves #13".to_string())
+        );
     }
 
     #[test]

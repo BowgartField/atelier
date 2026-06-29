@@ -5,7 +5,6 @@
 //! - User scope:    ~/.cursor/mcp.json              → `mcpServers`
 
 use crate::chat::{McpHealthStatus, McpServerInfo};
-use crate::platform::silent_command;
 use once_cell::sync::Lazy;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -85,7 +84,7 @@ pub fn check_mcp_health(
         return Err("Cursor CLI not installed".to_string());
     }
 
-    let mut cmd = silent_command(&cli_path);
+    let mut cmd = crate::platform::cli_command(&cli_path.to_string_lossy(), None);
     cmd.args(["mcp", "list"])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -95,11 +94,11 @@ pub fn check_mcp_health(
 
     let output = cmd
         .output()
-        .map_err(|e| format!("Failed to run cursor-agent mcp list: {e}"))?;
+        .map_err(|e| format!("Failed to run Cursor MCP list: {e}"))?;
 
     if !output.status.success() {
         let stderr = strip_ansi(&String::from_utf8_lossy(&output.stderr));
-        return Err(format!("cursor-agent mcp list failed: {}", stderr.trim()));
+        return Err(format!("Cursor MCP list failed: {}", stderr.trim()));
     }
 
     let combined = format!(
@@ -197,13 +196,12 @@ fn run_mcp_approval_command(
         return Err("Cursor CLI not installed".to_string());
     }
 
-    let output = silent_command(&cli_path)
+    let output = crate::platform::cli_command(&cli_path.to_string_lossy(), Some(worktree_path))
         .args(["mcp", verb, identifier])
-        .current_dir(worktree_path)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()
-        .map_err(|e| format!("Failed to run cursor-agent mcp {verb} {identifier}: {e}"))?;
+        .map_err(|e| format!("Failed to run Cursor MCP {verb} {identifier}: {e}"))?;
 
     if output.status.success() {
         return Ok(());
@@ -211,7 +209,7 @@ fn run_mcp_approval_command(
 
     let stderr = strip_ansi(&String::from_utf8_lossy(&output.stderr));
     Err(format!(
-        "cursor-agent mcp {verb} {identifier} failed: {}",
+        "Cursor MCP {verb} {identifier} failed: {}",
         stderr.trim()
     ))
 }

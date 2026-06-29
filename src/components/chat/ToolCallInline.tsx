@@ -1,4 +1,4 @@
-import { useState, useMemo, useEffect } from 'react'
+import { useState, useEffect } from 'react'
 import { usePreferences } from '@/services/preferences'
 import { useChatStore } from '@/store/chat-store'
 import {
@@ -29,7 +29,6 @@ import {
   Code,
   Activity,
 } from 'lucide-react'
-import { diffLines } from 'diff'
 import type { ToolCall } from '@/types/chat'
 import type { StackableItem } from './tool-call-utils'
 import { Markdown } from '@/components/ui/markdown'
@@ -40,6 +39,7 @@ import {
   CollapsibleContent,
   CollapsibleTrigger,
 } from '@/components/ui/collapsible'
+import { InlineFileDiff } from './InlineFileDiff'
 
 function shouldRenderRawOutput(toolCall: ToolCall): boolean {
   return (
@@ -48,6 +48,18 @@ function shouldRenderRawOutput(toolCall: ToolCall): boolean {
     toolCall.name !== 'Monitor'
   )
 }
+
+// Single source of truth for tool call row layout. Bump min-h-9/px-2.5 here, all rows update.
+// min-h ensures consistent baseline regardless of inline-content height (pill vs no-pill).
+export const TOOL_CALL_ROW_CLASS =
+  'flex min-h-9 w-full items-center gap-1.5 px-2.5 py-1.5 text-xs text-muted-foreground hover:bg-muted/50 select-none min-w-0'
+
+export const TOOL_CALL_SUB_ROW_CLASS =
+  'flex min-h-7 w-full items-center gap-1.5 px-2 py-1 text-xs text-muted-foreground/80 hover:bg-muted/30 select-none min-w-0'
+
+// Detail pill — sits AFTER label, snug to content (no flex-1 stretch).
+export const TOOL_CALL_DETAIL_PILL_CLASS =
+  'min-w-0 max-w-[55%] sm:max-w-full truncate rounded px-1 text-[0.6875rem] font-sans leading-none'
 
 interface ToolCallInlineProps {
   toolCall: ToolCall
@@ -97,9 +109,11 @@ export function ToolCallInline({
           isOpen && 'bg-muted/50'
         )}
       >
-        <CollapsibleTrigger className="flex w-full items-center gap-1.5 px-2.5 py-1.5 text-xs text-muted-foreground hover:bg-muted/50 select-none min-w-0">
+        <CollapsibleTrigger className={TOOL_CALL_ROW_CLASS}>
           {icon}
-          <span className="font-medium">{label}</span>
+          <span className="font-medium shrink-0 flex-none whitespace-nowrap">
+            {label}
+          </span>
           {detail && filePath && onFileClick ? (
             <code
               role="button"
@@ -109,15 +123,16 @@ export function ToolCallInline({
                 e.key === 'Enter' &&
                 handleFileClick(e as unknown as React.MouseEvent)
               }
-              className="inline-flex items-center gap-1 truncate rounded bg-muted/50 px-1.5 py-0.5 text-xs hover:bg-primary/20 hover:text-primary transition-colors cursor-pointer"
+              className={cn(
+                TOOL_CALL_DETAIL_PILL_CLASS,
+                'inline-flex items-center gap-1 hover:bg-primary/20 hover:text-primary transition-colors cursor-pointer'
+              )}
             >
               <span className="truncate">{detail}</span>
               <ExternalLink className="h-3 w-3 shrink-0 opacity-60" />
             </code>
           ) : detail ? (
-            <code className="truncate rounded bg-muted/50 px-1.5 py-0.5 text-xs">
-              {detail}
-            </code>
+            <code className={TOOL_CALL_DETAIL_PILL_CLASS}>{detail}</code>
           ) : null}
           {isStreaming && isIncomplete ? (
             <Loader2 className="ml-auto h-3 w-3 shrink-0 animate-spin text-muted-foreground/50" />
@@ -201,19 +216,17 @@ export function TaskCallInline({
           isOpen && 'bg-muted/50'
         )}
       >
-        <CollapsibleTrigger className="flex w-full items-center gap-1.5 px-2.5 py-1.5 text-xs text-muted-foreground hover:bg-muted/50 select-none min-w-0">
+        <CollapsibleTrigger className={TOOL_CALL_ROW_CLASS}>
           <Bot className="h-3.5 w-3.5 shrink-0" />
-          <span className="font-medium">
+          <span className="font-medium shrink-0 whitespace-nowrap">
             {subagentType ? `Task (${subagentType})` : 'Task'}
           </span>
           {description && (
-            <code className="truncate rounded bg-muted/50 px-1.5 py-0.5 text-xs">
-              {description}
-            </code>
+            <code className={TOOL_CALL_DETAIL_PILL_CLASS}>{description}</code>
           )}
           {/* Show sub-tool count badge */}
           {subToolCalls.length > 0 && (
-            <span className="ml-auto text-xs text-muted-foreground/60">
+            <span className="ml-auto shrink-0 text-xs text-muted-foreground/60">
               {subToolCalls.length} tool{subToolCalls.length === 1 ? '' : 's'}
             </span>
           )}
@@ -311,7 +324,8 @@ export function StackedGroup({
     if (item.type === 'thinking') {
       thinkingCount++
     } else {
-      toolCounts.set(item.tool.name, (toolCounts.get(item.tool.name) ?? 0) + 1)
+      const name = getToolSummaryName(item.tool.name)
+      toolCounts.set(name, (toolCounts.get(name) ?? 0) + 1)
     }
   }
 
@@ -343,9 +357,11 @@ export function StackedGroup({
           isOpen && 'bg-muted/50'
         )}
       >
-        <CollapsibleTrigger className="flex w-full items-center gap-1.5 px-2.5 py-1.5 text-xs text-muted-foreground hover:bg-muted/50 select-none min-w-0">
+        <CollapsibleTrigger className={TOOL_CALL_ROW_CLASS}>
           <Layers className="h-3.5 w-3.5 shrink-0" />
-          <span className="font-medium">{summary}</span>
+          <span className="font-medium shrink-0 whitespace-nowrap">
+            {summary}
+          </span>
           {isStreaming && isIncomplete ? (
             <Loader2 className="ml-auto h-3 w-3 shrink-0 animate-spin text-muted-foreground/50" />
           ) : (
@@ -402,9 +418,11 @@ function SubThinkingItem({ thinking }: SubThinkingItemProps) {
           isOpen && 'bg-muted/30'
         )}
       >
-        <CollapsibleTrigger className="flex w-full items-center gap-1.5 px-2 py-1 text-xs text-muted-foreground/80 hover:bg-muted/30 select-none">
+        <CollapsibleTrigger className={TOOL_CALL_SUB_ROW_CLASS}>
           <Brain className="h-3 w-3 shrink-0 text-purple-500" />
-          <span className="font-medium">Thinking</span>
+          <span className="font-medium shrink-0 whitespace-nowrap">
+            Thinking
+          </span>
           <ChevronRight
             className={cn(
               'ml-auto h-2.5 w-2.5 shrink-0 transition-transform duration-200',
@@ -415,7 +433,7 @@ function SubThinkingItem({ thinking }: SubThinkingItemProps) {
         <CollapsibleContent>
           <div className="border-t border-border/30 px-2 py-1.5">
             <div className="pl-2 border-l-2 border-purple-500/30 text-[0.625rem] text-muted-foreground/70">
-              <Markdown>{thinking}</Markdown>
+              <Markdown variant="tool-call">{thinking}</Markdown>
             </div>
           </div>
         </CollapsibleContent>
@@ -456,9 +474,11 @@ function SubToolItem({ toolCall, onFileClick }: SubToolItemProps) {
           isOpen && 'bg-muted/30'
         )}
       >
-        <CollapsibleTrigger className="flex w-full items-center gap-1.5 px-2 py-1 text-xs text-muted-foreground/80 hover:bg-muted/30 select-none">
-          <span className="[&>svg]:h-3 [&>svg]:w-3">{icon}</span>
-          <span className="font-medium">{label}</span>
+        <CollapsibleTrigger className={TOOL_CALL_SUB_ROW_CLASS}>
+          <span className="shrink-0 [&>svg]:h-3 [&>svg]:w-3">{icon}</span>
+          <span className="font-medium shrink-0 flex-none whitespace-nowrap">
+            {label}
+          </span>
           {detail && filePath && onFileClick ? (
             <code
               role="button"
@@ -468,13 +488,13 @@ function SubToolItem({ toolCall, onFileClick }: SubToolItemProps) {
                 e.key === 'Enter' &&
                 handleFileClick(e as unknown as React.MouseEvent)
               }
-              className="inline-flex items-center gap-0.5 truncate rounded bg-muted/30 px-1 py-0.5 text-[0.625rem] hover:bg-primary/20 hover:text-primary transition-colors cursor-pointer"
+              className="inline-flex min-w-0 max-w-[55%] sm:max-w-full items-center gap-0.5 truncate rounded px-0.5 text-[0.625rem] font-sans leading-none hover:bg-primary/20 hover:text-primary transition-colors cursor-pointer"
             >
               <span className="truncate">{detail}</span>
               <ExternalLink className="h-2.5 w-2.5 shrink-0 opacity-60" />
             </code>
           ) : detail ? (
-            <code className="truncate rounded bg-muted/30 px-1 py-0.5 text-[0.625rem]">
+            <code className="min-w-0 max-w-[55%] sm:max-w-full truncate rounded px-0.5 text-[0.625rem] font-sans leading-none">
               {detail}
             </code>
           ) : null}
@@ -517,52 +537,6 @@ interface ToolDisplay {
   expandedContent: React.ReactNode
 }
 
-/** Renders a unified diff view with colored +/- lines */
-function DiffView({
-  oldString,
-  newString,
-  filePath,
-  className,
-}: {
-  oldString: string
-  newString: string
-  filePath: string
-  className?: string
-}) {
-  const parts = useMemo(
-    () => diffLines(oldString, newString),
-    [oldString, newString]
-  )
-
-  return (
-    <div className={className}>
-      <div className="text-muted-foreground mb-1.5 font-mono">
-        Path: {filePath}
-      </div>
-      <div className="rounded border border-border/30 overflow-auto max-h-64">
-        {parts.map((part, i) => {
-          const lines = part.value.replace(/\n$/, '').split('\n')
-          return lines.map((line, j) => (
-            <div
-              key={`${i}-${j}`}
-              className={cn(
-                'px-2 font-mono',
-                part.added && 'bg-green-500/15 text-green-400',
-                part.removed && 'bg-red-500/15 text-red-400'
-              )}
-            >
-              <span className="inline-block w-4 select-none opacity-60">
-                {part.added ? '+' : part.removed ? '-' : ' '}
-              </span>
-              {line}
-            </div>
-          ))
-        })}
-      </div>
-    </div>
-  )
-}
-
 /** A single Codex file change entry */
 interface CodexFileChange {
   diff?: string
@@ -596,34 +570,6 @@ function parseCodexFileChanges(input: unknown): CodexFileChange[] {
   return []
 }
 
-/** Renders a pre-computed unified diff patch with colored +/- lines */
-function PatchDiffView({ patch }: { patch: string }) {
-  const lines = patch.split('\n')
-  if (lines.length > 0 && lines[lines.length - 1] === '') {
-    lines.pop()
-  }
-
-  return (
-    <div className="rounded border border-border/30 overflow-auto max-h-64">
-      {lines.map((line, i) => (
-        <div
-          key={i}
-          className={cn(
-            'px-2 font-mono',
-            line.startsWith('@@') && 'text-blue-400 bg-blue-500/10',
-            line.startsWith('+') &&
-              !line.startsWith('@@') &&
-              'bg-green-500/15 text-green-400',
-            line.startsWith('-') && 'bg-red-500/15 text-red-400'
-          )}
-        >
-          {line}
-        </div>
-      ))}
-    </div>
-  )
-}
-
 /** Renders one or more Codex file changes with diffs */
 function FileChangeDiffView({ input }: { input: unknown }) {
   const changes = parseCodexFileChanges(input)
@@ -639,27 +585,14 @@ function FileChangeDiffView({ input }: { input: unknown }) {
           ? getFilename(change.path)
           : `file ${idx + 1}`
         const changeType = change.kind?.type ?? 'update'
-        const typeColor =
-          changeType === 'create'
-            ? 'text-green-500'
-            : changeType === 'delete'
-              ? 'text-red-500'
-              : changeType === 'rename'
-                ? 'text-yellow-500'
-                : 'text-blue-500'
 
         return (
           <div key={change.path ?? idx}>
             <div className="flex items-center gap-1.5 mb-1">
-              <span className={cn('font-mono truncate', typeColor)}>
+              <span className="font-mono truncate text-muted-foreground">
                 {filename}
               </span>
-              <span
-                className={cn(
-                  'text-[0.625rem] uppercase font-medium px-1 rounded',
-                  typeColor
-                )}
-              >
+              <span className="text-[0.625rem] uppercase tracking-wide font-medium px-1.5 py-0.5 rounded bg-muted text-muted-foreground">
                 {changeType}
               </span>
               {change.kind?.move_path && (
@@ -669,7 +602,7 @@ function FileChangeDiffView({ input }: { input: unknown }) {
               )}
             </div>
             {change.diff ? (
-              <PatchDiffView patch={change.diff} />
+              <InlineFileDiff patch={change.diff} filePath={change.path} />
             ) : (
               <div className="text-muted-foreground/50 italic">
                 No diff available
@@ -693,16 +626,73 @@ function formatWakeupDelay(seconds: number): string {
   return remMins > 0 ? `${hours}h ${remMins}m` : `${hours}h`
 }
 
+function normalizeCommandCodeToolForDisplay(
+  name: string,
+  input: Record<string, unknown>
+): { name: string; input: Record<string, unknown> } {
+  switch (name) {
+    case 'read_file':
+      return {
+        name: 'Read',
+        input: {
+          ...input,
+          file_path:
+            input.file_path ??
+            input.absolutePath ??
+            input.filePath ??
+            input.path,
+        },
+      }
+    case 'write_file':
+      return {
+        name: 'Write',
+        input: {
+          ...input,
+          file_path:
+            input.file_path ??
+            input.filePath ??
+            input.absolutePath ??
+            input.path,
+        },
+      }
+    case 'read_multiple_files':
+      return {
+        name: 'ReadMultipleFiles',
+        input: {
+          ...input,
+          path: input.path ?? input.targetDirectory,
+        },
+      }
+    case 'shell_command':
+      return { name: 'Bash', input }
+    case 'read_directory':
+      return { name: 'List', input }
+    case 'glob':
+      return { name: 'Glob', input }
+    case 'grep':
+      return { name: 'Grep', input }
+    default:
+      return { name, input }
+  }
+}
+
+function getToolSummaryName(name: string): string {
+  return normalizeCommandCodeToolForDisplay(name, {}).name
+}
+
 /** Live-ticking remaining seconds for a pending ScheduleWakeup. */
 function useWakeupRemaining(fireAtUnix: number | undefined): number | null {
-  const [, setTick] = useState(0)
+  const [nowUnix, setNowUnix] = useState<number | null>(null)
   useEffect(() => {
     if (!fireAtUnix) return
-    const id = setInterval(() => setTick(t => t + 1), 1000)
+    const updateNow = () => setNowUnix(Math.floor(Date.now() / 1000))
+    updateNow()
+    const id = setInterval(updateNow, 1000)
     return () => clearInterval(id)
   }, [fireAtUnix])
   if (!fireAtUnix) return null
-  return Math.max(0, fireAtUnix - Math.floor(Date.now() / 1000))
+  if (nowUnix === null) return null
+  return Math.max(0, fireAtUnix - nowUnix)
 }
 
 interface ScheduleWakeupIndicatorProps {
@@ -746,9 +736,13 @@ function ScheduleWakeupCountdown({ toolCallId }: ScheduleWakeupIndicatorProps) {
 }
 
 function getToolDisplay(toolCall: ToolCall): ToolDisplay {
-  const input = (toolCall.input ?? {}) as Record<string, unknown>
+  const normalized = normalizeCommandCodeToolForDisplay(
+    toolCall.name,
+    (toolCall.input ?? {}) as Record<string, unknown>
+  )
+  const input = normalized.input
 
-  switch (toolCall.name) {
+  switch (normalized.name) {
     case 'Read': {
       const filePath = input.file_path as string | undefined
       const filename = filePath ? getFilename(filePath) : filePath
@@ -777,7 +771,7 @@ function getToolDisplay(toolCall: ToolCall): ToolDisplay {
         detail: filename,
         filePath,
         expandedContent: filePath ? (
-          <DiffView
+          <InlineFileDiff
             filePath={filePath}
             oldString={oldString ?? ''}
             newString={newString ?? ''}
@@ -856,6 +850,26 @@ function getToolDisplay(toolCall: ToolCall): ToolDisplay {
         label: 'Glob',
         detail: pattern,
         expandedContent: `Pattern: ${pattern ?? '(none)'}\nPath: ${path ?? '(cwd)'}`,
+      }
+    }
+
+    case 'ReadMultipleFiles': {
+      const path = input.path as string | undefined
+      const include = input.include
+      const includeText = Array.isArray(include)
+        ? include.join(', ')
+        : typeof include === 'string'
+          ? include
+          : undefined
+      const detail =
+        includeText && path
+          ? `${includeText} in ${path}`
+          : (includeText ?? path)
+      return {
+        icon: <FileText className="h-4 w-4 shrink-0" />,
+        label: 'Read Multiple Files',
+        detail,
+        expandedContent: `Path: ${path ?? '(cwd)'}${includeText ? `\nInclude: ${includeText}` : ''}`,
       }
     }
 
@@ -1037,7 +1051,9 @@ function getToolDisplay(toolCall: ToolCall): ToolDisplay {
           instructions.length > 0
             ? 'Read-only analysis instructions'
             : undefined,
-        expandedContent: <Markdown>{markdownBody}</Markdown>,
+        expandedContent: (
+          <Markdown variant="tool-call">{markdownBody}</Markdown>
+        ),
       }
     }
 
@@ -1116,6 +1132,7 @@ function getToolDisplay(toolCall: ToolCall): ToolDisplay {
       }
     }
 
+    case 'List':
     case 'list': {
       const path = input.path as string | undefined
       return {
@@ -1202,7 +1219,7 @@ function getToolDisplay(toolCall: ToolCall): ToolDisplay {
           />
         ),
         expandedContent: markdownBody ? (
-          <Markdown>{markdownBody}</Markdown>
+          <Markdown variant="tool-call">{markdownBody}</Markdown>
         ) : (
           JSON.stringify(input, null, 2)
         ),
@@ -1261,10 +1278,12 @@ function getToolDisplay(toolCall: ToolCall): ToolDisplay {
     }
 
     default: {
-      const isMcpTool = toolCall.name.startsWith('mcp__')
+      const isMcpTool = normalized.name.startsWith('mcp__')
       return {
         icon: <Terminal className="h-4 w-4 shrink-0" />,
-        label: isMcpTool ? toolCall.name : `${toolCall.name} (unhandled tool)`,
+        label: isMcpTool
+          ? normalized.name
+          : `${normalized.name} (unhandled tool)`,
         detail: undefined,
         expandedContent: JSON.stringify(input, null, 2),
       }

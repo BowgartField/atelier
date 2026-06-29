@@ -68,7 +68,11 @@ export function FilePreview({ files, onRemove, disabled }: FilePreviewProps) {
               )}
             </div>
           </TooltipTrigger>
-          <TooltipContent>{file.relativePath}</TooltipContent>
+          <TooltipContent>
+            {file.sourceProjectName
+              ? `${file.sourceProjectName}: ${file.relativePath}`
+              : file.relativePath}
+          </TooltipContent>
         </Tooltip>
       ))}
     </div>

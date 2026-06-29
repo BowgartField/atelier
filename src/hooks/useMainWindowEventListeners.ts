@@ -6,7 +6,7 @@ import { useQueryClient, type QueryClient } from '@tanstack/react-query'
 import { useUIStore } from '@/store/ui-store'
 import { useProjectsStore } from '@/store/projects-store'
 import { useChatStore } from '@/store/chat-store'
-import { useTerminalStore } from '@/store/terminal-store'
+import { isPanelTerminal, useTerminalStore } from '@/store/terminal-store'
 import { useBrowserStore } from '@/store/browser-store'
 import { projectsQueryKeys } from '@/services/projects'
 import { chatQueryKeys } from '@/services/chat'
@@ -39,12 +39,54 @@ export function shouldLetPlanDialogHandleAction(
   return planDialogOpen && PLAN_DIALOG_APPROVAL_ACTIONS.has(action)
 }
 
-export function getTerminalShortcutWorktreeId(): string | null {
-  const activeElement = document.activeElement
-  const terminalFocused =
-    activeElement instanceof HTMLElement && !!activeElement.closest('.xterm')
+export function findKeybindingAction(
+  shortcut: string,
+  keybindings: KeybindingsMap
+): KeybindingAction | null {
+  for (const [action, binding] of Object.entries(keybindings)) {
+    if (binding === shortcut) return action as KeybindingAction
+  }
 
-  if (!terminalFocused) return null
+  return null
+}
+
+export function shouldAllowKeybindingThroughOpenOverlay(
+  action: KeybindingAction | null,
+  uiState: ReturnType<typeof useUIStore.getState>
+): boolean {
+  // GitDiffModal is intentionally a full-screen workflow overlay, but users
+  // still need the global "Open in..." picker from there (Cmd/Ctrl+O).
+  return action === 'open_in_modal' && uiState.gitDiffModalOpen
+}
+
+function getFocusedTerminalElement(): HTMLElement | null {
+  const activeElement = document.activeElement
+  if (!(activeElement instanceof HTMLElement)) return null
+
+  return activeElement.closest('.xterm, [data-terminal-emulator]')
+}
+
+export function isPlainSessionTerminalFocused(): boolean {
+  return !!getFocusedTerminalElement()?.closest(
+    '[data-terminal-surface="session"]'
+  )
+}
+
+export function blurFocusedTerminalForShortcut(): boolean {
+  const terminalElement = getFocusedTerminalElement()
+  if (!terminalElement) return false
+
+  const activeElement = document.activeElement
+  if (activeElement instanceof HTMLElement) {
+    activeElement.blur()
+  }
+
+  document.body.focus({ preventScroll: true })
+  return true
+}
+
+export function getTerminalShortcutWorktreeId(): string | null {
+  if (!getFocusedTerminalElement()) return null
 
   const uiState = useUIStore.getState()
   const chatState = useChatStore.getState()
@@ -86,7 +128,9 @@ export function closeActiveTerminalTabForShortcut(): boolean {
   disposeTerminal(activeTerminalId)
   terminalStore.removeTerminal(worktreeId, activeTerminalId)
 
-  const remaining = useTerminalStore.getState().terminals[worktreeId] ?? []
+  const remaining = (
+    useTerminalStore.getState().terminals[worktreeId] ?? []
+  ).filter(isPanelTerminal)
   if (remaining.length === 0) {
     terminalStore.setTerminalPanelOpen(worktreeId, false)
     terminalStore.setTerminalVisible(false)
@@ -103,7 +147,9 @@ export function switchActiveTerminalTabByIndexForShortcut(
   if (!worktreeId) return false
 
   const terminalStore = useTerminalStore.getState()
-  const terminals = terminalStore.terminals[worktreeId] ?? []
+  const terminals = (terminalStore.terminals[worktreeId] ?? []).filter(
+    isPanelTerminal
+  )
   const targetTerminal = terminals[index]
 
   if (targetTerminal) {
@@ -128,7 +174,6 @@ function executeKeybindingAction(
   // Canvas-only actions: blocked when the session chat modal is open
   const CANVAS_ONLY_ACTIONS = new Set<KeybindingAction>([
     'open_plan',
-    'open_recap',
     'restore_last_archived',
     'focus_canvas_search',
   ])
@@ -292,7 +337,20 @@ function executeKeybindingAction(
       // When terminal is focused, CMD+T should create a terminal tab.
       if (addTerminalTabForShortcut()) break
       logger.debug('Keybinding: new_session')
-      window.dispatchEvent(new CustomEvent('create-new-session'))
+      window.dispatchEvent(
+        new CustomEvent('create-new-session', {
+          detail: { intent: 'default' },
+        })
+      )
+      break
+    }
+    case 'open_new_session_modal': {
+      logger.debug('Keybinding: open_new_session_modal')
+      window.dispatchEvent(
+        new CustomEvent('create-new-session', {
+          detail: { intent: 'picker' },
+        })
+      )
       break
     }
     case 'next_session':
@@ -371,10 +429,6 @@ function executeKeybindingAction(
       logger.debug('Keybinding: open_plan')
       window.dispatchEvent(new CustomEvent('open-plan'))
       break
-    case 'open_recap':
-      logger.debug('Keybinding: open_recap')
-      window.dispatchEvent(new CustomEvent('open-recap'))
-      break
     case 'restore_last_archived':
       logger.debug('Keybinding: restore_last_archived')
       window.dispatchEvent(new CustomEvent('restore-last-archived'))
@@ -439,6 +493,20 @@ function executeKeybindingAction(
     case 'scroll_chat_down':
       window.dispatchEvent(
         new CustomEvent('scroll-chat', { detail: { direction: 'down' } })
+      )
+      break
+    case 'scroll_chat_up_medium':
+      window.dispatchEvent(
+        new CustomEvent('scroll-chat', {
+          detail: { direction: 'up', amount: 'medium' },
+        })
+      )
+      break
+    case 'scroll_chat_down_medium':
+      window.dispatchEvent(
+        new CustomEvent('scroll-chat', {
+          detail: { direction: 'down', amount: 'medium' },
+        })
       )
       break
     case 'scroll_chat_up_small':
@@ -528,8 +596,21 @@ export function useMainWindowEventListeners() {
         }
       }
 
+      if (shortcut === 'mod+shift+escape' && blurFocusedTerminalForShortcut()) {
+        e.preventDefault()
+        e.stopPropagation()
+        return
+      }
+
+      // A focused full-screen/plain terminal session should own all keybindings.
+      // Side/modal terminals still use the terminal-specific remapping below.
+      if (isPlainSessionTerminalFocused()) return
+
+      const keybindings = keybindingsRef.current
+      const matchedAction = findKeybindingAction(shortcut, keybindings)
+
       // Cancel prompt should work even when modals are open
-      if (shortcut === keybindingsRef.current.cancel_prompt) {
+      if (matchedAction === 'cancel_prompt') {
         logger.debug('Cancel prompt shortcut matched', { shortcut })
         e.preventDefault()
         e.stopPropagation()
@@ -542,13 +623,19 @@ export function useMainWindowEventListeners() {
       // (including future modals) via their data-state attribute.
       // Also skip when a Radix DropdownMenu / Select is open so its built-in
       // arrow-key navigation isn't hijacked (e.g. by scroll_chat_*).
+      const uiState = useUIStore.getState()
       if (
+        !shouldAllowKeybindingThroughOpenOverlay(matchedAction, uiState) &&
         document.querySelector(
           '[role="dialog"][data-state="open"], [role="alertdialog"][data-state="open"], [role="menu"][data-state="open"], [role="listbox"][data-state="open"]'
         )
       )
         return
-      if (useProjectsStore.getState().projectSettingsDialogOpen) return
+      if (
+        !shouldAllowKeybindingThroughOpenOverlay(matchedAction, uiState) &&
+        useProjectsStore.getState().projectSettingsDialogOpen
+      )
+        return
 
       // When terminal is focused, remap shortcuts for terminal-specific actions
       // and block all others so they don't interfere with terminal usage.
@@ -588,6 +675,7 @@ export function useMainWindowEventListeners() {
           if (
             shortcut === kb.toggle_terminal ||
             shortcut === kb.toggle_browser ||
+            shortcut === kb.open_new_session_modal ||
             shortcut === kb.cancel_prompt
           ) {
             // Let these fall through to the normal keybinding handler below
@@ -634,38 +722,57 @@ export function useMainWindowEventListeners() {
         }
       }
 
+      // On the project canvas, Cmd/Ctrl+ArrowUp/Down reorders the selected
+      // worktree. The global chat-scroll shortcuts use the same keys and run in
+      // capture phase, so handle this before they stop propagation.
+      if (
+        (matchedAction === 'scroll_chat_up' ||
+          matchedAction === 'scroll_chat_down') &&
+        !useUIStore.getState().sessionChatModalOpen &&
+        document.querySelector(
+          '[data-pdnd-worktree-scope="canvas-worktree-list"]'
+        )
+      ) {
+        e.preventDefault()
+        e.stopPropagation()
+        window.dispatchEvent(
+          new CustomEvent('move-selected-worktree', {
+            detail: {
+              direction: matchedAction === 'scroll_chat_up' ? 'up' : 'down',
+            },
+          })
+        )
+        return
+      }
+
       // Look up matching action in keybindings
-      const keybindings = keybindingsRef.current
-      for (const [action, binding] of Object.entries(keybindings)) {
-        if (binding === shortcut) {
-          if (
-            shouldLetPlanDialogHandleAction(
-              action as KeybindingAction,
-              useUIStore.getState().planDialogOpen
-            )
-          ) {
-            return
-          }
-          // Scope small-scroll arrow keys to ChatWindow context
-          // so canvas/list arrow navigation still works elsewhere
-          if (
-            action === 'scroll_chat_up_small' ||
-            action === 'scroll_chat_down_small'
-          ) {
-            const chatVisible =
-              !!useChatStore.getState().activeWorktreeId ||
-              useUIStore.getState().sessionChatModalOpen
-            if (!chatVisible) return
-          }
-          e.preventDefault()
-          e.stopPropagation()
-          executeKeybindingAction(
-            action as KeybindingAction,
-            commandContext,
-            queryClient
+      if (matchedAction) {
+        const action = matchedAction
+        if (
+          shouldLetPlanDialogHandleAction(
+            action,
+            useUIStore.getState().planDialogOpen
           )
+        ) {
           return
         }
+        // Scope small-scroll arrow keys to ChatWindow context
+        // so canvas/list arrow navigation still works elsewhere
+        if (
+          action === 'scroll_chat_up_small' ||
+          action === 'scroll_chat_down_small' ||
+          action === 'scroll_chat_up_medium' ||
+          action === 'scroll_chat_down_medium'
+        ) {
+          const chatVisible =
+            !!useChatStore.getState().activeWorktreeId ||
+            useUIStore.getState().sessionChatModalOpen
+          if (!chatVisible) return
+        }
+        e.preventDefault()
+        e.stopPropagation()
+        executeKeybindingAction(action, commandContext, queryClient)
+        return
       }
     }
 
@@ -753,11 +860,7 @@ export function useMainWindowEventListeners() {
 
         listen('menu-toggle-browser', () => {
           logger.debug('Toggle browser menu event received from native menu')
-          executeKeybindingAction(
-            'toggle_browser',
-            commandContext,
-            queryClient
-          )
+          executeKeybindingAction('toggle_browser', commandContext, queryClient)
         }),
 
         // Branch naming events (automatic branch renaming based on first message)

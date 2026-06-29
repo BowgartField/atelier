@@ -6,6 +6,7 @@ use base64::{engine::general_purpose::STANDARD, Engine};
 use once_cell::sync::Lazy;
 use regex::Regex;
 use std::collections::HashMap;
+use std::future::Future;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -16,6 +17,8 @@ struct ChunkEvent {
     session_id: String,
     worktree_id: String,
     content: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    run_id: Option<String>,
 }
 
 #[derive(serde::Serialize, Clone)]
@@ -104,8 +107,20 @@ struct TrackedPartState {
 struct SharedSseSubscriber {
     jean_session_id: String,
     worktree_id: String,
+    run_id: String,
     cancelled: Arc<AtomicBool>,
     streamed_any: Arc<AtomicBool>,
+    /// True once the OpenCode session's turn has started (first streamed part
+    /// seen). Steered `prompt_async` injections must wait for this so they never
+    /// race the main blocking `/message` POST and reset its connection.
+    turn_started: Arc<AtomicBool>,
+    /// True when OpenCode emitted `session.idle` (whole session queue drained).
+    /// Reset to false on any streamed part. Used to keep a steered run open
+    /// until every injected prompt has finished.
+    session_idle: Arc<AtomicBool>,
+    /// True once at least one steered prompt was injected into this run. Only
+    /// steered runs wait for `session.idle`; plain runs finalize immediately.
+    steered: Arc<AtomicBool>,
     tracked_parts: HashMap<String, TrackedPartState>,
     /// Ordered list of content blocks accumulated from SSE events.
     /// Includes intermediate thinking/tool blocks that may not appear in the
@@ -258,6 +273,14 @@ impl SharedSseSubscriber {
             });
         }
     }
+
+    /// Record that the session is actively streaming: the turn has started and
+    /// the session is no longer idle. Called on every streamed part so a steered
+    /// prompt that just made the session busy again re-extends the run.
+    fn note_streaming_activity(&self) {
+        self.turn_started.store(true, Ordering::Relaxed);
+        self.session_idle.store(false, Ordering::Relaxed);
+    }
 }
 
 type SharedSseSubscriberHandle = Arc<Mutex<SharedSseSubscriber>>;
@@ -272,6 +295,40 @@ struct SharedSseSubscriberEntry {
 struct SharedSseListenerState {
     connected: Arc<AtomicBool>,
     running: Arc<AtomicBool>,
+    disabled_until: Arc<Mutex<Option<Instant>>>,
+}
+
+const OPENCODE_SSE_BASE_RECONNECT_DELAY: Duration = Duration::from_millis(250);
+const OPENCODE_SSE_MAX_RECONNECT_DELAY: Duration = Duration::from_secs(5);
+const OPENCODE_SSE_SHORT_LIVED_THRESHOLD: Duration = Duration::from_secs(2);
+const OPENCODE_SSE_MAX_SHORT_LIVED_DISCONNECTS: u32 = 3;
+const OPENCODE_SSE_DISABLED_COOLDOWN: Duration = Duration::from_secs(60);
+const OPENCODE_HTTP_CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+fn shared_sse_reconnect_delay(short_lived_disconnects: u32) -> Duration {
+    if short_lived_disconnects == 0 {
+        return OPENCODE_SSE_BASE_RECONNECT_DELAY;
+    }
+    let exp = short_lived_disconnects.saturating_sub(1).min(5);
+    let multiplier = 1_u32.checked_shl(exp).unwrap_or(32);
+    OPENCODE_SSE_BASE_RECONNECT_DELAY
+        .saturating_mul(multiplier)
+        .min(OPENCODE_SSE_MAX_RECONNECT_DELAY)
+}
+
+fn listener_in_cooldown(state: &SharedSseListenerState) -> bool {
+    let guard = lock_recover(&state.disabled_until, "OPENCODE_SSE_DISABLED_UNTIL");
+    matches!(*guard, Some(deadline) if deadline > Instant::now())
+}
+
+fn mark_listener_cooldown(state: &SharedSseListenerState) {
+    let mut guard = lock_recover(&state.disabled_until, "OPENCODE_SSE_DISABLED_UNTIL");
+    *guard = Some(Instant::now() + OPENCODE_SSE_DISABLED_COOLDOWN);
+}
+
+fn clear_listener_cooldown(state: &SharedSseListenerState) {
+    let mut guard = lock_recover(&state.disabled_until, "OPENCODE_SSE_DISABLED_UNTIL");
+    *guard = None;
 }
 
 struct SharedSseCoordinator {
@@ -302,17 +359,25 @@ impl SharedSseSubscription {
         opencode_session_id: String,
         jean_session_id: String,
         worktree_id: String,
+        run_id: String,
         working_dir: String,
         cancelled: Arc<AtomicBool>,
         streamed_any: Arc<AtomicBool>,
+        turn_started: Arc<AtomicBool>,
+        session_idle: Arc<AtomicBool>,
+        steered: Arc<AtomicBool>,
     ) -> Self {
         ensure_shared_sse_listener(app, base_url, &working_dir);
 
         let subscriber = Arc::new(Mutex::new(SharedSseSubscriber {
             jean_session_id,
             worktree_id,
+            run_id,
             cancelled,
             streamed_any,
+            turn_started,
+            session_idle,
+            steered,
             tracked_parts: HashMap::new(),
             accumulated_blocks: Vec::new(),
             accumulated_tool_calls: Vec::new(),
@@ -404,12 +469,22 @@ fn get_or_create_listener_state(working_dir: &str) -> SharedSseListenerState {
         .or_insert_with(|| SharedSseListenerState {
             connected: Arc::new(AtomicBool::new(false)),
             running: Arc::new(AtomicBool::new(false)),
+            disabled_until: Arc::new(Mutex::new(None)),
         })
         .clone()
 }
 
 fn ensure_shared_sse_listener(app: &AppHandle, base_url: &str, working_dir: &str) {
     let listener_state = get_or_create_listener_state(working_dir);
+
+    if listener_in_cooldown(&listener_state) {
+        log::info!(
+            "OpenCode shared SSE: listener in cooldown for dir={}, skipping spawn (POST fallback will be used)",
+            working_dir
+        );
+        return;
+    }
+
     if listener_state
         .running
         .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
@@ -426,6 +501,7 @@ fn ensure_shared_sse_listener(app: &AppHandle, base_url: &str, working_dir: &str
     let base_url = base_url.to_string();
     let working_dir = working_dir.to_string();
     let subscribers = SHARED_SSE.subscribers.clone();
+    let state_for_thread = listener_state.clone();
     let connected = listener_state.connected.clone();
     let running = listener_state.running.clone();
 
@@ -450,7 +526,7 @@ fn ensure_shared_sse_listener(app: &AppHandle, base_url: &str, working_dir: &str
                 base_url,
                 working_dir,
                 subscribers,
-                connected.clone(),
+                state_for_thread,
             ));
             connected.store(false, Ordering::SeqCst);
             running.store(false, Ordering::SeqCst);
@@ -504,6 +580,7 @@ fn emit_chunk_for_subscriber(app: &AppHandle, subscriber: &SharedSseSubscriber, 
         app,
         &subscriber.jean_session_id,
         &subscriber.worktree_id,
+        Some(&subscriber.run_id),
         content,
     );
     subscriber.streamed_any.store(true, Ordering::Relaxed);
@@ -553,6 +630,92 @@ fn emit_tool_result_for_subscriber(
     subscriber.streamed_any.store(true, Ordering::Relaxed);
 }
 
+/// Look up the (turn_started, session_idle, steered) flags for an OpenCode
+/// session from the shared subscriber map. Returns None if no run is currently
+/// subscribed for that session.
+fn opencode_session_flags(
+    opencode_session_id: &str,
+) -> Option<(Arc<AtomicBool>, Arc<AtomicBool>, Arc<AtomicBool>)> {
+    let subscribers = lock_recover(&SHARED_SSE.subscribers, "OPENCODE_SSE_SUBSCRIBERS");
+    let entry = subscribers.get(opencode_session_id)?;
+    let sub = lock_recover(&entry.handle, "OPENCODE_SSE_SUBSCRIBER");
+    Some((
+        sub.turn_started.clone(),
+        sub.session_idle.clone(),
+        sub.steered.clone(),
+    ))
+}
+
+/// Block until the OpenCode session's main turn has started streaming (so a
+/// steered `prompt_async` injection never races the blocking `/message` POST and
+/// resets its connection), or until `timeout` elapses. Returns true if the turn
+/// started.
+pub fn wait_opencode_turn_started(opencode_session_id: &str, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some((turn_started, _, _)) = opencode_session_flags(opencode_session_id) {
+            if turn_started.load(Ordering::Relaxed) {
+                return true;
+            }
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Mark that a steered prompt was injected into the OpenCode session's active
+/// run, so the run waits for `session.idle` before finalizing instead of
+/// completing as soon as the original blocking `/message` POST returns.
+pub fn mark_opencode_steered(opencode_session_id: &str) {
+    if let Some((_, _, steered)) = opencode_session_flags(opencode_session_id) {
+        steered.store(true, Ordering::Relaxed);
+    }
+}
+
+/// Block (cancel-aware, bounded) until the OpenCode session reaches a STABLE
+/// `session.idle` — i.e. every steered `prompt_async` injection has finished and
+/// no new one has restarted streaming. A freshly injected prompt resets
+/// `session_idle` to false on its first streamed part, so this naturally extends
+/// the run across all injected prompts.
+fn wait_for_opencode_session_idle(
+    session_idle: &Arc<AtomicBool>,
+    cancelled: &Arc<AtomicBool>,
+    opencode_session_id: &str,
+) {
+    const MAX_WAIT: Duration = Duration::from_secs(1800);
+    const GRACE: Duration = Duration::from_millis(500);
+    let deadline = Instant::now() + MAX_WAIT;
+    log::info!(
+        "OpenCode: steered run waiting for session.idle opencode_session={opencode_session_id}"
+    );
+    loop {
+        if cancelled.load(Ordering::SeqCst) {
+            return;
+        }
+        if Instant::now() >= deadline {
+            log::warn!(
+                "OpenCode: steered run idle-wait timed out opencode_session={opencode_session_id}"
+            );
+            return;
+        }
+        if session_idle.load(Ordering::Relaxed) {
+            // Confirm idle is stable: a steered prompt mid-injection resets the
+            // flag on its first streamed part, so re-check after a short grace.
+            std::thread::sleep(GRACE);
+            if session_idle.load(Ordering::Relaxed) {
+                log::info!(
+                    "OpenCode: steered run reached stable session.idle opencode_session={opencode_session_id}"
+                );
+                return;
+            }
+            continue;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
 fn has_subscribers_for_working_dir(
     subscribers: &Arc<Mutex<HashMap<String, SharedSseSubscriberEntry>>>,
     working_dir: &str,
@@ -563,7 +726,13 @@ fn has_subscribers_for_working_dir(
         .any(|entry| entry.working_dir == working_dir)
 }
 
-fn emit_chat_chunk(app: &AppHandle, session_id: &str, worktree_id: &str, content: &str) {
+fn emit_chat_chunk(
+    app: &AppHandle,
+    session_id: &str,
+    worktree_id: &str,
+    run_id: Option<&str>,
+    content: &str,
+) {
     if content.is_empty() {
         return;
     }
@@ -574,6 +743,7 @@ fn emit_chat_chunk(app: &AppHandle, session_id: &str, worktree_id: &str, content
             session_id: session_id.to_string(),
             worktree_id: worktree_id.to_string(),
             content: content.to_string(),
+            run_id: run_id.map(ToOwned::to_owned),
         },
     );
 }
@@ -832,10 +1002,14 @@ fn parse_provider_model(model: Option<&str>) -> Option<(String, String)> {
         return None;
     }
 
-    // Strip "opencode/" prefix if present (e.g. "opencode/ollama/Qwen" → "ollama/Qwen")
-    let raw = raw.strip_prefix("opencode/").unwrap_or(raw);
-    // Expect provider/model; if not present, let backend pick default.
-    let (provider, model_id) = raw.split_once('/')?;
+    // Strip the Jean `opencode/` wrapper prefix ONLY when the remaining string still
+    // contains a `/` — e.g. "opencode/ollama/Qwen" → "ollama/Qwen". For inputs like
+    // "opencode/gpt-5.5", opencode IS the provider, so keep the whole string.
+    let stripped = raw
+        .strip_prefix("opencode/")
+        .filter(|rest| rest.contains('/'))
+        .unwrap_or(raw);
+    let (provider, model_id) = stripped.split_once('/')?;
     let provider = provider.trim();
     let model_id = model_id.trim();
     if provider.is_empty() || model_id.is_empty() {
@@ -852,6 +1026,40 @@ fn bare_model_id(model: &str) -> Option<&str> {
         return None;
     }
     Some(raw.strip_prefix("opencode/").unwrap_or(raw))
+}
+
+/// Extracts a human-readable error message from an opencode message response when
+/// `info.error` is populated (status 200 OK + parts=[] + error object). Tries the
+/// upstream provider's raw error body first, then `info.error.data.message`, then
+/// `info.error.name`.
+fn extract_opencode_error_message(message: &serde_json::Value) -> Option<String> {
+    let error = message.get("info")?.get("error")?;
+    let data = error.get("data");
+
+    // Provider-level error body (e.g. opencode.ai zen CreditsError message)
+    if let Some(body_str) = data
+        .and_then(|d| d.get("responseBody"))
+        .and_then(|v| v.as_str())
+    {
+        if let Ok(body_json) = serde_json::from_str::<serde_json::Value>(body_str) {
+            if let Some(msg) = body_json
+                .get("error")
+                .and_then(|e| e.get("message"))
+                .and_then(|v| v.as_str())
+            {
+                return Some(msg.to_string());
+            }
+        }
+    }
+
+    if let Some(msg) = data.and_then(|d| d.get("message")).and_then(|v| v.as_str()) {
+        return Some(msg.to_string());
+    }
+
+    error
+        .get("name")
+        .and_then(|v| v.as_str())
+        .map(|n| n.to_string())
 }
 
 /// Search the provider list for a provider that owns `target_model_id`.
@@ -1038,8 +1246,9 @@ async fn shared_sse_listener_loop(
     base_url: String,
     working_dir: String,
     subscribers: Arc<Mutex<HashMap<String, SharedSseSubscriberEntry>>>,
-    connected: Arc<AtomicBool>,
+    state: SharedSseListenerState,
 ) {
+    let connected = state.connected.clone();
     let client = match reqwest::Client::builder().no_proxy().build() {
         Ok(c) => c,
         Err(e) => {
@@ -1051,12 +1260,22 @@ async fn shared_sse_listener_loop(
     let url = format!("{base_url}/event");
     let query = [("directory", working_dir.clone())];
     let mut connect_attempt: u64 = 0;
+    let mut short_lived_disconnects: u32 = 0;
 
     loop {
         if !has_subscribers_for_working_dir(&subscribers, &working_dir) {
             connected.store(false, Ordering::SeqCst);
             tokio::time::sleep(Duration::from_millis(200)).await;
             continue;
+        }
+
+        if listener_in_cooldown(&state) {
+            log::info!(
+                "OpenCode shared SSE: cooldown active for dir={}, listener exiting",
+                working_dir
+            );
+            connected.store(false, Ordering::SeqCst);
+            return;
         }
 
         connect_attempt += 1;
@@ -1112,6 +1331,7 @@ async fn shared_sse_listener_loop(
         let mut total_chunks: u64 = 0;
         let mut total_events_emitted: u64 = 0;
         let mut poll_count: u64 = 0;
+        let connection_started = Instant::now();
 
         loop {
             poll_count += 1;
@@ -1136,7 +1356,7 @@ async fn shared_sse_listener_loop(
                     total_chunks += 1;
                     let chunk_str = String::from_utf8_lossy(&bytes);
                     let preview: String = chunk_str.chars().take(300).collect();
-                    log::trace!(
+                    log::debug!(
                         "OpenCode shared SSE: chunk #{total_chunks} ({} bytes): {preview}{}",
                         bytes.len(),
                         if chunk_str.len() > 300 { "..." } else { "" }
@@ -1170,18 +1390,61 @@ async fn shared_sse_listener_loop(
                     }
                 }
                 Ok(None) => {
+                    if !current_data.is_empty() {
+                        let emitted = process_shared_sse_event(&app, &current_data, &subscribers);
+                        if matches!(emitted, Some(true)) {
+                            total_events_emitted += 1;
+                        }
+                        current_data.clear();
+                    }
                     log::info!(
-                        "OpenCode shared SSE: stream ended after {total_chunks} chunks, {total_events_emitted} events emitted"
+                        "OpenCode shared SSE: stream ended after {total_chunks} chunks, {total_events_emitted} events emitted, elapsed_ms={}",
+                        connection_started.elapsed().as_millis()
                     );
                     connected.store(false, Ordering::SeqCst);
                     break;
                 }
                 Err(e) => {
+                    if !current_data.is_empty() {
+                        let emitted = process_shared_sse_event(&app, &current_data, &subscribers);
+                        if matches!(emitted, Some(true)) {
+                            total_events_emitted += 1;
+                        }
+                        current_data.clear();
+                    }
                     log::info!("OpenCode shared SSE: read error after {total_chunks} chunks: {e}");
                     connected.store(false, Ordering::SeqCst);
                     break;
                 }
             }
+        }
+
+        let elapsed = connection_started.elapsed();
+        if elapsed < OPENCODE_SSE_SHORT_LIVED_THRESHOLD && total_events_emitted == 0 {
+            short_lived_disconnects = short_lived_disconnects.saturating_add(1);
+        } else {
+            short_lived_disconnects = 0;
+            clear_listener_cooldown(&state);
+        }
+
+        if short_lived_disconnects >= OPENCODE_SSE_MAX_SHORT_LIVED_DISCONNECTS {
+            log::warn!(
+                "OpenCode shared SSE: disabling listener for dir={} after {short_lived_disconnects} short-lived disconnects; POST response fallback will be used for {}s",
+                working_dir,
+                OPENCODE_SSE_DISABLED_COOLDOWN.as_secs()
+            );
+            mark_listener_cooldown(&state);
+            connected.store(false, Ordering::SeqCst);
+            return;
+        }
+
+        if has_subscribers_for_working_dir(&subscribers, &working_dir) {
+            let delay = shared_sse_reconnect_delay(short_lived_disconnects);
+            log::info!(
+                "OpenCode shared SSE: reconnecting after {}ms (short_lived_disconnects={short_lived_disconnects})",
+                delay.as_millis()
+            );
+            tokio::time::sleep(delay).await;
         }
     }
 }
@@ -1195,6 +1458,7 @@ fn process_message_part_event(
     if subscriber.cancelled.load(Ordering::Relaxed) {
         return Some(false);
     }
+    subscriber.note_streaming_activity();
 
     let part_type = part.get("type").and_then(|v| v.as_str()).unwrap_or("");
     let part_id = part
@@ -1472,6 +1736,7 @@ fn process_message_part_delta_event(
     if subscriber.cancelled.load(Ordering::Relaxed) {
         return Some(false);
     }
+    subscriber.note_streaming_activity();
 
     let delta_session_id = properties
         .get("sessionID")
@@ -1667,6 +1932,27 @@ fn process_shared_sse_event(
             process_message_part_delta_event(app, &properties, &mut subscriber)
         }
         "message.created" | "session.updated" => Some(false),
+        "session.idle" => {
+            // The session's whole queue (original turn + any steered prompts)
+            // has drained. Flag the subscriber so a steered run can finalize.
+            let opencode_session_id = properties
+                .get("sessionID")
+                .and_then(|v| v.as_str())
+                .or_else(|| {
+                    properties
+                        .get("info")
+                        .and_then(|i| i.get("id"))
+                        .and_then(|v| v.as_str())
+                })
+                .unwrap_or("");
+            if let Some((_, session_idle, _)) = opencode_session_flags(opencode_session_id) {
+                session_idle.store(true, Ordering::Relaxed);
+                log::info!(
+                    "OpenCode shared SSE: session.idle opencode_session={opencode_session_id}"
+                );
+            }
+            Some(false)
+        }
         _ => {
             log::trace!("OpenCode shared SSE: event type='{}'", event_type);
             Some(false)
@@ -1674,11 +1960,154 @@ fn process_shared_sse_event(
     }
 }
 
+async fn await_opencode_http_or_cancel<F, T>(
+    future: F,
+    cancelled: Arc<AtomicBool>,
+    opencode_session_id: String,
+    working_dir: String,
+) -> Option<T>
+where
+    F: Future<Output = T>,
+{
+    if cancelled.load(Ordering::SeqCst) {
+        super::registry::abort_opencode_session(opencode_session_id.clone(), Some(working_dir));
+        return None;
+    }
+
+    tokio::pin!(future);
+    loop {
+        tokio::select! {
+            result = &mut future => return Some(result),
+            _ = tokio::time::sleep(OPENCODE_HTTP_CANCEL_POLL_INTERVAL) => {
+                if cancelled.load(Ordering::SeqCst) {
+                    super::registry::abort_opencode_session(opencode_session_id.clone(), Some(working_dir.clone()));
+                    return None;
+                }
+            }
+        }
+    }
+}
+
+async fn sleep_or_cancel_opencode_http(
+    duration: Duration,
+    cancelled: Arc<AtomicBool>,
+    opencode_session_id: String,
+    working_dir: String,
+) -> bool {
+    await_opencode_http_or_cancel(
+        tokio::time::sleep(duration),
+        cancelled,
+        opencode_session_id,
+        working_dir,
+    )
+    .await
+    .is_none()
+}
+
+fn post_opencode_message_cancellable(
+    msg_url: String,
+    working_dir: String,
+    payload: serde_json::Value,
+    cancelled: Arc<AtomicBool>,
+    jean_session_id: String,
+    opencode_session_id: String,
+) -> Result<Option<(reqwest::StatusCode, String)>, String> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| format!("Failed to build OpenCode HTTP runtime: {e}"))?;
+
+    runtime.block_on(async move {
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(1800))
+            .build()
+            .map_err(|e| format!("Failed to build OpenCode async HTTP client: {e}"))?;
+
+        let send_once = || {
+            client
+                .post(&msg_url)
+                .query(&[("directory", working_dir.as_str())])
+                .json(&payload)
+                .send()
+        };
+
+        let response = match await_opencode_http_or_cancel(
+            send_once(),
+            cancelled.clone(),
+            opencode_session_id.clone(),
+            working_dir.clone(),
+        )
+        .await
+        {
+            Some(Ok(resp)) => resp,
+            Some(Err(e)) if e.is_connect() || e.is_request() => {
+                log::warn!("OpenCode message connection error, retrying in 2s: {e}");
+                if sleep_or_cancel_opencode_http(
+                    std::time::Duration::from_secs(2),
+                    cancelled.clone(),
+                    opencode_session_id.clone(),
+                    working_dir.clone(),
+                )
+                .await
+                {
+                    return Ok(None);
+                }
+
+                match await_opencode_http_or_cancel(
+                    send_once(),
+                    cancelled.clone(),
+                    opencode_session_id.clone(),
+                    working_dir.clone(),
+                )
+                .await
+                {
+                    Some(Ok(resp)) => resp,
+                    Some(Err(e)) => return Err(format!("Failed to send OpenCode message: {e}")),
+                    None => return Ok(None),
+                }
+            }
+            Some(Err(e)) => return Err(format!("Failed to send OpenCode message: {e}")),
+            None => return Ok(None),
+        };
+
+        let status = response.status();
+        log::info!(
+            "OpenCode: POST body read start jean_session={} opencode_session={}",
+            jean_session_id,
+            opencode_session_id
+        );
+        let body_read_start = Instant::now();
+        let body = match await_opencode_http_or_cancel(
+            response.text(),
+            cancelled,
+            opencode_session_id.clone(),
+            working_dir,
+        )
+        .await
+        {
+            Some(Ok(body)) => body,
+            Some(Err(e)) => {
+                log::warn!(
+                    "OpenCode: POST body read failed jean_session={} opencode_session={} elapsed_ms={} err={e}",
+                    jean_session_id,
+                    opencode_session_id,
+                    body_read_start.elapsed().as_millis()
+                );
+                return Err(format!("Failed to read OpenCode message response: {e}"));
+            }
+            None => return Ok(None),
+        };
+
+        Ok(Some((status, body)))
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn execute_opencode_http(
     app: &tauri::AppHandle,
     session_id: &str,
     worktree_id: &str,
+    run_id: &str,
     working_dir: &std::path::Path,
     existing_opencode_session_id: Option<&str>,
     model: Option<&str>,
@@ -1761,6 +2190,12 @@ pub fn execute_opencode_http(
         opencode_session_id.clone(),
         working_dir_string.clone(),
     );
+    super::commands::trigger_opencode_queue_steer(
+        app.clone(),
+        worktree_id.to_string(),
+        working_dir_string.clone(),
+        session_id.to_string(),
+    );
 
     let selected_model = if let Some(pm) = parse_provider_model(model) {
         pm
@@ -1782,13 +2217,17 @@ pub fn execute_opencode_http(
             .json()
             .map_err(|e| format!("Failed to parse OpenCode providers response: {e}"))?;
 
-        // Try to find the bare model ID across providers before picking any random model
         model
             .and_then(bare_model_id)
             .and_then(|bare| find_provider_for_model(&providers, bare))
             .or_else(|| choose_model(&providers))
             .ok_or("No OpenCode models available. Authenticate a provider first.")?
     };
+    log::info!(
+        "OpenCode: selected model provider='{}' model='{}'",
+        selected_model.0,
+        selected_model.1
+    );
 
     // Check for cancellation before sending the (potentially long-running) message request
     if cancelled.load(Ordering::SeqCst) {
@@ -1803,6 +2242,13 @@ pub fn execute_opencode_http(
     }
 
     let streamed_via_sse = Arc::new(AtomicBool::new(false));
+    // Steering coordination flags shared with the SSE listener. `turn_started`
+    // gates steered `prompt_async` injections until the main turn is live;
+    // `session_idle` lets a steered run wait for every injected prompt to finish;
+    // `steered` records whether any injection happened (plain runs skip the wait).
+    let turn_started = Arc::new(AtomicBool::new(false));
+    let session_idle = Arc::new(AtomicBool::new(false));
+    let steered = Arc::new(AtomicBool::new(false));
     log::info!(
         "OpenCode: registering shared SSE subscriber jean_session={} opencode_session={}",
         session_id,
@@ -1814,9 +2260,13 @@ pub fn execute_opencode_http(
         opencode_session_id.clone(),
         session_id.to_string(),
         worktree_id.to_string(),
+        run_id.to_string(),
         working_dir_string.clone(),
         cancelled.clone(),
         streamed_via_sse.clone(),
+        turn_started.clone(),
+        session_idle.clone(),
+        steered.clone(),
     );
 
     let sse_connected = wait_for_shared_sse_connection(Duration::from_secs(3), &working_dir_string);
@@ -1865,7 +2315,6 @@ pub fn execute_opencode_http(
         payload["system"] = serde_json::Value::String(system.to_string());
     }
 
-    // Retry once on connection-level errors (server temporarily unreachable).
     let post_start = Instant::now();
     log::info!(
         "OpenCode: message POST start jean_session={} opencode_session={} url={}",
@@ -1873,41 +2322,39 @@ pub fn execute_opencode_http(
         opencode_session_id,
         msg_url
     );
-    let response = match client.post(&msg_url).query(&query).json(&payload).send() {
-        Ok(resp) => resp,
-        Err(e) if e.is_connect() || e.is_request() => {
-            log::warn!("OpenCode message connection error, retrying in 2s: {e}");
-            std::thread::sleep(std::time::Duration::from_secs(2));
-            if cancelled.load(Ordering::SeqCst) {
-                return Ok(OpenCodeResponse {
-                    content: String::new(),
-                    session_id: opencode_session_id,
-                    tool_calls: vec![],
-                    content_blocks: vec![],
-                    cancelled: true,
-                    usage: None,
-                });
-            }
-            client
-                .post(&msg_url)
-                .query(&query)
-                .json(&payload)
-                .send()
-                .map_err(|e| format!("Failed to send OpenCode message: {e}"))?
-        }
-        Err(e) => return Err(format!("Failed to send OpenCode message: {e}")),
+    let Some((status, body)) = post_opencode_message_cancellable(
+        msg_url,
+        working_dir_string.clone(),
+        payload,
+        cancelled.clone(),
+        session_id.to_string(),
+        opencode_session_id.clone(),
+    )?
+    else {
+        log::info!(
+            "OpenCode: message POST cancelled jean_session={} opencode_session={} elapsed_ms={}",
+            session_id,
+            opencode_session_id,
+            post_start.elapsed().as_millis()
+        );
+        return Ok(OpenCodeResponse {
+            content: String::new(),
+            session_id: opencode_session_id,
+            tool_calls: vec![],
+            content_blocks: vec![],
+            cancelled: true,
+            usage: None,
+        });
     };
     log::info!(
         "OpenCode: message POST finished jean_session={} opencode_session={} elapsed_ms={} status={}",
         session_id,
         opencode_session_id,
         post_start.elapsed().as_millis(),
-        response.status()
+        status
     );
 
-    if !response.status().is_success() {
-        let status = response.status();
-        let body = response.text().unwrap_or_default();
+    if !status.is_success() {
         let error = format!("OpenCode message failed: status={status}, body={body}");
         let _ = app.emit_all(
             "chat:error",
@@ -1920,9 +2367,49 @@ pub fn execute_opencode_http(
         return Err(error);
     }
 
-    let response_json: serde_json::Value = response
-        .json()
-        .map_err(|e| format!("Failed to parse OpenCode message response: {e}"))?;
+    let body_parse_start = Instant::now();
+    let response_json: serde_json::Value = serde_json::from_str(&body).map_err(|e| {
+        log::warn!(
+            "OpenCode: POST body parse failed jean_session={} opencode_session={} elapsed_ms={} err={e}",
+            session_id,
+            opencode_session_id,
+            body_parse_start.elapsed().as_millis()
+        );
+        format!("Failed to parse OpenCode message response: {e}")
+    })?;
+    log::info!(
+        "OpenCode: POST body parse done jean_session={} opencode_session={} elapsed_ms={} parts={}",
+        session_id,
+        opencode_session_id,
+        body_parse_start.elapsed().as_millis(),
+        response_json
+            .get("parts")
+            .and_then(|v| v.as_array())
+            .map(|a| a.len())
+            .unwrap_or(0)
+    );
+
+    // Surface upstream errors from `info.error` (e.g. opencode.ai zen "Insufficient balance",
+    // ContextOverflowError, model-provider auth failures). These come back as 200 OK with
+    // parts=[] and an embedded error object; without this check the run would silently log
+    // "empty JSONL content" and the UI would show nothing.
+    if let Some(error_msg) = extract_opencode_error_message(&response_json) {
+        log::warn!(
+            "OpenCode: upstream error in POST response jean_session={} opencode_session={} msg={}",
+            session_id,
+            opencode_session_id,
+            error_msg
+        );
+        let _ = app.emit_all(
+            "chat:error",
+            &ErrorEvent {
+                session_id: session_id.to_string(),
+                worktree_id: worktree_id.to_string(),
+                error: error_msg.clone(),
+            },
+        );
+        return Err(error_msg);
+    }
 
     // Let the SSE listener drain any trailing events before deciding whether
     // the POST response needs to synthesize the stream.
@@ -1989,6 +2476,7 @@ pub fn execute_opencode_http(
                                     session_id: session_id.to_string(),
                                     worktree_id: worktree_id.to_string(),
                                     content: text.to_string(),
+                                    run_id: Some(run_id.to_string()),
                                 },
                             );
                         }
@@ -2118,6 +2606,16 @@ pub fn execute_opencode_http(
             }
             _ => {}
         }
+    }
+
+    // If any prompt was steered into this run via `prompt_async`, the blocking
+    // `/message` POST returns when the ORIGINAL turn finishes — but injected
+    // prompts keep running server-side and stream over the (still-subscribed)
+    // SSE. Wait for `session.idle` so their output is captured below before we
+    // take the accumulated SSE blocks. Plain (non-steered) runs skip this and
+    // finalize immediately, so they are completely unaffected.
+    if steered.load(Ordering::Relaxed) {
+        wait_for_opencode_session_idle(&session_idle, cancelled, &opencode_session_id);
     }
 
     // If SSE accumulated richer content (intermediate thinking/tool blocks),
@@ -2513,4 +3011,121 @@ pub fn answer_opencode_question(
     log::info!("OpenCode question replied: request_id={request_id}, tool_call_id={tool_call_id}");
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn turn_started_gate_returns_false_for_unknown_session_quickly() {
+        // No subscriber registered → gate must time out (not block forever) and
+        // report the turn never started, so the steer caller requeues instead.
+        let start = Instant::now();
+        let started = wait_opencode_turn_started("ses_does_not_exist", Duration::from_millis(120));
+        assert!(!started);
+        assert!(start.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn mark_steered_is_noop_for_unknown_session() {
+        // Must not panic when the session has no active subscriber.
+        mark_opencode_steered("ses_does_not_exist");
+    }
+
+    #[test]
+    fn parse_provider_model_keeps_single_segment_after_opencode_prefix() {
+        assert_eq!(
+            parse_provider_model(Some("opencode/gpt-5.5")),
+            Some(("opencode".into(), "gpt-5.5".into()))
+        );
+    }
+
+    #[test]
+    fn parse_provider_model_strips_jean_prefix_for_wrapped_paths() {
+        assert_eq!(
+            parse_provider_model(Some("opencode/ollama/Qwen")),
+            Some(("ollama".into(), "Qwen".into()))
+        );
+    }
+
+    #[test]
+    fn parse_provider_model_handles_plain_provider_model() {
+        assert_eq!(
+            parse_provider_model(Some("anthropic/claude-sonnet-4-6")),
+            Some(("anthropic".into(), "claude-sonnet-4-6".into()))
+        );
+    }
+
+    #[test]
+    fn extract_opencode_error_picks_credits_message_from_response_body() {
+        let body = serde_json::json!({
+            "info": {
+                "error": {
+                    "name": "APIError",
+                    "data": {
+                        "message": "Insufficient balance. Manage your billing here: ...",
+                        "responseBody": "{\"type\":\"error\",\"error\":{\"type\":\"CreditsError\",\"message\":\"Insufficient balance.\"}}"
+                    }
+                }
+            },
+            "parts": []
+        });
+        assert_eq!(
+            extract_opencode_error_message(&body),
+            Some("Insufficient balance.".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_opencode_error_falls_back_to_data_message() {
+        let body = serde_json::json!({
+            "info": {
+                "error": {
+                    "name": "ContextOverflowError",
+                    "data": {
+                        "message": "Session too large to compact"
+                    }
+                }
+            },
+            "parts": []
+        });
+        assert_eq!(
+            extract_opencode_error_message(&body),
+            Some("Session too large to compact".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_opencode_error_returns_none_when_no_error() {
+        let body = serde_json::json!({
+            "info": {},
+            "parts": [{"type": "text", "text": "hello"}]
+        });
+        assert_eq!(extract_opencode_error_message(&body), None);
+    }
+
+    #[test]
+    fn await_opencode_http_or_cancel_returns_none_when_cancelled() {
+        std::thread::spawn(|| {
+            let cancelled = Arc::new(AtomicBool::new(true));
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+
+            let start = Instant::now();
+            let result = runtime.block_on(await_opencode_http_or_cancel(
+                std::future::pending::<()>(),
+                cancelled,
+                "opencode-session".to_string(),
+                "/tmp".to_string(),
+            ));
+
+            assert!(result.is_none());
+            assert!(start.elapsed() < Duration::from_millis(50));
+        })
+        .join()
+        .unwrap();
+    }
 }

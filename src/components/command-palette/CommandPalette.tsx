@@ -5,7 +5,7 @@ import { usePreferences } from '@/services/preferences'
 import { useProjects, useAppDataDir } from '@/services/projects'
 import { useChatStore } from '@/store/chat-store'
 import { useProjectsStore } from '@/store/projects-store'
-import { convertFileSrc } from '@/lib/transport'
+import { convertFileSrc, convertProjectFileSrc } from '@/lib/transport'
 import { getAllCommands, executeCommand } from '@/lib/commands'
 import { formatShortcutDisplay } from '@/types/keybindings'
 import {
@@ -58,11 +58,13 @@ export function CommandPalette() {
       .map(project => ({
         id: `goto-project-${project.id}`,
         label: project.name,
-        description: 'Open project canvas',
+        description: 'Open',
         avatarUrl:
           project.avatar_path && appDataDir
             ? convertFileSrc(`${appDataDir}/${project.avatar_path}`)
-            : null,
+            : project.default_avatar_path
+              ? convertProjectFileSrc(project.default_avatar_path)
+              : null,
         avatarFallback: project.name[0]?.toUpperCase() ?? '?',
         group: 'projects',
         keywords: ['project', 'switch', 'open', project.name.toLowerCase()],
@@ -161,7 +163,7 @@ export function CommandPalette() {
         value={search}
         onValueChange={setSearch}
       />
-      <CommandList>
+      <CommandList className="max-h-[70dvh] sm:max-h-[300px]">
         <CommandEmpty>No results found.</CommandEmpty>
 
         {/* Projects group first (near top) */}

@@ -17,6 +17,7 @@ use super::types::{
 use crate::http_server::EmitExt;
 
 use std::collections::HashMap;
+use std::io::Write;
 
 // =============================================================================
 // Response type (same shape as ClaudeResponse)
@@ -49,6 +50,8 @@ struct ChunkEvent {
     session_id: String,
     worktree_id: String,
     content: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    run_id: Option<String>,
 }
 
 #[derive(serde::Serialize, Clone)]
@@ -401,10 +404,12 @@ fn emit_codex_plan_tool_call(
 // App-server param builders
 // =============================================================================
 
-/// Split "gpt-5.4-fast" → ("gpt-5.4", true). Only gpt-5.4-fast is recognised;
-/// older models that happened to end in `-fast` are left unchanged.
-fn split_fast_model(model: &str) -> (&str, bool) {
+/// Split "gpt-5.5-fast" → ("gpt-5.5", true). Fast tier supported on
+/// gpt-5.5 and gpt-5.4 family; older models that happened to end in
+/// `-fast` are left unchanged.
+pub(crate) fn split_fast_model(model: &str) -> (&str, bool) {
     match model {
+        "gpt-5.5-fast" => ("gpt-5.5", true),
         "gpt-5.4-fast" => ("gpt-5.4", true),
         "gpt-5.4-mini-fast" => ("gpt-5.4-mini", true),
         other => (other.strip_suffix("-fast").unwrap_or(other), false),
@@ -441,13 +446,17 @@ pub fn build_thread_start_params(
         }
     }
 
-    // Permission mode mapping
+    // Permission mode mapping.
     //
-    // Always use granular approval policy with mcp_elicitations=false to
+    // Plan mode must never ask the user for permissions. It is read-only, so
+    // any attempted writes or denied commands should fail/decline rather than
+    // surfacing an approval prompt.
+    //
+    // Build mode uses granular approval policy with mcp_elicitations=false to
     // auto-approve MCP elicitation requests (matching Claude Code's behavior).
     // Codex reads MCP config from TOML files directly, so we can't detect
     // whether MCP servers are configured — but setting mcp_elicitations=false
-    // is a no-op when no MCP servers exist, so it's safe to always use it.
+    // is a no-op when no MCP servers exist, so it's safe to use in build mode.
     match execution_mode.unwrap_or("plan") {
         "build" => {
             params["approvalPolicy"] = serde_json::json!({
@@ -466,14 +475,7 @@ pub fn build_thread_start_params(
         }
         // "plan" or default: read-only sandbox
         _ => {
-            params["approvalPolicy"] = serde_json::json!({
-                "granular": {
-                    "mcp_elicitations": false,
-                    "sandbox_approval": true,
-                    "rules": true,
-                    "request_permissions": true,
-                }
-            });
+            params["approvalPolicy"] = serde_json::json!("never");
             params["sandbox"] = serde_json::json!("read-only");
         }
     }
@@ -538,11 +540,19 @@ pub fn build_turn_start_params(
     }
 
     // Sandbox policy — grant read access to add_dirs (pasted files, contexts, etc.)
-    // in ALL modes, and writable roots only in build/yolo modes.
+    // in ALL modes, and writable roots only in build mode.
     // Also include git metadata dirs so worktree commits work (issue #280).
+    // In yolo mode, keep true danger-full-access. A per-turn sandboxPolicy
+    // overrides the thread-level `sandbox`, so using workspaceWrite here would
+    // accidentally re-sandbox yolo turns and break tools such as Playwright on
+    // macOS.
     let mode = execution_mode.unwrap_or("plan");
-    if !add_dirs.is_empty() || !git_writable_roots.is_empty() {
-        let is_writable = mode == "build" || mode == "yolo";
+    if mode == "yolo" {
+        params["sandboxPolicy"] = serde_json::json!({
+            "type": "dangerFullAccess",
+        });
+    } else {
+        let is_writable = mode == "build";
         let writable_roots: Vec<serde_json::Value> = if is_writable {
             let mut roots = vec![serde_json::json!(working_dir.to_string_lossy())];
             for dir in add_dirs {
@@ -573,6 +583,33 @@ pub fn build_turn_start_params(
     );
 
     params
+}
+
+/// Build JSON-RPC params for `turn/steer` — injects user input into a running turn.
+/// The request fails server-side when `expectedTurnId` no longer matches the
+/// active turn (turn ended), which callers treat as a fallback signal.
+pub fn build_turn_steer_params(thread_id: &str, turn_id: &str, text: &str) -> serde_json::Value {
+    build_turn_steer_params_with_input(
+        thread_id,
+        turn_id,
+        vec![serde_json::json!({
+            "type": "text",
+            "text": text,
+            "text_elements": [],
+        })],
+    )
+}
+
+pub fn build_turn_steer_params_with_input(
+    thread_id: &str,
+    turn_id: &str,
+    input: Vec<serde_json::Value>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "threadId": thread_id,
+        "expectedTurnId": turn_id,
+        "input": input,
+    })
 }
 
 // =============================================================================
@@ -700,6 +737,11 @@ pub fn execute_codex_via_server(
         }
     }
 
+    // If user set a `/goal` before the first turn, flush it to the server now
+    // that we have a real thread id. No-op when the session has no buffered
+    // goal or when this is a resume (the server already knows the goal).
+    super::commands::flush_pending_codex_goal(app, session_id, &thread_id);
+
     // Build turn params
     let turn_params = build_turn_start_params(
         &thread_id,
@@ -744,6 +786,8 @@ pub fn execute_codex_via_server(
         is_plan_mode,
         is_build_mode,
         &event_rx,
+        None,
+        None,
     );
     super::decrement_tailer_count();
 
@@ -767,6 +811,273 @@ pub fn execute_codex_via_server(
     Ok(resp)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CodexResumeDisposition {
+    Active,
+    Idle,
+    Failed,
+    Interrupted,
+}
+
+fn codex_thread_status_type(response: &serde_json::Value) -> Option<&str> {
+    response
+        .get("thread")
+        .and_then(|thread| thread.get("status"))
+        .and_then(|status| status.get("type"))
+        .and_then(|value| value.as_str())
+}
+
+fn codex_thread_turns(response: &serde_json::Value) -> Option<&Vec<serde_json::Value>> {
+    response
+        .get("thread")
+        .and_then(|thread| thread.get("turns"))
+        .and_then(|turns| turns.as_array())
+}
+
+fn select_codex_recovery_turn<'a>(
+    response: &'a serde_json::Value,
+    preferred_turn_id: Option<&str>,
+) -> Option<&'a serde_json::Value> {
+    let turns = codex_thread_turns(response)?;
+    if let Some(preferred) = preferred_turn_id.filter(|id| !id.is_empty()) {
+        if let Some(turn) = turns
+            .iter()
+            .find(|turn| turn.get("id").and_then(|value| value.as_str()) == Some(preferred))
+        {
+            return Some(turn);
+        }
+    }
+    turns.last()
+}
+
+fn codex_turn_status(turn: &serde_json::Value) -> Option<&str> {
+    turn.get("status").and_then(|value| value.as_str())
+}
+
+fn classify_codex_resume(
+    response: &serde_json::Value,
+    preferred_turn_id: Option<&str>,
+    had_active_turn: bool,
+) -> CodexResumeDisposition {
+    let thread_status = codex_thread_status_type(response);
+    let turn_status =
+        select_codex_recovery_turn(response, preferred_turn_id).and_then(codex_turn_status);
+
+    match turn_status {
+        Some("failed") => CodexResumeDisposition::Failed,
+        Some("interrupted") => CodexResumeDisposition::Interrupted,
+        Some("inProgress") => CodexResumeDisposition::Active,
+        Some("completed") => CodexResumeDisposition::Idle,
+        _ if had_active_turn && thread_status == Some("active") => CodexResumeDisposition::Active,
+        _ => CodexResumeDisposition::Idle,
+    }
+}
+
+fn codex_turn_error_message(turn: &serde_json::Value) -> Option<String> {
+    let error = turn.get("error")?;
+    error
+        .get("message")
+        .and_then(|value| value.as_str())
+        .or_else(|| error.as_str())
+        .map(ToOwned::to_owned)
+}
+
+fn codex_thread_snapshot_history_lines(
+    response: &serde_json::Value,
+    preferred_turn_id: Option<&str>,
+    include_result_marker: bool,
+) -> Vec<String> {
+    let Some(turn) = select_codex_recovery_turn(response, preferred_turn_id) else {
+        return Vec::new();
+    };
+
+    let mut lines = Vec::new();
+    if let Some(items) = turn.get("items").and_then(|value| value.as_array()) {
+        for item in items {
+            let normalized = normalize_item_types(item);
+            let item_type = normalized
+                .get("type")
+                .and_then(|value| value.as_str())
+                .unwrap_or("");
+
+            // User messages are represented by RunEntry.user_message in Jean.
+            if item_type == "user_message" || item_type == "hook_prompt" {
+                continue;
+            }
+
+            let started = serde_json::json!({
+                "type": "item.started",
+                "item": normalized,
+            });
+            if let Ok(line) = serde_json::to_string(&started) {
+                lines.push(line);
+            }
+
+            let completed = serde_json::json!({
+                "type": "item.completed",
+                "item": normalized,
+            });
+            if let Ok(line) = serde_json::to_string(&completed) {
+                lines.push(line);
+            }
+        }
+    }
+
+    match codex_turn_status(turn) {
+        Some("failed") => {
+            let failed = serde_json::json!({
+                "type": "turn.failed",
+                "error": turn.get("error").cloned().unwrap_or(serde_json::Value::Null),
+            });
+            if let Ok(line) = serde_json::to_string(&failed) {
+                lines.push(line);
+            }
+        }
+        Some("completed") if include_result_marker => {
+            lines.push(r#"{"type":"result"}"#.to_string());
+        }
+        _ => {}
+    }
+
+    lines
+}
+
+fn append_codex_thread_snapshot_to_history_file(
+    output_file: &std::path::Path,
+    response: &serde_json::Value,
+    preferred_turn_id: Option<&str>,
+    include_result_marker: bool,
+) -> Result<(), String> {
+    let lines =
+        codex_thread_snapshot_history_lines(response, preferred_turn_id, include_result_marker);
+    if lines.is_empty() {
+        return Ok(());
+    }
+
+    let existing = std::fs::read_to_string(output_file).unwrap_or_default();
+    let existing_lines: std::collections::HashSet<&str> = existing.lines().map(str::trim).collect();
+
+    // Snapshot items use synthetic `item-N` ids while live-written lines use
+    // real ids (msg_…, rs_…). Collect (type, text, id) of existing text items
+    // so re-snapshotted duplicates of already-written items are skipped.
+    let mut existing_text_items: std::collections::HashMap<(String, String), String> =
+        std::collections::HashMap::new();
+    for line in existing.lines() {
+        let Ok(msg) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        let Some(item) = msg.get("item") else {
+            continue;
+        };
+        let item_type = item.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        if item_type != "agent_message" && item_type != "reasoning" {
+            continue;
+        }
+        let Some(text) = item.get("text").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let id = item.get("id").and_then(|v| v.as_str()).unwrap_or("");
+        existing_text_items
+            .entry((item_type.to_string(), text.to_string()))
+            .or_insert_with(|| id.to_string());
+    }
+    let is_known_text_item = |line: &str| -> bool {
+        let Ok(msg) = serde_json::from_str::<serde_json::Value>(line) else {
+            return false;
+        };
+        let Some(item) = msg.get("item") else {
+            return false;
+        };
+        let item_type = item.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        if item_type != "agent_message" && item_type != "reasoning" {
+            return false;
+        }
+        let Some(text) = item.get("text").and_then(|v| v.as_str()) else {
+            return false;
+        };
+        let id = item.get("id").and_then(|v| v.as_str()).unwrap_or("");
+        match existing_text_items.get(&(item_type.to_string(), text.to_string())) {
+            Some(first_id) => {
+                first_id != id && (first_id.starts_with("item-") || id.starts_with("item-"))
+            }
+            None => false,
+        }
+    };
+
+    let mut writer = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(output_file)
+        .map_err(|e| format!("Failed to open Codex recovery history: {e}"))?;
+
+    for line in lines {
+        if existing_lines.contains(line.as_str()) || is_known_text_item(&line) {
+            continue;
+        }
+        writeln!(writer, "{line}")
+            .map_err(|e| format!("Failed to append Codex recovery history: {e}"))?;
+    }
+    writer
+        .flush()
+        .map_err(|e| format!("Failed to flush Codex recovery history: {e}"))?;
+
+    Ok(())
+}
+
+fn emit_codex_done(app: &tauri::AppHandle, session_id: &str, worktree_id: &str) {
+    let _ = app.emit_all(
+        "chat:done",
+        &DoneEvent {
+            session_id: session_id.to_string(),
+            worktree_id: worktree_id.to_string(),
+            waiting_for_plan: false,
+        },
+    );
+}
+
+fn run_was_explicitly_cancelled(app: &tauri::AppHandle, session_id: &str, run_id: &str) -> bool {
+    super::storage::load_metadata(app, session_id)
+        .ok()
+        .flatten()
+        .and_then(|metadata| {
+            metadata
+                .runs
+                .iter()
+                .find(|run| run.run_id == run_id)
+                .map(|run| run.status == super::types::RunStatus::Cancelled || run.cancelled)
+        })
+        .unwrap_or(false)
+}
+
+fn persist_codex_recovered_completion_state(
+    app: &tauri::AppHandle,
+    session_id: &str,
+    run_id: &str,
+) -> Result<(), String> {
+    let Some(mut metadata) = super::storage::load_metadata(app, session_id)? else {
+        return Ok(());
+    };
+
+    let is_plan_mode = metadata
+        .runs
+        .iter()
+        .find(|run| run.run_id == run_id)
+        .and_then(|run| run.execution_mode.as_deref())
+        == Some("plan");
+
+    if is_plan_mode {
+        metadata.waiting_for_input = true;
+        metadata.waiting_for_input_type = Some("plan".to_string());
+        metadata.is_reviewing = false;
+    } else {
+        metadata.waiting_for_input = false;
+        metadata.waiting_for_input_type = None;
+        metadata.is_reviewing = true;
+    }
+
+    super::storage::save_metadata(app, &metadata)
+}
+
 /// Resume a Codex session after Jean crashed.
 ///
 /// Spawns a new app-server (if needed), calls `thread/resume` to reconnect
@@ -782,18 +1093,34 @@ pub fn resume_codex_after_crash(
     worktree_id: &str,
     run_id: &str,
     thread_id: &str,
-    had_active_turn: bool,
+    codex_turn_id: Option<&str>,
 ) -> Result<bool, String> {
     use super::codex_server;
     use super::run_log::RunLogWriter;
     use super::storage::get_session_dir;
 
+    let had_active_turn = codex_turn_id.is_some();
+
     log::info!(
         "Codex crash recovery: session={session_id}, thread={thread_id}, had_active_turn={had_active_turn}"
     );
 
-    // 1. Ensure the app-server is running
+    // 1. Ensure the app-server is running.
     codex_server::ensure_running(app)?;
+
+    // Register a SessionContext BEFORE calling thread/resume. The server may
+    // start emitting notifications for the resumed thread immediately after
+    // accepting `thread/resume` — if no session is registered yet, those
+    // events get dropped by route_notification. The channel acts as a buffer:
+    // process_turn_events will drain it when we enter the event loop. If the
+    // disposition turns out to be non-Active, we unregister below.
+    let (event_tx, event_rx) = std::sync::mpsc::channel();
+    let ctx = codex_server::SessionContext {
+        session_id: session_id.to_string(),
+        worktree_id: worktree_id.to_string(),
+        event_tx,
+    };
+    codex_server::register_session(thread_id, ctx);
 
     // 2. Call thread/resume to reconnect to the persisted thread
     let resume_params = serde_json::json!({
@@ -807,37 +1134,39 @@ pub fn resume_codex_after_crash(
         Err(e) => {
             // Thread gone/expired — cannot recover
             log::warn!("Codex crash recovery: thread/resume failed for {thread_id}: {e}");
-            codex_server::decrement_usage_count();
-            return Ok(false);
+            codex_server::unregister_session(thread_id);
+            Ok(false)
         }
         Ok(response) => {
             log::trace!("Codex crash recovery: thread/resume succeeded for {thread_id}");
 
-            // Check thread status from response
-            let thread_status = response
-                .get("thread")
-                .and_then(|t| t.get("status"))
-                .and_then(|s| s.as_str())
-                .unwrap_or("unknown");
+            let disposition = classify_codex_resume(&response, codex_turn_id, had_active_turn);
 
-            if had_active_turn && thread_status != "completed" {
+            if disposition == CodexResumeDisposition::Active {
                 // Turn was in-flight when Jean crashed and thread is still active.
-                // Register for events and enter the event loop to stream remaining output.
+                // Session is already registered above; just register the turn for
+                // cancellation tracking and enter the event loop.
                 let session_dir = get_session_dir(app, session_id)?;
                 let output_file = session_dir.join(format!("{run_id}.jsonl"));
 
-                let (event_tx, event_rx) = std::sync::mpsc::channel();
-                let ctx = codex_server::SessionContext {
-                    session_id: session_id.to_string(),
-                    worktree_id: worktree_id.to_string(),
-                    event_tx,
-                };
-                codex_server::register_session(thread_id, ctx);
                 super::registry::register_codex_turn(
                     session_id.to_string(),
                     thread_id.to_string(),
-                    String::new(),
+                    codex_turn_id.unwrap_or_default().to_string(),
                 );
+
+                // Backfill items that completed while Jean was closed. Live
+                // notifications only cover events from reconnect onward; the
+                // resume snapshot holds the earlier ones. Existing lines are
+                // skipped (exact-line dedupe) and the parser upserts by item id.
+                if let Err(e) = append_codex_thread_snapshot_to_history_file(
+                    &output_file,
+                    &response,
+                    codex_turn_id,
+                    false,
+                ) {
+                    log::warn!("Failed to backfill Codex resume snapshot: {e}");
+                }
 
                 // Determine execution mode from run metadata (single load)
                 let exec_mode = super::storage::load_metadata(app, session_id)?.and_then(|m| {
@@ -860,6 +1189,8 @@ pub fn resume_codex_after_crash(
                     is_plan_mode,
                     is_build_mode,
                     &event_rx,
+                    Some(std::time::Duration::from_secs(15)),
+                    codex_turn_id,
                 );
                 super::decrement_tailer_count();
 
@@ -876,8 +1207,31 @@ pub fn resume_codex_after_crash(
                 // Complete the run
                 if let Ok(mut writer) = RunLogWriter::resume(app, session_id, run_id) {
                     let assistant_message_id = uuid::Uuid::new_v4().to_string();
-                    if let Err(e) = writer.complete(&assistant_message_id, None, response.usage) {
+                    if response.error_emitted {
+                        if let Err(e) = writer.crash() {
+                            log::error!(
+                                "Failed to mark Codex run crashed after recovery error: {e}"
+                            );
+                        }
+                    } else if response.cancelled {
+                        if run_was_explicitly_cancelled(app, session_id, run_id) {
+                            if let Err(e) = writer.cancel(Some(&assistant_message_id), None) {
+                                log::error!("Failed to cancel run after Codex crash recovery: {e}");
+                            }
+                        } else if let Err(e) = writer.crash() {
+                            log::error!(
+                                "Recovered Codex turn was interrupted without user cancel; \
+                                 failed to mark run crashed: {e}"
+                            );
+                        }
+                    } else if let Err(e) =
+                        writer.complete(&assistant_message_id, None, response.usage)
+                    {
                         log::error!("Failed to complete run after crash recovery: {e}");
+                    } else if let Err(e) =
+                        persist_codex_recovered_completion_state(app, session_id, run_id)
+                    {
+                        log::error!("Failed to persist Codex recovered completion state: {e}");
                     }
                 }
 
@@ -887,10 +1241,65 @@ pub fn resume_codex_after_crash(
             // Thread is idle — turn completed while Jean was down, or no turn was active.
             // The JSONL file may already have the result from before the crash.
             // Mark the run as completed (the JSONL output is the source of truth).
-            codex_server::decrement_usage_count();
+            // Unregister the placeholder session we set up before thread/resume.
+            codex_server::unregister_session(thread_id);
+            let session_dir = get_session_dir(app, session_id)?;
+            let output_file = session_dir.join(format!("{run_id}.jsonl"));
 
             // Check if the JSONL file has a result line (turn completed before crash)
             let has_result = super::run_log::jsonl_has_result_line(app, session_id, run_id);
+
+            if !has_result {
+                if let Err(e) = append_codex_thread_snapshot_to_history_file(
+                    &output_file,
+                    &response,
+                    codex_turn_id,
+                    disposition == CodexResumeDisposition::Idle,
+                ) {
+                    log::warn!("Failed to append Codex recovery snapshot: {e}");
+                }
+            }
+
+            if disposition == CodexResumeDisposition::Failed {
+                if let Some(turn) = select_codex_recovery_turn(&response, codex_turn_id) {
+                    let raw_error = codex_turn_error_message(turn)
+                        .unwrap_or_else(|| "Unknown Codex error".to_string());
+                    let _ = app.emit_all(
+                        "chat:error",
+                        &ErrorEvent {
+                            session_id: session_id.to_string(),
+                            worktree_id: worktree_id.to_string(),
+                            error: format_codex_user_error(&raw_error),
+                        },
+                    );
+                }
+                if let Ok(mut writer) = RunLogWriter::resume(app, session_id, run_id) {
+                    if let Err(e) = writer.crash() {
+                        log::error!("Failed to mark failed Codex run crashed during recovery: {e}");
+                    }
+                }
+                return Ok(true);
+            }
+
+            if disposition == CodexResumeDisposition::Interrupted {
+                if let Ok(mut writer) = RunLogWriter::resume(app, session_id, run_id) {
+                    let assistant_message_id = uuid::Uuid::new_v4().to_string();
+                    if run_was_explicitly_cancelled(app, session_id, run_id) {
+                        if let Err(e) = writer.cancel(Some(&assistant_message_id), None) {
+                            log::error!(
+                                "Failed to cancel interrupted Codex run during recovery: {e}"
+                            );
+                        }
+                    } else if let Err(e) = writer.crash() {
+                        log::error!(
+                            "Recovered Codex turn was interrupted without user cancel; \
+                             failed to mark run crashed: {e}"
+                        );
+                    }
+                }
+                emit_codex_done(app, session_id, worktree_id);
+                return Ok(true);
+            }
 
             if has_result {
                 log::trace!("Codex crash recovery: run {run_id} already has result in JSONL");
@@ -899,21 +1308,64 @@ pub fn resume_codex_after_crash(
                     let assistant_message_id = uuid::Uuid::new_v4().to_string();
                     if let Err(e) = writer.complete(&assistant_message_id, None, None) {
                         log::error!("Failed to complete run during crash recovery: {e}");
+                    } else if let Err(e) =
+                        persist_codex_recovered_completion_state(app, session_id, run_id)
+                    {
+                        log::error!("Failed to persist Codex recovered completion state: {e}");
                     }
                 }
+                emit_codex_done(app, session_id, worktree_id);
                 return Ok(true);
             }
 
-            // No result in JSONL — turn may have completed on the server side
-            // but events weren't written. Mark as completed with empty content.
+            // No result in JSONL — thread/turn data from app-server was written above.
+            // If the snapshot produced no assistant items AND a turn was in-flight
+            // when Jean died, completing would lie to the user (status=done with an
+            // empty response). Mark the run as crashed instead so the UI can prompt
+            // a resend.
+            let snapshot_has_assistant_content =
+                select_codex_recovery_turn(&response, codex_turn_id)
+                    .and_then(|turn| turn.get("items").and_then(|v| v.as_array()))
+                    .map(|items| {
+                        items.iter().any(|item| {
+                            let normalized = normalize_item_types(item);
+                            let item_type = normalized
+                                .get("type")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("");
+                            item_type != "user_message" && item_type != "hook_prompt"
+                        })
+                    })
+                    .unwrap_or(false);
+
+            if had_active_turn && !snapshot_has_assistant_content {
+                log::warn!(
+                    "Codex crash recovery: thread idle with no assistant items for run {run_id}; marking crashed"
+                );
+                if let Ok(mut writer) = RunLogWriter::resume(app, session_id, run_id) {
+                    if let Err(e) = writer.crash() {
+                        log::error!(
+                            "Failed to mark Codex run crashed during recovery (empty snapshot): {e}"
+                        );
+                    }
+                }
+                emit_codex_done(app, session_id, worktree_id);
+                return Ok(true);
+            }
+
             log::trace!("Codex crash recovery: thread idle, marking run {run_id} as completed");
             if let Ok(mut writer) = RunLogWriter::resume(app, session_id, run_id) {
                 let assistant_message_id = uuid::Uuid::new_v4().to_string();
                 if let Err(e) = writer.complete(&assistant_message_id, None, None) {
                     log::error!("Failed to complete run during crash recovery: {e}");
+                } else if let Err(e) =
+                    persist_codex_recovered_completion_state(app, session_id, run_id)
+                {
+                    log::error!("Failed to persist Codex recovered completion state: {e}");
                 }
             }
-            return Ok(true);
+            emit_codex_done(app, session_id, worktree_id);
+            Ok(true)
         }
     }
 }
@@ -964,6 +1416,8 @@ fn process_turn_events(
     is_plan_mode: bool,
     is_build_mode: bool,
     event_rx: &std::sync::mpsc::Receiver<super::codex_server::ServerEvent>,
+    status_poll_interval: Option<std::time::Duration>,
+    recovery_turn_id: Option<&str>,
 ) -> CodexResponse {
     use super::codex_server::ServerEvent;
     use std::io::Write;
@@ -987,13 +1441,87 @@ fn process_turn_events(
         .ok();
 
     'outer: loop {
-        let event = match event_rx.recv() {
-            Ok(e) => e,
-            Err(_) => {
-                log::warn!("Event channel disconnected for session {session_id}");
-                cancelled = true;
-                break 'outer;
-            }
+        let event = match status_poll_interval {
+            Some(interval) => match event_rx.recv_timeout(interval) {
+                Ok(e) => e,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    let snapshot = super::codex_server::send_request(
+                        "thread/read",
+                        serde_json::json!({
+                            "threadId": thread_id,
+                            "includeTurns": true,
+                        }),
+                    );
+                    match snapshot {
+                        Ok(snapshot) => {
+                            let disposition =
+                                classify_codex_resume(&snapshot, recovery_turn_id, true);
+                            if disposition == CodexResumeDisposition::Active {
+                                continue;
+                            }
+
+                            if let Some(ref mut writer) = output_writer {
+                                let _ = writer.flush();
+                            }
+                            if let Err(e) = append_codex_thread_snapshot_to_history_file(
+                                output_file,
+                                &snapshot,
+                                recovery_turn_id,
+                                false,
+                            ) {
+                                log::warn!("Failed to append Codex snapshot after idle poll: {e}");
+                            }
+
+                            match disposition {
+                                CodexResumeDisposition::Failed => {
+                                    if let Some(turn) =
+                                        select_codex_recovery_turn(&snapshot, recovery_turn_id)
+                                    {
+                                        let raw_error = codex_turn_error_message(turn)
+                                            .unwrap_or_else(|| "Unknown Codex error".to_string());
+                                        let _ = app.emit_all(
+                                            "chat:error",
+                                            &ErrorEvent {
+                                                session_id: session_id.to_string(),
+                                                worktree_id: worktree_id.to_string(),
+                                                error: format_codex_user_error(&raw_error),
+                                            },
+                                        );
+                                    }
+                                    error_emitted = true;
+                                    break 'outer;
+                                }
+                                CodexResumeDisposition::Interrupted => {
+                                    cancelled = true;
+                                    server_interrupted = true;
+                                    break 'outer;
+                                }
+                                CodexResumeDisposition::Idle => {
+                                    break 'outer;
+                                }
+                                CodexResumeDisposition::Active => unreachable!(),
+                            }
+                        }
+                        Err(e) => {
+                            log::warn!("Codex recovery status poll failed: {e}");
+                            continue;
+                        }
+                    }
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    log::warn!("Event channel disconnected for session {session_id}");
+                    cancelled = true;
+                    break 'outer;
+                }
+            },
+            None => match event_rx.recv() {
+                Ok(e) => e,
+                Err(_) => {
+                    log::warn!("Event channel disconnected for session {session_id}");
+                    cancelled = true;
+                    break 'outer;
+                }
+            },
         };
 
         match event {
@@ -1010,6 +1538,7 @@ fn process_turn_events(
                     app,
                     session_id,
                     worktree_id,
+                    run_id,
                     &method,
                     &params,
                     &mut full_content,
@@ -1046,6 +1575,13 @@ fn process_turn_events(
                                 log::warn!("Failed to persist codex_turn_id on run: {e}");
                             }
                         }
+                        // Steer any prompts that were queued before the turn
+                        // became steerable (auto-steer preference, default on).
+                        super::commands::trigger_codex_queue_steer(
+                            app.clone(),
+                            worktree_id.to_string(),
+                            session_id.to_string(),
+                        );
                     }
                 }
             }
@@ -1194,6 +1730,7 @@ fn process_turn_events(
                 worktree_id: worktree_id.to_string(),
                 undo_send: false,
                 emitted_at_ms,
+                run_id: Some(run_id.to_string()),
             },
         );
     }
@@ -1270,6 +1807,14 @@ fn notification_to_history_line(method: &str, params: &serde_json::Value) -> Opt
             let line = serde_json::json!({ "type": "item.completed", "item": normalized });
             return Some(serde_json::to_string(&line).ok()?);
         }
+        "item/fileChange/patchUpdated" => {
+            let line = serde_json::json!({
+                "type": "item.file_change.patch_updated",
+                "item_id": params.get("itemId").cloned().unwrap_or(serde_json::Value::Null),
+                "changes": params.get("changes").cloned().unwrap_or(serde_json::json!([])),
+            });
+            return Some(serde_json::to_string(&line).ok()?);
+        }
         "item/agentMessage/delta" => {
             // Delta events don't have a direct old-format equivalent; skip for history
             return None;
@@ -1299,6 +1844,7 @@ fn process_server_notification(
     app: &tauri::AppHandle,
     session_id: &str,
     worktree_id: &str,
+    run_id: &str,
     method: &str,
     params: &serde_json::Value,
     full_content: &mut String,
@@ -1331,10 +1877,6 @@ fn process_server_notification(
             // Streaming text delta — emit immediately
             if let Some(delta) = params.get("delta").and_then(|v| v.as_str()) {
                 if !delta.is_empty() {
-                    log::debug!(
-                        "[codex-text] delta {}B for session {session_id}",
-                        delta.len()
-                    );
                     full_content.push_str(delta);
                     let _ = app.emit_all(
                         "chat:chunk",
@@ -1342,6 +1884,7 @@ fn process_server_notification(
                             session_id: session_id.to_string(),
                             worktree_id: worktree_id.to_string(),
                             content: delta.to_string(),
+                            run_id: Some(run_id.to_string()),
                         },
                     );
                 }
@@ -1428,6 +1971,7 @@ fn process_server_notification(
                 app,
                 session_id,
                 worktree_id,
+                run_id,
                 &event_msg,
                 event_type,
                 full_content,
@@ -1522,6 +2066,7 @@ fn process_server_notification(
                 app,
                 session_id,
                 worktree_id,
+                run_id,
                 &event_msg,
                 event_type,
                 full_content,
@@ -1532,6 +2077,31 @@ fn process_server_notification(
                 completed,
                 usage,
                 error_emitted,
+            );
+        }
+        "item/fileChange/patchUpdated" => {
+            let item_id = params.get("itemId").and_then(|v| v.as_str()).unwrap_or("");
+            let changes = params
+                .get("changes")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!([]));
+            let tool_id = upsert_file_change_tool_call(
+                tool_calls,
+                content_blocks,
+                pending_tool_ids,
+                item_id,
+                changes.clone(),
+            );
+            let _ = app.emit_all(
+                "chat:tool_use",
+                &ToolUseEvent {
+                    session_id: session_id.to_string(),
+                    worktree_id: worktree_id.to_string(),
+                    id: tool_id,
+                    name: "FileChange".to_string(),
+                    input: changes,
+                    parent_tool_use_id: None,
+                },
             );
         }
         "item/commandExecution/outputDelta" | "item/fileChange/outputDelta" => {
@@ -1574,6 +2144,21 @@ fn process_server_notification(
             *completed = true;
             log::trace!("Codex turn completed for session: {session_id}");
         }
+        "thread/goal/updated" => {
+            let goal = super::commands::extract_codex_goal_objective(params);
+            if let Err(e) =
+                super::commands::persist_codex_goal(app, worktree_id, "", session_id, goal)
+            {
+                log::warn!("Failed to persist codex goal update: {e}");
+            }
+        }
+        "thread/goal/cleared" => {
+            if let Err(e) =
+                super::commands::persist_codex_goal(app, worktree_id, "", session_id, None)
+            {
+                log::warn!("Failed to persist codex goal clear: {e}");
+            }
+        }
         "thread/tokenUsage/updated" => {
             // Extract usage data
             if let Some(token_usage) = params.get("tokenUsage") {
@@ -1592,6 +2177,13 @@ fn process_server_notification(
                         .unwrap_or(0),
                     cache_creation_input_tokens: 0,
                 });
+            }
+        }
+        "account/rateLimits/updated" => {
+            if let Err(e) =
+                crate::codex_cli::update_codex_usage_from_app_server_rate_limits(app, params)
+            {
+                log::warn!("Failed to update Codex usage from rate limits notification: {e}");
             }
         }
         "item/reasoning/textDelta" | "item/reasoning/summaryTextDelta" => {
@@ -1734,6 +2326,20 @@ fn handle_approval_request(
                 .unwrap_or("")
                 .to_string();
 
+            if is_plan_mode {
+                log::trace!("Denying command approval in plan mode (rpc_id={rpc_id}): {command}");
+                if let Err(e) = super::codex_server::send_response(
+                    rpc_id,
+                    serde_json::json!({"decision": "decline"}),
+                ) {
+                    log::error!(
+                        "Failed to deny command approval in plan mode (rpc_id={rpc_id}): {e}"
+                    );
+                    emit_connection_error();
+                }
+                return;
+            }
+
             // Auto-approve embedded/resolved CLI binaries (matches Claude's --allowedTools)
             let gh_binary = crate::gh_cli::config::resolve_gh_binary(app);
             let gh_str = gh_binary.to_string_lossy();
@@ -1789,6 +2395,10 @@ fn handle_approval_request(
                 network_approval_context: params.get("networkApprovalContext").and_then(|value| {
                     serde_json::from_value::<CodexNetworkApprovalContext>(value.clone()).ok()
                 }),
+                additional_permissions: params.get("additionalPermissions").cloned(),
+                available_decisions: params.get("availableDecisions").and_then(|value| {
+                    serde_json::from_value::<Vec<serde_json::Value>>(value.clone()).ok()
+                }),
                 proposed_execpolicy_amendment: params
                     .get("proposedExecpolicyAmendment")
                     .and_then(|value| serde_json::from_value::<Vec<String>>(value.clone()).ok()),
@@ -1809,6 +2419,20 @@ fn handle_approval_request(
             );
         }
         "item/permissions/requestApproval" => {
+            if is_plan_mode {
+                log::trace!("Denying permissions request in plan mode (rpc_id={rpc_id})");
+                if let Err(e) = super::codex_server::send_response(
+                    rpc_id,
+                    serde_json::json!({"permissions": {}, "scope": "turn"}),
+                ) {
+                    log::error!(
+                        "Failed to deny permissions request in plan mode (rpc_id={rpc_id}): {e}"
+                    );
+                    emit_connection_error();
+                }
+                return;
+            }
+
             let request = CodexPermissionRequest {
                 rpc_id,
                 item_id: params
@@ -1820,6 +2444,10 @@ fn handle_approval_request(
                     .get("permissions")
                     .cloned()
                     .unwrap_or(serde_json::Value::Null),
+                cwd: params
+                    .get("cwd")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string()),
                 reason: params
                     .get("reason")
                     .and_then(|v| v.as_str())
@@ -1887,6 +2515,10 @@ fn handle_approval_request(
                     .and_then(|v| v.as_str())
                     .unwrap_or_default()
                     .to_string(),
+                namespace: params
+                    .get("namespace")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string()),
                 tool: params
                     .get("tool")
                     .and_then(|v| v.as_str())
@@ -1905,6 +2537,77 @@ fn handle_approval_request(
                     request,
                 },
             );
+        }
+        "account/chatgptAuthTokens/refresh" => {
+            let previous_account_id = params
+                .get("previousAccountId")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            let app = app.clone();
+            let session_id = session_id.to_string();
+            let worktree_id = worktree_id.to_string();
+            tauri::async_runtime::spawn(async move {
+                match crate::codex_cli::refresh_codex_app_server_auth_tokens(
+                    app.clone(),
+                    previous_account_id,
+                )
+                .await
+                {
+                    Ok(tokens) => {
+                        let payload = match serde_json::to_value(tokens) {
+                            Ok(payload) => payload,
+                            Err(e) => {
+                                let error =
+                                    format!("Failed to serialize Codex auth refresh response: {e}");
+                                log::error!("{error}");
+                                if let Err(send_err) =
+                                    super::codex_server::send_error_response(rpc_id, -32000, &error)
+                                {
+                                    log::error!(
+                                        "Failed to send Codex auth refresh serialization error \
+                                         (rpc_id={rpc_id}): {send_err}"
+                                    );
+                                }
+                                return;
+                            }
+                        };
+                        if let Err(e) = super::codex_server::send_response(rpc_id, payload) {
+                            log::error!(
+                                "Failed to send Codex auth refresh response (rpc_id={rpc_id}): {e}"
+                            );
+                        }
+                    }
+                    Err(error) => {
+                        log::error!("Codex auth refresh request failed (rpc_id={rpc_id}): {error}");
+                        let _ = app.emit_all(
+                            "chat:error",
+                            &ErrorEvent {
+                                session_id,
+                                worktree_id,
+                                error: error.clone(),
+                            },
+                        );
+                        if let Err(e) =
+                            super::codex_server::send_error_response(rpc_id, -32000, &error)
+                        {
+                            log::error!(
+                                "Failed to send Codex auth refresh error (rpc_id={rpc_id}): {e}"
+                            );
+                        }
+                    }
+                }
+            });
+        }
+        "applyPatchApproval" | "execCommandApproval" => {
+            let error = format!(
+                "Deprecated Codex server request {method} is unsupported by Jean's current \
+                 app-server flow."
+            );
+            log::warn!("{error}");
+            if let Err(e) = super::codex_server::send_error_response(rpc_id, -32601, &error) {
+                log::error!("Failed to reject deprecated Codex request (rpc_id={rpc_id}): {e}");
+                emit_connection_error();
+            }
         }
         _ => {
             let error = format!("Unsupported Codex server request: {method}. Please update Jean.");
@@ -1959,12 +2662,48 @@ fn format_codex_user_error(error_msg: &str) -> String {
     }
 }
 
+fn upsert_file_change_tool_call(
+    tool_calls: &mut Vec<ToolCall>,
+    content_blocks: &mut Vec<ContentBlock>,
+    pending_tool_ids: &mut HashMap<String, String>,
+    item_id: &str,
+    changes: serde_json::Value,
+) -> String {
+    let tool_id = if item_id.is_empty() {
+        uuid::Uuid::new_v4().to_string()
+    } else {
+        item_id.to_string()
+    };
+
+    if let Some(tool) = tool_calls.iter_mut().find(|tool| tool.id == tool_id) {
+        tool.input = changes;
+    } else {
+        tool_calls.push(ToolCall {
+            id: tool_id.clone(),
+            name: "FileChange".to_string(),
+            input: changes,
+            output: None,
+            parent_tool_use_id: None,
+        });
+        content_blocks.push(ContentBlock::ToolUse {
+            tool_call_id: tool_id.clone(),
+        });
+    }
+
+    if !item_id.is_empty() {
+        pending_tool_ids.insert(item_id.to_string(), tool_id.clone());
+    }
+
+    tool_id
+}
+
 /// Process a single Codex JSONL event. Shared between attached and detached tailers.
 #[allow(clippy::too_many_arguments)]
 fn process_codex_event(
     app: &tauri::AppHandle,
     session_id: &str,
     worktree_id: &str,
+    run_id: &str,
     msg: &serde_json::Value,
     event_type: &str,
     full_content: &mut String,
@@ -2031,28 +2770,17 @@ fn process_codex_event(
                     );
                 }
                 "file_change" => {
-                    let tool_id = if item_id.is_empty() {
-                        uuid::Uuid::new_v4().to_string()
-                    } else {
-                        item_id.to_string()
-                    };
                     let changes = item
                         .get("changes")
                         .cloned()
-                        .unwrap_or(serde_json::Value::Null);
-                    tool_calls.push(ToolCall {
-                        id: tool_id.clone(),
-                        name: "FileChange".to_string(),
-                        input: changes.clone(),
-                        output: None,
-                        parent_tool_use_id: None,
-                    });
-                    content_blocks.push(ContentBlock::ToolUse {
-                        tool_call_id: tool_id.clone(),
-                    });
-                    if !item_id.is_empty() {
-                        pending_tool_ids.insert(item_id.to_string(), tool_id.clone());
-                    }
+                        .unwrap_or_else(|| serde_json::json!([]));
+                    let tool_id = upsert_file_change_tool_call(
+                        tool_calls,
+                        content_blocks,
+                        pending_tool_ids,
+                        item_id,
+                        changes.clone(),
+                    );
                     let _ = app.emit_all(
                         "chat:tool_use",
                         &ToolUseEvent {
@@ -2363,6 +3091,7 @@ fn process_codex_event(
                                         session_id: session_id.to_string(),
                                         worktree_id: worktree_id.to_string(),
                                         content: text.to_string(),
+                                        run_id: Some(run_id.to_string()),
                                     },
                                 );
                             }
@@ -2685,6 +3414,74 @@ fn process_codex_event(
 // JSONL history parser (for loading saved sessions)
 // =============================================================================
 
+/// Return true when a persisted Codex run log contains anything that should
+/// render as assistant-side output, even if the run was cancelled before
+/// metadata received a final assistant_message_id.
+pub(crate) fn codex_run_log_has_visible_assistant_artifacts(
+    lines: &[String],
+    is_plan_mode: bool,
+) -> bool {
+    for line in lines {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+
+        let Ok(msg) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+
+        if msg
+            .get("_run_meta")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false)
+        {
+            continue;
+        }
+
+        match msg
+            .get("type")
+            .and_then(|value| value.as_str())
+            .unwrap_or("")
+        {
+            "turn.plan_updated" | "item.plan.delta" if is_plan_mode => return true,
+            "turn.completed" => {
+                if msg
+                    .get("output")
+                    .and_then(extract_text_from_turn_output)
+                    .is_some_and(|text| !text.trim().is_empty())
+                {
+                    return true;
+                }
+            }
+            "item.started" | "item.completed" => {
+                let item = msg.get("item").unwrap_or(&serde_json::Value::Null);
+                let item_type = item
+                    .get("type")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("");
+                match item_type {
+                    "agent_message" => {
+                        if extract_agent_message_text(item)
+                            .is_some_and(|text| !text.trim().is_empty())
+                        {
+                            return true;
+                        }
+                    }
+                    "plan" if is_plan_mode => return true,
+                    "command_execution" | "file_change" | "mcp_tool_call" | "collab_tool_call"
+                    | "todo_list" | "web_search" | "image_generation" | "image_view"
+                    | "context_compaction" | "dynamic_tool_call" => return true,
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+    }
+
+    false
+}
+
 /// Parse stored Codex JSONL into a ChatMessage (for loading history).
 ///
 /// Maps Codex events to the same ChatMessage format used by Claude sessions.
@@ -2702,6 +3499,25 @@ pub fn parse_codex_run_to_message(
     let mut content_blocks: Vec<ContentBlock> = Vec::new();
     let mut pending_tool_ids: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
+    // Crash-recovery snapshots renumber agent_message/reasoning items to
+    // synthetic `item-N` ids while live notifications use real ids (msg_…,
+    // rs_…). Track (type, text) → first id so the same item appended under
+    // both id schemes renders once. Two REAL ids with identical text are
+    // kept (legitimate repeated model output).
+    let mut seen_text_items: std::collections::HashMap<(&'static str, String), String> =
+        std::collections::HashMap::new();
+    let mut is_duplicate_text_item = |kind: &'static str, text: &str, item_id: &str| -> bool {
+        match seen_text_items.entry((kind, text.to_string())) {
+            std::collections::hash_map::Entry::Vacant(e) => {
+                e.insert(item_id.to_string());
+                false
+            }
+            std::collections::hash_map::Entry::Occupied(e) => {
+                let first_id = e.get();
+                first_id == item_id || first_id.starts_with("item-") || item_id.starts_with("item-")
+            }
+        }
+    };
 
     for line in lines {
         if line.trim().is_empty() {
@@ -2724,6 +3540,16 @@ pub fn parse_codex_run_to_message(
         let event_type = msg.get("type").and_then(|v| v.as_str()).unwrap_or("");
 
         match event_type {
+            // User text injected mid-turn via `turn/steer` (written by steer_codex_turn).
+            // Codex's own userMessage items are filtered (unordered duplicates) —
+            // this explicit line is the single source of truth for transcript order.
+            "steered_user_message" => {
+                if let Some(text) = msg.get("text").and_then(|v| v.as_str()) {
+                    content_blocks.push(ContentBlock::UserInput {
+                        text: text.to_string(),
+                    });
+                }
+            }
             "turn.plan_updated" => {
                 if !is_plan_mode {
                     continue;
@@ -2822,26 +3648,14 @@ pub fn parse_codex_run_to_message(
                         let changes = item
                             .get("changes")
                             .cloned()
-                            .unwrap_or(serde_json::Value::Null);
-                        let tool_id = if item_id.is_empty() {
-                            Uuid::new_v4().to_string()
-                        } else {
-                            item_id.to_string()
-                        };
-
-                        tool_calls.push(ToolCall {
-                            id: tool_id.clone(),
-                            name: "FileChange".to_string(),
-                            input: changes,
-                            output: None,
-                            parent_tool_use_id: None,
-                        });
-                        content_blocks.push(ContentBlock::ToolUse {
-                            tool_call_id: tool_id.clone(),
-                        });
-                        if !item_id.is_empty() {
-                            pending_tool_ids.insert(item_id.to_string(), tool_id);
-                        }
+                            .unwrap_or_else(|| serde_json::json!([]));
+                        upsert_file_change_tool_call(
+                            &mut tool_calls,
+                            &mut content_blocks,
+                            &mut pending_tool_ids,
+                            item_id,
+                            changes,
+                        );
                     }
                     "mcp_tool_call" => {
                         let server = item
@@ -2926,6 +3740,20 @@ pub fn parse_codex_run_to_message(
                     _ => {}
                 }
             }
+            "item.file_change.patch_updated" => {
+                let item_id = msg.get("item_id").and_then(|v| v.as_str()).unwrap_or("");
+                let changes = msg
+                    .get("changes")
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::json!([]));
+                upsert_file_change_tool_call(
+                    &mut tool_calls,
+                    &mut content_blocks,
+                    &mut pending_tool_ids,
+                    item_id,
+                    changes,
+                );
+            }
             "item.completed" => {
                 let item = msg.get("item").unwrap_or(&serde_json::Value::Null);
                 let item_type = item.get("type").and_then(|v| v.as_str()).unwrap_or("");
@@ -2967,6 +3795,9 @@ pub fn parse_codex_run_to_message(
                     "agent_message" => {
                         if let Some(text) = extract_agent_message_text(item) {
                             if run.cancelled && content == text {
+                                continue;
+                            }
+                            if is_duplicate_text_item("agent_message", &text, item_id) {
                                 continue;
                             }
                             content.push_str(&text);
@@ -3023,6 +3854,9 @@ pub fn parse_codex_run_to_message(
                     }
                     "reasoning" => {
                         if let Some(text) = item.get("text").and_then(|v| v.as_str()) {
+                            if is_duplicate_text_item("reasoning", text, item_id) {
+                                continue;
+                            }
                             content_blocks.push(ContentBlock::Thinking {
                                 thinking: text.to_string(),
                             });
@@ -3186,7 +4020,7 @@ pub fn parse_codex_run_to_message(
 /// Execute a one-shot Codex CLI call with `--output-schema` for structured JSON output.
 ///
 /// Equivalent to Claude's `--json-schema` pattern but for Codex:
-///   `codex exec --json --model <model> --full-auto --output-schema <schema> -`
+///   `codex exec --json --model <model> --sandbox workspace-write --output-schema <schema> -`
 ///
 /// Returns the raw JSON string of the structured output.
 pub fn execute_one_shot_codex(
@@ -3197,9 +4031,9 @@ pub fn execute_one_shot_codex(
     working_dir: Option<&std::path::Path>,
     reasoning_effort: Option<&str>,
 ) -> Result<String, String> {
-    let cli_path = crate::codex_cli::resolve_cli_binary(app);
+    let cli_path = crate::codex_cli::resolve_cli_binary(app)?;
 
-    if !cli_path.exists() {
+    if !crate::platform::resolved_cli_exists(&cli_path) {
         return Err("Codex CLI not installed".to_string());
     }
 
@@ -3218,27 +4052,37 @@ pub fn execute_one_shot_codex(
     std::fs::write(&schema_file, output_schema)
         .map_err(|e| format!("Failed to write schema file: {e}"))?;
 
-    let mut cmd = crate::platform::silent_command(&cli_path);
-    cmd.args(["exec", "--json", "--model", actual_model, "--full-auto"]);
-    if is_fast {
-        cmd.args(["-c", "service_tier=\"fast\""]);
-    }
-    cmd.arg("--output-schema");
-    cmd.arg(&schema_file);
-    if let Some(dir) = working_dir {
-        cmd.arg("--cd");
-        cmd.arg(dir);
+    let wsl = crate::platform::get_wsl_config();
+    let schema_arg = if cfg!(windows) && wsl.enabled {
+        std::path::PathBuf::from(crate::platform::win_to_wsl_path(
+            &schema_file.to_string_lossy(),
+        ))
     } else {
-        // One-shot calls that don't know a repository path should still run.
-        cmd.arg("--skip-git-repo-check");
-    }
-    cmd.arg("-"); // Read prompt from stdin
+        schema_file.clone()
+    };
+    let working_dir_arg = working_dir.map(|dir| {
+        if cfg!(windows) && wsl.enabled {
+            std::path::PathBuf::from(crate::platform::win_to_wsl_path(&dir.to_string_lossy()))
+        } else {
+            dir.to_path_buf()
+        }
+    });
+
+    let mut cmd = crate::platform::resolved_cli_command(&cli_path, working_dir);
+    cmd.args(build_one_shot_codex_args(
+        actual_model,
+        is_fast,
+        &schema_arg,
+        working_dir_arg.as_deref(),
+    ));
     cmd.stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
 
-    if let Some(dir) = working_dir {
-        cmd.current_dir(dir);
+    if !wsl.enabled {
+        if let Some(dir) = working_dir {
+            cmd.current_dir(dir);
+        }
     }
 
     let mut child = cmd
@@ -3338,10 +4182,329 @@ pub fn execute_one_shot_codex(
     extract_codex_structured_output(&stdout)
 }
 
+fn build_one_shot_codex_args(
+    actual_model: &str,
+    is_fast: bool,
+    schema_file: &std::path::Path,
+    working_dir: Option<&std::path::Path>,
+) -> Vec<std::ffi::OsString> {
+    let mut args = vec![
+        "exec".into(),
+        "--json".into(),
+        "--model".into(),
+        actual_model.into(),
+        "--sandbox".into(),
+        "workspace-write".into(),
+        "--output-schema".into(),
+        schema_file.as_os_str().to_os_string(),
+    ];
+    if is_fast {
+        args.push("-c".into());
+        args.push("service_tier=\"fast\"".into());
+    }
+    if let Some(dir) = working_dir {
+        args.push("--cd".into());
+        args.push(dir.as_os_str().to_os_string());
+    } else {
+        // One-shot calls that don't know a repository path should still run.
+        args.push("--skip-git-repo-check".into());
+    }
+    args.push("-".into());
+    args
+}
+
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
     use crate::chat::types::{RunEntry, RunStatus};
+
+    #[test]
+    fn classify_codex_resume_reads_thread_status_object() {
+        let response = serde_json::json!({
+            "thread": {
+                "status": { "type": "active" },
+                "turns": [
+                    { "id": "turn-1", "status": "inProgress" }
+                ]
+            }
+        });
+
+        assert_eq!(
+            classify_codex_resume(&response, Some("turn-1"), true),
+            CodexResumeDisposition::Active
+        );
+    }
+
+    #[test]
+    fn classify_codex_resume_completed_turn_is_idle() {
+        let response = serde_json::json!({
+            "thread": {
+                "status": { "type": "idle" },
+                "turns": [
+                    { "id": "turn-1", "status": "completed" }
+                ]
+            }
+        });
+
+        assert_eq!(
+            classify_codex_resume(&response, Some("turn-1"), true),
+            CodexResumeDisposition::Idle
+        );
+    }
+
+    #[test]
+    fn classify_codex_resume_prefers_persisted_turn_status() {
+        let response = serde_json::json!({
+            "thread": {
+                "status": { "type": "active" },
+                "turns": [
+                    { "id": "old-turn", "status": "completed" },
+                    { "id": "new-turn", "status": "inProgress" }
+                ]
+            }
+        });
+
+        assert_eq!(
+            classify_codex_resume(&response, Some("old-turn"), true),
+            CodexResumeDisposition::Idle
+        );
+    }
+
+    #[test]
+    fn classify_codex_resume_detects_failed_and_interrupted_turns() {
+        let failed = serde_json::json!({
+            "thread": {
+                "status": { "type": "idle" },
+                "turns": [
+                    { "id": "turn-1", "status": "failed" }
+                ]
+            }
+        });
+        let interrupted = serde_json::json!({
+            "thread": {
+                "status": { "type": "idle" },
+                "turns": [
+                    { "id": "turn-1", "status": "interrupted" }
+                ]
+            }
+        });
+
+        assert_eq!(
+            classify_codex_resume(&failed, Some("turn-1"), true),
+            CodexResumeDisposition::Failed
+        );
+        assert_eq!(
+            classify_codex_resume(&interrupted, Some("turn-1"), true),
+            CodexResumeDisposition::Interrupted
+        );
+    }
+
+    #[test]
+    fn parse_codex_run_updates_file_change_from_patch_updated() {
+        let run = test_run_entry();
+        let lines = vec![
+            r#"{"type":"item.started","item":{"id":"fc-1","type":"file_change","changes":[]}}"#.to_string(),
+            r#"{"type":"item.file_change.patch_updated","item_id":"fc-1","changes":[{"path":"src/lib.rs","kind":{"type":"update"},"diff":"@@ -1 +1 @@\n-old\n+new\n"}]}"#.to_string(),
+        ];
+
+        let msg = parse_codex_run_to_message(&lines, &run).expect("parse");
+        let file_change = msg
+            .tool_calls
+            .iter()
+            .find(|tool| tool.name == "FileChange")
+            .expect("file change tool");
+
+        assert_eq!(file_change.input[0]["path"], "src/lib.rs");
+        assert!(file_change.input[0]["diff"]
+            .as_str()
+            .expect("diff")
+            .contains("+new"));
+    }
+
+    #[test]
+    fn codex_thread_snapshot_history_lines_normalizes_and_skips_user_items() {
+        let response = serde_json::json!({
+            "thread": {
+                "status": { "type": "idle" },
+                "turns": [
+                    {
+                        "id": "turn-1",
+                        "status": "completed",
+                        "items": [
+                            {
+                                "id": "user-1",
+                                "type": "userMessage",
+                                "text": "prompt"
+                            },
+                            {
+                                "id": "cmd-1",
+                                "type": "commandExecution",
+                                "command": "rtk git status",
+                                "aggregatedOutput": "clean"
+                            },
+                            {
+                                "id": "msg-1",
+                                "type": "agentMessage",
+                                "text": "done"
+                            }
+                        ]
+                    }
+                ]
+            }
+        });
+
+        let lines = codex_thread_snapshot_history_lines(&response, Some("turn-1"), true);
+        assert_eq!(lines.len(), 5);
+        assert!(lines.iter().all(|line| !line.contains("userMessage")));
+        assert_eq!(
+            lines.last().map(String::as_str),
+            Some(r#"{"type":"result"}"#)
+        );
+
+        let first: serde_json::Value = serde_json::from_str(&lines[0]).expect("json line");
+        assert_eq!(first["type"], "item.started");
+        assert_eq!(first["item"]["type"], "command_execution");
+        assert_eq!(first["item"]["aggregated_output"], "clean");
+
+        let agent: serde_json::Value = serde_json::from_str(&lines[3]).expect("json line");
+        assert_eq!(agent["type"], "item.completed");
+        assert_eq!(agent["item"]["type"], "agent_message");
+        assert_eq!(agent["item"]["text"], "done");
+    }
+
+    fn test_run_entry() -> RunEntry {
+        serde_json::from_value(serde_json::json!({
+            "run_id": "run-1",
+            "user_message_id": "u1",
+            "user_message": "hi",
+            "started_at": 0,
+            "status": "completed"
+        }))
+        .expect("test RunEntry")
+    }
+
+    #[test]
+    fn parse_codex_run_dedupes_snapshot_and_live_ids_for_same_text() {
+        // Live notifications use real ids (msg_…); crash-recovery snapshots
+        // renumber the same items to synthetic item-N ids. The parser must
+        // render the item once.
+        let run = test_run_entry();
+        let lines = vec![
+            r#"{"type":"item.completed","item":{"id":"msg_abc","type":"agent_message","text":"Hello"}}"#.to_string(),
+            r#"{"type":"item.completed","item":{"id":"item-2","type":"agent_message","text":"Hello"}}"#.to_string(),
+            r#"{"type":"item.completed","item":{"id":"rs_abc","type":"reasoning","text":"thinking…"}}"#.to_string(),
+            r#"{"type":"item.completed","item":{"id":"item-1","type":"reasoning","text":"thinking…"}}"#.to_string(),
+        ];
+
+        let msg = parse_codex_run_to_message(&lines, &run).expect("parse");
+        assert_eq!(msg.content, "Hello");
+        let text_blocks = msg
+            .content_blocks
+            .iter()
+            .filter(|b| matches!(b, ContentBlock::Text { .. }))
+            .count();
+        let thinking_blocks = msg
+            .content_blocks
+            .iter()
+            .filter(|b| matches!(b, ContentBlock::Thinking { .. }))
+            .count();
+        assert_eq!(text_blocks, 1);
+        assert_eq!(thinking_blocks, 1);
+    }
+
+    #[test]
+    fn parse_codex_run_keeps_repeated_text_from_distinct_real_ids() {
+        let run = test_run_entry();
+        let lines = vec![
+            r#"{"type":"item.completed","item":{"id":"msg_a","type":"agent_message","text":"Done."}}"#.to_string(),
+            r#"{"type":"item.completed","item":{"id":"msg_b","type":"agent_message","text":"Done."}}"#.to_string(),
+        ];
+
+        let msg = parse_codex_run_to_message(&lines, &run).expect("parse");
+        assert_eq!(msg.content, "Done.Done.");
+    }
+
+    #[test]
+    fn snapshot_append_skips_text_items_already_written_under_live_ids() {
+        let tmp = tempfile::tempdir().unwrap();
+        let output_file = tmp.path().join("run.jsonl");
+        std::fs::write(
+            &output_file,
+            concat!(
+                r#"{"type":"item.completed","item":{"id":"msg_abc","type":"agent_message","text":"Hello"}}"#,
+                "\n"
+            ),
+        )
+        .unwrap();
+
+        let response = serde_json::json!({
+            "thread": {
+                "status": { "type": "active" },
+                "turns": [
+                    {
+                        "id": "turn-1",
+                        "status": "inProgress",
+                        "items": [
+                            { "id": "item-2", "type": "agentMessage", "text": "Hello" },
+                            { "id": "item-3", "type": "agentMessage", "text": "New content" }
+                        ]
+                    }
+                ]
+            }
+        });
+
+        append_codex_thread_snapshot_to_history_file(
+            &output_file,
+            &response,
+            Some("turn-1"),
+            false,
+        )
+        .expect("append");
+
+        let contents = std::fs::read_to_string(&output_file).unwrap();
+        assert_eq!(
+            contents.matches("\"text\":\"Hello\"").count(),
+            1,
+            "duplicate snapshot of live-written item must be skipped: {contents}"
+        );
+        assert!(contents.contains("New content"));
+    }
+
+    #[test]
+    fn snapshot_history_lines_match_live_notification_lines_byte_for_byte() {
+        // The resume backfill relies on exact-line dedupe between snapshot
+        // lines (thread/resume) and live lines (item/completed notifications).
+        // Both must serialize identically for the same item.
+        let item = serde_json::json!({
+            "id": "msg-1",
+            "type": "agentMessage",
+            "text": "done"
+        });
+
+        let live_params = serde_json::json!({ "item": item });
+        let live_line = notification_to_history_line("item/completed", &live_params)
+            .expect("live history line");
+
+        let response = serde_json::json!({
+            "thread": {
+                "status": { "type": "active" },
+                "turns": [
+                    {
+                        "id": "turn-1",
+                        "status": "inProgress",
+                        "items": [item]
+                    }
+                ]
+            }
+        });
+        let snapshot_lines = codex_thread_snapshot_history_lines(&response, Some("turn-1"), false);
+
+        assert!(
+            snapshot_lines.contains(&live_line),
+            "snapshot lines {snapshot_lines:?} must contain live line {live_line}"
+        );
+    }
 
     #[test]
     fn gpt_5_4_fast_enables_fast_service_tier() {
@@ -3356,6 +4519,26 @@ mod tests {
         );
         assert_eq!(params["model"], "gpt-5.4");
         assert_eq!(params["serviceTier"], "fast");
+    }
+
+    #[test]
+    fn gpt_5_5_fast_enables_fast_service_tier() {
+        let params = build_thread_start_params(
+            std::path::Path::new("/tmp"),
+            Some("gpt-5.5-fast"),
+            Some("plan"),
+            false,
+            None,
+            false,
+            None,
+        );
+        assert_eq!(params["model"], "gpt-5.5");
+        assert_eq!(params["serviceTier"], "fast");
+    }
+
+    #[test]
+    fn split_fast_model_recognises_gpt_5_5_fast() {
+        assert_eq!(split_fast_model("gpt-5.5-fast"), ("gpt-5.5", true));
     }
 
     #[test]
@@ -3382,6 +4565,34 @@ mod tests {
         assert_eq!(split_fast_model("gpt-5.4"), ("gpt-5.4", false));
         assert_eq!(split_fast_model("gpt-5.4-mini"), ("gpt-5.4-mini", false));
         assert_eq!(split_fast_model("o3"), ("o3", false));
+    }
+
+    #[test]
+    fn one_shot_codex_args_use_workspace_write_sandbox() {
+        let schema_file = std::path::Path::new("/tmp/jean-codex-schema.json");
+        let working_dir = std::path::Path::new("/tmp/project");
+
+        let args = build_one_shot_codex_args("gpt-5.4", false, schema_file, Some(working_dir));
+
+        assert!(args.windows(2).any(|window| {
+            window
+                == [
+                    std::ffi::OsString::from("--sandbox"),
+                    std::ffi::OsString::from("workspace-write"),
+                ]
+        }));
+        assert!(!args
+            .iter()
+            .any(|arg| arg == &std::ffi::OsString::from("--full-auto")));
+        let output_schema_position = args
+            .iter()
+            .position(|arg| arg == "--output-schema")
+            .expect("--output-schema arg is present");
+        assert_eq!(
+            args.get(output_schema_position + 1),
+            Some(&schema_file.as_os_str().to_os_string()),
+            "schema path must immediately follow --output-schema"
+        );
     }
 
     #[test]
@@ -3418,7 +4629,7 @@ mod tests {
     }
 
     #[test]
-    fn plan_mode_uses_granular_approval_policy() {
+    fn plan_mode_uses_never_approval_policy_and_read_only_sandbox() {
         let params = build_thread_start_params(
             std::path::Path::new("/tmp"),
             Some("gpt-5.4"),
@@ -3428,11 +4639,46 @@ mod tests {
             false,
             None,
         );
-        let policy = &params["approvalPolicy"]["granular"];
-        assert_eq!(policy["mcp_elicitations"], false);
-        assert_eq!(policy["sandbox_approval"], true);
-        assert_eq!(policy["rules"], true);
-        assert_eq!(policy["request_permissions"], true);
+        assert_eq!(params["approvalPolicy"], "never");
+        assert_eq!(params["sandbox"], "read-only");
+    }
+
+    #[test]
+    fn plan_turn_always_uses_read_only_sandbox_policy() {
+        let params = build_turn_start_params(
+            "thread-1",
+            "hello",
+            std::path::Path::new("/tmp/worktree"),
+            Some("plan"),
+            None,
+            &[],
+            &[],
+        );
+        let policy = &params["sandboxPolicy"];
+        assert_eq!(policy["type"], "readOnly");
+        assert_eq!(policy["writableRoots"].as_array().unwrap().len(), 0);
+        assert_eq!(policy["readOnlyAccess"]["type"], "fullAccess");
+        assert_eq!(policy["networkAccess"], true);
+    }
+
+    #[test]
+    fn build_turn_uses_workspace_write_sandbox_policy() {
+        let params = build_turn_start_params(
+            "thread-1",
+            "hello",
+            std::path::Path::new("/tmp/worktree"),
+            Some("build"),
+            None,
+            &["/tmp/context".to_string()],
+            &["/tmp/git".to_string()],
+        );
+        let policy = &params["sandboxPolicy"];
+        assert_eq!(policy["type"], "workspaceWrite");
+        assert_eq!(
+            policy["writableRoots"],
+            serde_json::json!(["/tmp/worktree", "/tmp/context", "/tmp/git"])
+        );
+        assert_eq!(policy["readOnlyAccess"]["type"], "fullAccess");
     }
 
     #[test]
@@ -3447,6 +4693,36 @@ mod tests {
             None,
         );
         assert_eq!(params["approvalPolicy"], "never");
+    }
+
+    #[test]
+    fn yolo_turn_uses_danger_full_access_even_with_writable_roots() {
+        let params = build_turn_start_params(
+            "thread-1",
+            "prompt",
+            std::path::Path::new("/repo/worktree"),
+            Some("yolo"),
+            None,
+            &[],
+            &["/repo/.git/worktrees/worktree".to_string()],
+        );
+
+        assert_eq!(params["sandboxPolicy"]["type"], "dangerFullAccess");
+    }
+
+    #[test]
+    fn yolo_turn_uses_danger_full_access_without_writable_roots() {
+        let params = build_turn_start_params(
+            "thread-1",
+            "prompt",
+            std::path::Path::new("/repo/worktree"),
+            Some("yolo"),
+            None,
+            &[],
+            &[],
+        );
+
+        assert_eq!(params["sandboxPolicy"]["type"], "dangerFullAccess");
     }
 
     #[test]
@@ -3465,6 +4741,8 @@ mod tests {
             execution_mode: Some("plan".to_string()),
             thinking_level: None,
             effort_level: None,
+            backend: None,
+            custom_profile_name: None,
             started_at: 1,
             ended_at: Some(2),
             status: RunStatus::Cancelled,
@@ -3477,6 +4755,7 @@ mod tests {
             codex_thread_id: None,
             codex_turn_id: None,
             cursor_chat_id: None,
+            grok_session_id: None,
         };
 
         let message = parse_codex_run_to_message(&lines, &run).expect("message");
@@ -3487,6 +4766,71 @@ mod tests {
             message.content_blocks.first(),
             Some(ContentBlock::Text { text }) if text == "Same text"
         ));
+    }
+
+    #[test]
+    fn build_turn_steer_params_shape() {
+        let params = build_turn_steer_params("thread-1", "turn-1", "do this next");
+
+        assert_eq!(params["threadId"], "thread-1");
+        assert_eq!(params["expectedTurnId"], "turn-1");
+        let input = params["input"].as_array().expect("input array");
+        assert_eq!(input.len(), 1);
+        assert_eq!(input[0]["type"], "text");
+        assert_eq!(input[0]["text"], "do this next");
+    }
+
+    #[test]
+    fn parse_run_orders_steered_user_message_between_items() {
+        let lines = vec![
+            r#"{"type":"item.completed","item":{"type":"agent_message","text":"Before steer"}}"#
+                .to_string(),
+            r#"{"type":"steered_user_message","text":"also check tests"}"#.to_string(),
+            r#"{"type":"item.completed","item":{"type":"agent_message","text":"After steer"}}"#
+                .to_string(),
+        ];
+        let run = RunEntry {
+            run_id: "run-3".to_string(),
+            user_message_id: "user-3".to_string(),
+            user_message: "prompt".to_string(),
+            model: None,
+            execution_mode: Some("build".to_string()),
+            thinking_level: None,
+            effort_level: None,
+            backend: None,
+            custom_profile_name: None,
+            started_at: 1,
+            ended_at: Some(2),
+            status: RunStatus::Completed,
+            assistant_message_id: Some("assistant-3".to_string()),
+            cancelled: false,
+            recovered: false,
+            claude_session_id: None,
+            pid: None,
+            usage: None,
+            codex_thread_id: None,
+            codex_turn_id: None,
+            cursor_chat_id: None,
+            grok_session_id: None,
+        };
+
+        let message = parse_codex_run_to_message(&lines, &run).expect("message");
+
+        assert_eq!(message.content_blocks.len(), 3);
+        assert!(matches!(
+            &message.content_blocks[0],
+            ContentBlock::Text { text } if text == "Before steer"
+        ));
+        assert!(matches!(
+            &message.content_blocks[1],
+            ContentBlock::UserInput { text } if text == "also check tests"
+        ));
+        assert!(matches!(
+            &message.content_blocks[2],
+            ContentBlock::Text { text } if text == "After steer"
+        ));
+        // Steered text must not leak into the assistant content blob.
+        assert!(!message.content.contains("also check tests"));
     }
 
     #[test]
@@ -3506,6 +4850,8 @@ mod tests {
             execution_mode: Some("plan".to_string()),
             thinking_level: None,
             effort_level: None,
+            backend: None,
+            custom_profile_name: None,
             started_at: 1,
             ended_at: Some(2),
             status: RunStatus::Completed,
@@ -3518,6 +4864,7 @@ mod tests {
             codex_thread_id: None,
             codex_turn_id: None,
             cursor_chat_id: None,
+            grok_session_id: None,
         };
 
         let message = parse_codex_run_to_message(&lines, &run).expect("message");
@@ -3559,6 +4906,8 @@ mod tests {
             execution_mode: Some("plan".to_string()),
             thinking_level: None,
             effort_level: None,
+            backend: None,
+            custom_profile_name: None,
             started_at: 1,
             ended_at: Some(2),
             status: RunStatus::Completed,
@@ -3571,6 +4920,7 @@ mod tests {
             codex_thread_id: None,
             codex_turn_id: None,
             cursor_chat_id: None,
+            grok_session_id: None,
         };
 
         let message = parse_codex_run_to_message(&lines, &run).expect("message");
@@ -3601,6 +4951,30 @@ mod tests {
     }
 
     #[test]
+    fn codex_run_log_visible_artifacts_detects_cancelled_tool_output_without_agent_id() {
+        let lines = vec![
+            r#"{"_run_meta":true}"#.to_string(),
+            r#"{"type":"turn.started"}"#.to_string(),
+            r#"{"item":{"aggregated_output":null,"command":"rtk test","id":"call-1","status":"inProgress","type":"command_execution"},"type":"item.started"}"#.to_string(),
+        ];
+
+        assert!(codex_run_log_has_visible_assistant_artifacts(&lines, false));
+    }
+
+    #[test]
+    fn codex_run_log_visible_artifacts_ignores_user_only_cancelled_run() {
+        let lines = vec![
+            r#"{"_run_meta":true}"#.to_string(),
+            r#"{"type":"turn.started"}"#.to_string(),
+            r#"{"item":{"content":[{"text":"continue","type":"text"}],"id":"user-1","type":"user_message"},"type":"item.completed"}"#.to_string(),
+        ];
+
+        assert!(!codex_run_log_has_visible_assistant_artifacts(
+            &lines, false
+        ));
+    }
+
+    #[test]
     fn extract_plain_text_plan_sections_splits_intro_from_plan() {
         assert_eq!(
             extract_plain_text_plan_sections(
@@ -3627,6 +5001,8 @@ mod tests {
             execution_mode: Some("plan".to_string()),
             thinking_level: None,
             effort_level: None,
+            backend: None,
+            custom_profile_name: None,
             started_at: 1,
             ended_at: Some(2),
             status: RunStatus::Completed,
@@ -3639,6 +5015,7 @@ mod tests {
             codex_thread_id: None,
             codex_turn_id: None,
             cursor_chat_id: None,
+            grok_session_id: None,
         };
 
         let message = parse_codex_run_to_message(&lines, &run).expect("message");
@@ -3680,6 +5057,8 @@ mod tests {
             execution_mode: Some("yolo".to_string()),
             thinking_level: None,
             effort_level: None,
+            backend: None,
+            custom_profile_name: None,
             started_at: 1,
             ended_at: Some(2),
             status: RunStatus::Completed,
@@ -3692,6 +5071,7 @@ mod tests {
             codex_thread_id: None,
             codex_turn_id: None,
             cursor_chat_id: None,
+            grok_session_id: None,
         };
 
         let message = parse_codex_run_to_message(&lines, &run).expect("message");
@@ -3738,6 +5118,8 @@ mod tests {
             execution_mode: Some("plan".to_string()),
             thinking_level: None,
             effort_level: None,
+            backend: None,
+            custom_profile_name: None,
             started_at: 1,
             ended_at: Some(2),
             status: RunStatus::Completed,
@@ -3750,6 +5132,7 @@ mod tests {
             codex_thread_id: None,
             codex_turn_id: None,
             cursor_chat_id: None,
+            grok_session_id: None,
         };
 
         let message = parse_codex_run_to_message(&lines, &run).expect("message");
@@ -3777,6 +5160,8 @@ mod tests {
             execution_mode: Some("plan".to_string()),
             thinking_level: None,
             effort_level: None,
+            backend: None,
+            custom_profile_name: None,
             started_at: 1,
             ended_at: Some(2),
             status: RunStatus::Completed,
@@ -3789,6 +5174,7 @@ mod tests {
             codex_thread_id: None,
             codex_turn_id: None,
             cursor_chat_id: None,
+            grok_session_id: None,
         };
 
         let message = parse_codex_run_to_message(&lines, &run).expect("message");

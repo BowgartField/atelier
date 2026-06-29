@@ -14,10 +14,10 @@ import {
   FolderOpen,
   Bug,
   RefreshCw,
-  Sparkles,
   Undo2,
   Link2,
   ShieldAlert,
+  Loader2,
 } from 'lucide-react'
 import {
   Dialog,
@@ -25,7 +25,18 @@ import {
   DialogHeader,
   DialogTitle,
 } from '@/components/ui/dialog'
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from '@/components/ui/alert-dialog'
 import { Button } from '@/components/ui/button'
+import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { RadioGroup, RadioGroupItem } from '@/components/ui/radio-group'
 import {
@@ -46,11 +57,14 @@ import {
 } from '@/services/github'
 import { usePreferences } from '@/services/preferences'
 import { useAvailableOpencodeModels } from '@/services/opencode-cli'
+import { useAvailableGrokModels } from '@/services/grok-cli'
 import { invoke } from '@/lib/transport'
+import { dismissibleToast } from '@/lib/dismissible-toast'
 import { generateId } from '@/lib/uuid'
 import { openExternal } from '@/lib/platform'
 import { notify } from '@/lib/notifications'
 import { cn } from '@/lib/utils'
+import { toastActionLabel } from '@/lib/toast-action-label'
 import { toast } from 'sonner'
 import {
   gitPush,
@@ -78,25 +92,31 @@ import {
 import { useRemotePicker } from '@/hooks/useRemotePicker'
 import { useInstalledBackends } from '@/hooks/useInstalledBackends'
 import { chatQueryKeys } from '@/services/chat'
-import { saveWorktreePr, projectsQueryKeys } from '@/services/projects'
+import {
+  linkWorktreePr,
+  saveWorktreePr,
+  projectsQueryKeys,
+} from '@/services/projects'
 import { useQueryClient } from '@tanstack/react-query'
 import {
   CODEX_MODEL_OPTIONS,
   MODEL_OPTIONS,
   OPENCODE_MODEL_OPTIONS,
+  GROK_MODEL_OPTIONS,
 } from '@/components/chat/toolbar/toolbar-options'
 import { formatOpencodeModelLabel } from '@/components/chat/toolbar/toolbar-utils'
+import { ReviewMethodModal } from '@/components/chat/ReviewMethodModal'
 
 type MagicOption =
   | 'save-context'
   | 'load-context'
   | 'linked-projects'
-  | 'create-recap'
   | 'commit'
   | 'commit-and-push'
   | 'pull'
   | 'push'
   | 'open-pr'
+  | 'link-pr'
   | 'update-pr'
   | 'review'
   | 'merge'
@@ -109,15 +129,21 @@ type MagicOption =
   | 'review-comments'
   | 'revert-last-commit'
 
+interface TriggerCodeRabbitPrReviewResponse {
+  pr_number: number
+  pr_url: string
+  comment_body: string
+}
+
 /** Options that work on canvas without an open session (git-only operations) */
 const CANVAS_ALLOWED_OPTIONS = new Set<MagicOption>([
-  'create-recap',
   'commit',
   'commit-and-push',
   'revert-last-commit',
   'pull',
   'push',
   'open-pr',
+  'link-pr',
   'update-pr',
   'review',
   'review-comments',
@@ -205,12 +231,6 @@ function buildMagicColumns(hasOpenPr: boolean): MagicColumns {
           icon: Link2,
           key: 'K',
         },
-        {
-          id: 'create-recap',
-          label: 'Create Recap',
-          icon: Sparkles,
-          key: 'T',
-        },
       ],
     },
     {
@@ -250,6 +270,12 @@ function buildMagicColumns(hasOpenPr: boolean): MagicColumns {
           icon: GitPullRequest,
           key: 'O',
         },
+        {
+          id: 'link-pr',
+          label: 'Link PR',
+          icon: Link2,
+          key: 'B',
+        },
         { id: 'review', label: 'Review', icon: Eye, key: 'R' },
         {
           id: 'review-comments',
@@ -265,7 +291,7 @@ function buildMagicColumns(hasOpenPr: boolean): MagicColumns {
       options: [
         {
           id: 'release-notes',
-          label: 'Generate Notes',
+          label: 'Generate Release Notes',
           icon: FileText,
           key: 'G',
         },
@@ -317,12 +343,12 @@ const KEY_TO_OPTION: Record<string, MagicOption> = {
   s: 'save-context',
   l: 'load-context',
   k: 'linked-projects',
-  t: 'create-recap',
   c: 'commit',
   p: 'commit-and-push',
   d: 'pull',
   u: 'push',
   o: 'open-pr',
+  b: 'link-pr',
   e: 'update-pr',
   r: 'review',
   v: 'review-comments',
@@ -365,11 +391,21 @@ export function MagicModal() {
   const [customInvestigateModel, setCustomInvestigateModel] =
     useState<string>('sonnet')
   const [resolveDialogOpen, setResolveDialogOpen] = useState(false)
+  const [reviewMethodDialogOpen, setReviewMethodDialogOpen] = useState(false)
+  const [linkPrDialogOpen, setLinkPrDialogOpen] = useState(false)
+  const [linkPrNumber, setLinkPrNumber] = useState('')
+  const [linkPrError, setLinkPrError] = useState<string | null>(null)
+  const [detectedLinkPr, setDetectedLinkPr] = useState<DetectPrResponse | null>(
+    null
+  )
+  const [isDetectingLinkPr, setIsDetectingLinkPr] = useState(false)
+  const [isLinkingPr, setIsLinkingPr] = useState(false)
   const [resolveSelectionMode, setResolveSelectionMode] =
     useState<ResolveSelectionMode>('settings-default')
   const [customResolveBackend, setCustomResolveBackend] =
     useState<CliBackend>('claude')
   const [customResolveModel, setCustomResolveModel] = useState<string>('sonnet')
+  const [revertConfirmOpen, setRevertConfirmOpen] = useState(false)
 
   const hasOpenPr = Boolean(worktree?.pr_url)
 
@@ -402,6 +438,9 @@ export function MagicModal() {
   const { installedBackends } = useInstalledBackends()
   const { data: availableOpencodeModels } = useAvailableOpencodeModels({
     enabled: installedBackends.includes('opencode'),
+  })
+  const { data: availableGrokModels } = useAvailableGrokModels({
+    enabled: installedBackends.includes('grok'),
   })
 
   // Build columns dynamically based on PR state
@@ -450,6 +489,16 @@ export function MagicModal() {
     }))
   }, [availableOpencodeModels])
 
+  const grokModelOptions = useMemo(() => {
+    const models = availableGrokModels?.length
+      ? availableGrokModels.map(model => ({
+          value: `grok/${model.id}`,
+          label: model.label || model.id,
+        }))
+      : GROK_MODEL_OPTIONS
+    return models
+  }, [availableGrokModels])
+
   const investigateDefaults = useMemo(() => {
     if (!investigateType) return null
 
@@ -467,12 +516,18 @@ export function MagicModal() {
     const model =
       preferences?.magic_prompt_models?.[modelKey] ??
       (backend === 'codex'
-        ? (preferences?.selected_codex_model ?? 'gpt-5.4')
+        ? (preferences?.selected_codex_model ?? 'gpt-5.5')
         : backend === 'opencode'
-          ? (preferences?.selected_opencode_model ?? 'opencode/gpt-5.3-codex')
+          ? (preferences?.selected_opencode_model ?? 'opencode/gpt-5.5')
           : backend === 'cursor'
             ? (preferences?.selected_cursor_model ?? 'cursor/auto')
-            : (preferences?.selected_model ?? 'sonnet'))
+            : backend === 'commandcode'
+              ? (preferences?.selected_commandcode_model ??
+                'commandcode/default')
+              : backend === 'grok'
+                ? (preferences?.selected_grok_model ??
+                  'grok/grok-composer-2.5-fast')
+                : (preferences?.selected_model ?? 'sonnet'))
     const provider = resolveMagicPromptProvider(
       preferences?.magic_prompt_providers,
       providerKey,
@@ -493,12 +548,18 @@ export function MagicModal() {
     const model =
       preferences?.magic_prompt_models?.[RESOLVE_CONFLICTS_MODEL_KEY] ??
       (backend === 'codex'
-        ? (preferences?.selected_codex_model ?? 'gpt-5.4')
+        ? (preferences?.selected_codex_model ?? 'gpt-5.5')
         : backend === 'opencode'
-          ? (preferences?.selected_opencode_model ?? 'opencode/gpt-5.3-codex')
+          ? (preferences?.selected_opencode_model ?? 'opencode/gpt-5.5')
           : backend === 'cursor'
             ? (preferences?.selected_cursor_model ?? 'cursor/auto')
-            : (preferences?.selected_model ?? 'sonnet'))
+            : backend === 'commandcode'
+              ? (preferences?.selected_commandcode_model ??
+                'commandcode/default')
+              : backend === 'grok'
+                ? (preferences?.selected_grok_model ??
+                  'grok/grok-composer-2.5-fast')
+                : (preferences?.selected_model ?? 'sonnet'))
     const provider = resolveMagicPromptProvider(
       preferences?.magic_prompt_providers,
       RESOLVE_CONFLICTS_PROVIDER_KEY,
@@ -570,11 +631,13 @@ export function MagicModal() {
           return CODEX_MODEL_OPTIONS
         case 'opencode':
           return opencodeModelOptions
+        case 'grok':
+          return grokModelOptions
         default:
           return investigateClaudeModelOptions
       }
     },
-    [investigateClaudeModelOptions, opencodeModelOptions]
+    [grokModelOptions, investigateClaudeModelOptions, opencodeModelOptions]
   )
 
   const customInvestigateModelOptions = useMemo(
@@ -598,6 +661,10 @@ export function MagicModal() {
         return 'Codex'
       case 'opencode':
         return 'OpenCode'
+      case 'cursor':
+        return 'Cursor'
+      case 'grok':
+        return 'Grok (Beta)'
       default:
         return 'Claude'
     }
@@ -641,11 +708,13 @@ export function MagicModal() {
           return CODEX_MODEL_OPTIONS
         case 'opencode':
           return opencodeModelOptions
+        case 'grok':
+          return grokModelOptions
         default:
           return resolveClaudeModelOptions
       }
     },
-    [opencodeModelOptions, resolveClaudeModelOptions]
+    [grokModelOptions, opencodeModelOptions, resolveClaudeModelOptions]
   )
 
   const customResolveModelOptions = useMemo(
@@ -788,7 +857,8 @@ export function MagicModal() {
   const executeGitDirectly = useCallback(
     async (
       option: MagicOption,
-      override?: { backend: CliBackend; model: string }
+      override?: { backend: CliBackend; model: string },
+      reviewSource: 'ai' | 'coderabbit-cli' | 'coderabbit-pr' = 'ai'
     ) => {
       if (!selectedWorktreeId || !worktree?.path) return
 
@@ -804,7 +874,7 @@ export function MagicModal() {
           gitDiffSelectedFiles.size > 0
             ? Array.from(gitDiffSelectedFiles)
             : null
-        const toastId = toast.loading(
+        const opToast = dismissibleToast.loading(
           isPush
             ? `Committing and pushing on ${branch}...`
             : `Creating commit on ${branch}...`
@@ -835,22 +905,17 @@ export function MagicModal() {
           window.dispatchEvent(new CustomEvent('git-commit-completed'))
           if (worktree.project_id) fetchWorktreesStatus(worktree.project_id)
           if (result.push_fell_back) {
-            toast.warning(
-              'Could not push to PR branch, pushed to new branch instead',
-              {
-                id: toastId,
-              }
+            opToast.warning(
+              'Could not push to PR branch, pushed to new branch instead'
             )
           } else if (result.commit_hash) {
             const prefix = isPush ? 'Committed and pushed' : 'Committed'
-            toast.success(`${prefix}: ${result.message.split('\n')[0]}`, {
-              id: toastId,
-            })
+            opToast.success(`${prefix}: ${result.message.split('\n')[0]}`)
           } else {
-            toast.success('Pushed to remote', { id: toastId })
+            opToast.success('Pushed to remote')
           }
         } catch (error) {
-          toast.error(`Failed: ${error}`, { id: toastId })
+          opToast.error(`Failed: ${error}`)
         } finally {
           clearWorktreeLoading(selectedWorktreeId)
         }
@@ -902,7 +967,9 @@ export function MagicModal() {
         }
         case 'push': {
           const doPush = async (remote?: string) => {
-            const toastId = toast.loading(`Pushing ${worktree.branch}...`)
+            const opToast = dismissibleToast.loading(
+              `Pushing ${worktree.branch}...`
+            )
             try {
               const result = await gitPush(
                 worktree.path,
@@ -912,15 +979,14 @@ export function MagicModal() {
               triggerImmediateGitPoll()
               if (worktree.project_id) fetchWorktreesStatus(worktree.project_id)
               if (result.fellBack) {
-                toast.warning(
-                  'Could not push to PR branch, pushed to new branch instead',
-                  { id: toastId }
+                opToast.warning(
+                  'Could not push to PR branch, pushed to new branch instead'
                 )
               } else {
-                toast.success('Changes pushed', { id: toastId })
+                opToast.success('Changes pushed')
               }
             } catch (error) {
-              toast.error(`Push failed: ${error}`, { id: toastId })
+              opToast.error(`Push failed: ${error}`)
             }
           }
           if (worktree.pr_number) {
@@ -980,7 +1046,7 @@ export function MagicModal() {
               {
                 id: toastId,
                 action: {
-                  label: 'Open',
+                  label: toastActionLabel('Open'),
                   onClick: () => openExternal(result.pr_url),
                 },
               }
@@ -1045,6 +1111,178 @@ export function MagicModal() {
               { worktreeId: selectedWorktreeId }
             )
 
+            if (
+              !result.has_conflicts &&
+              (worktree.pr_number || worktree.pr_url)
+            ) {
+              const prResult = await invoke<MergeConflictsResponse>(
+                'fetch_and_merge_base',
+                { worktreeId: selectedWorktreeId }
+              )
+
+              if (!prResult.has_conflicts) {
+                toast.success('No conflicts — base branch merged cleanly', {
+                  id: toastId,
+                })
+                triggerImmediateGitPoll()
+                return
+              }
+
+              toast.warning(
+                `Found conflicts in ${prResult.conflicts.length} file(s)`,
+                {
+                  id: toastId,
+                  description: 'Opening conflict resolution session...',
+                }
+              )
+
+              const {
+                registerWorktreePath,
+                setActiveSession,
+                copySessionSettings,
+                activeSessionIds,
+                setExecutionMode,
+                setExecutingMode,
+                setLastSentMessage,
+                setError,
+                clearInputDraft,
+              } = useChatStore.getState()
+              const currentSessionId = activeSessionIds[selectedWorktreeId]
+
+              const newSession = await invoke<Session>('create_session', {
+                worktreeId: selectedWorktreeId,
+                worktreePath: worktree.path,
+                name: 'PR: resolve conflicts',
+              })
+
+              if (currentSessionId)
+                copySessionSettings(currentSessionId, newSession.id)
+
+              const resolvedProvider = resolveMagicPromptProvider(
+                preferences?.magic_prompt_providers,
+                RESOLVE_CONFLICTS_PROVIDER_KEY,
+                preferences?.default_provider
+              )
+              const resolvedBackend =
+                override?.backend ??
+                resolveMagicPromptBackend(
+                  preferences?.magic_prompt_backends,
+                  RESOLVE_CONFLICTS_BACKEND_KEY,
+                  project?.default_backend ??
+                    preferences?.default_backend ??
+                    'claude'
+                ) ??
+                'claude'
+              const resolvedModel =
+                override?.model ??
+                preferences?.magic_prompt_models?.[
+                  RESOLVE_CONFLICTS_MODEL_KEY
+                ] ??
+                (resolvedBackend === 'codex'
+                  ? (preferences?.selected_codex_model ?? 'gpt-5.5')
+                  : resolvedBackend === 'opencode'
+                    ? (preferences?.selected_opencode_model ??
+                      'opencode/gpt-5.5')
+                    : resolvedBackend === 'cursor'
+                      ? (preferences?.selected_cursor_model ?? 'cursor/auto')
+                      : (preferences?.selected_model ?? 'sonnet'))
+              const resolvedSessionProvider =
+                override?.backend && override.backend !== 'claude'
+                  ? null
+                  : resolvedProvider
+
+              useChatStore
+                .getState()
+                .setSelectedBackend(newSession.id, resolvedBackend)
+              useChatStore
+                .getState()
+                .setSelectedModel(newSession.id, resolvedModel)
+              useChatStore
+                .getState()
+                .setSelectedProvider(newSession.id, resolvedSessionProvider)
+
+              invoke('set_session_backend', {
+                worktreeId: selectedWorktreeId,
+                worktreePath: worktree.path,
+                sessionId: newSession.id,
+                backend: resolvedBackend,
+              }).catch(() => undefined)
+              invoke('set_session_model', {
+                worktreeId: selectedWorktreeId,
+                worktreePath: worktree.path,
+                sessionId: newSession.id,
+                model: resolvedModel,
+              }).catch(() => undefined)
+              invoke('set_session_provider', {
+                worktreeId: selectedWorktreeId,
+                worktreePath: worktree.path,
+                sessionId: newSession.id,
+                provider: resolvedSessionProvider,
+              }).catch(() => undefined)
+
+              registerWorktreePath(selectedWorktreeId, worktree.path)
+              setActiveSession(selectedWorktreeId, newSession.id)
+              window.dispatchEvent(
+                new CustomEvent('open-worktree-modal', {
+                  detail: {
+                    worktreeId: selectedWorktreeId,
+                    worktreePath: worktree.path,
+                  },
+                })
+              )
+
+              const conflictFiles = prResult.conflicts.join('\n- ')
+              const diffSection = prResult.conflict_diff
+                ? `\n\nHere is the diff showing the conflict details:\n\n\`\`\`diff\n${prResult.conflict_diff}\n\`\`\``
+                : ''
+              const baseBranch = project?.default_branch || 'main'
+              const resolveInstructions =
+                preferences?.magic_prompts?.resolve_conflicts ??
+                DEFAULT_RESOLVE_CONFLICTS_PROMPT
+
+              const conflictPrompt = `I merged \`origin/${baseBranch}\` into this branch to resolve PR conflicts, but there are merge conflicts.
+
+Conflicts in these files:
+- ${conflictFiles}${diffSection}
+
+${resolveInstructions}`
+
+              setLastSentMessage(newSession.id, conflictPrompt)
+              setError(newSession.id, null)
+              setExecutionMode(newSession.id, 'yolo')
+              setExecutingMode(newSession.id, 'yolo')
+              clearInputDraft(newSession.id)
+              invoke('update_session_state', {
+                worktreeId: selectedWorktreeId,
+                worktreePath: worktree.path,
+                sessionId: newSession.id,
+                selectedExecutionMode: 'yolo',
+              }).catch(() => undefined)
+
+              await invoke('send_chat_message', {
+                sessionId: newSession.id,
+                worktreeId: selectedWorktreeId,
+                worktreePath: worktree.path,
+                message: conflictPrompt,
+                model: resolvedModel,
+                executionMode: 'yolo',
+                backend:
+                  resolvedBackend !== 'claude' ? resolvedBackend : undefined,
+                customProfileName:
+                  resolvedSessionProvider &&
+                  resolvedSessionProvider !== '__anthropic__'
+                    ? resolvedSessionProvider
+                    : undefined,
+                chromeEnabled: preferences?.chrome_enabled ?? false,
+                aiLanguage: preferences?.ai_language,
+              })
+
+              queryClient.invalidateQueries({
+                queryKey: chatQueryKeys.sessions(selectedWorktreeId),
+              })
+              return
+            }
+
             if (!result.has_conflicts) {
               toast.info('No merge conflicts detected', { id: toastId })
               return
@@ -1061,9 +1299,13 @@ export function MagicModal() {
             const {
               registerWorktreePath,
               setActiveSession,
-              setInputDraft,
               copySessionSettings,
               activeSessionIds,
+              setExecutionMode,
+              setExecutingMode,
+              setLastSentMessage,
+              setError,
+              clearInputDraft,
             } = useChatStore.getState()
             const currentSessionId = activeSessionIds[selectedWorktreeId]
 
@@ -1096,10 +1338,10 @@ export function MagicModal() {
               override?.model ??
               preferences?.magic_prompt_models?.[RESOLVE_CONFLICTS_MODEL_KEY] ??
               (resolvedBackend === 'codex'
-                ? (preferences?.selected_codex_model ?? 'gpt-5.4')
+                ? (preferences?.selected_codex_model ?? 'gpt-5.5')
                 : resolvedBackend === 'opencode'
                   ? (preferences?.selected_opencode_model ??
-                    'opencode/gpt-5.3-codex')
+                    'opencode/gpt-5.5')
                   : resolvedBackend === 'cursor'
                     ? (preferences?.selected_cursor_model ?? 'cursor/auto')
                     : (preferences?.selected_model ?? 'sonnet'))
@@ -1188,7 +1430,35 @@ Conflicts in these files:
 
 ${resolveInstructions}`
 
-            setInputDraft(newSession.id, conflictPrompt)
+            setLastSentMessage(newSession.id, conflictPrompt)
+            setError(newSession.id, null)
+            setExecutionMode(newSession.id, 'yolo')
+            setExecutingMode(newSession.id, 'yolo')
+            clearInputDraft(newSession.id)
+            invoke('update_session_state', {
+              worktreeId: selectedWorktreeId,
+              worktreePath: worktree.path,
+              sessionId: newSession.id,
+              selectedExecutionMode: 'yolo',
+            }).catch(() => undefined)
+
+            await invoke('send_chat_message', {
+              sessionId: newSession.id,
+              worktreeId: selectedWorktreeId,
+              worktreePath: worktree.path,
+              message: conflictPrompt,
+              model: resolvedModel,
+              executionMode: 'yolo',
+              backend:
+                resolvedBackend !== 'claude' ? resolvedBackend : undefined,
+              customProfileName:
+                resolvedSessionProvider &&
+                resolvedSessionProvider !== '__anthropic__'
+                  ? resolvedSessionProvider
+                  : undefined,
+              chromeEnabled: preferences?.chrome_enabled ?? false,
+              aiLanguage: preferences?.ai_language,
+            })
 
             queryClient.invalidateQueries({
               queryKey: chatQueryKeys.sessions(selectedWorktreeId),
@@ -1203,37 +1473,98 @@ ${resolveInstructions}`
           const projectName = project?.name ?? 'project'
           const worktreeName = worktree.name ?? worktree.branch ?? ''
           const reviewTarget = `${projectName}/${worktreeName}`
+          if (reviewSource === 'coderabbit-pr') {
+            const toastId = toast.loading(
+              `Triggering CodeRabbit review for ${reviewTarget}...`
+            )
+
+            try {
+              if (!worktree.pr_number) {
+                throw new Error('Open or link a PR in Jean first')
+              }
+
+              const result = await invoke<TriggerCodeRabbitPrReviewResponse>(
+                'trigger_coderabbit_pr_review',
+                {
+                  worktreeId: selectedWorktreeId,
+                  worktreePath: worktree.path,
+                  prNumber: worktree.pr_number,
+                }
+              )
+
+              if (worktree.project_id) {
+                queryClient.invalidateQueries({
+                  queryKey: projectsQueryKeys.worktrees(worktree.project_id),
+                })
+                queryClient.invalidateQueries({
+                  queryKey: [
+                    ...projectsQueryKeys.all,
+                    'worktree',
+                    selectedWorktreeId,
+                  ],
+                })
+              }
+
+              toast.success(
+                `CodeRabbit review triggered on PR #${result.pr_number}`,
+                {
+                  id: toastId,
+                  action: result.pr_url
+                    ? {
+                        label: toastActionLabel('Open'),
+                        onClick: () => openExternal(result.pr_url),
+                      }
+                    : undefined,
+                }
+              )
+            } catch (error) {
+              toast.error(`Failed to trigger CodeRabbit review: ${error}`, {
+                id: toastId,
+              })
+            } finally {
+              clearWorktreeLoading(selectedWorktreeId)
+            }
+            break
+          }
+
           const reviewRunId = generateId()
           let cancelRequested = false
-          const toastId = toast.loading(`Reviewing ${reviewTarget}...`, {
-            cancel: {
-              label: 'Cancel',
-              onClick: () => {
-                cancelRequested = true
-                toast.loading(`Cancelling review for ${reviewTarget}...`, {
-                  id: toastId,
-                })
-                invoke<boolean>('cancel_review_with_ai', { reviewRunId })
-                  .then(cancelled => {
-                    if (cancelled) {
-                      toast.info(`Review cancelled for ${reviewTarget}`, {
+          const reviewLabel =
+            reviewSource === 'coderabbit-cli'
+              ? 'CodeRabbit CLI review'
+              : 'Review'
+          const toastId = toast.loading(
+            `${reviewLabel} for ${reviewTarget}...`,
+            {
+              cancel: {
+                label: 'Cancel',
+                onClick: () => {
+                  cancelRequested = true
+                  toast.loading(`Cancelling review for ${reviewTarget}...`, {
+                    id: toastId,
+                  })
+                  invoke<boolean>('cancel_review_with_ai', { reviewRunId })
+                    .then(cancelled => {
+                      if (cancelled) {
+                        toast.info(`Review cancelled for ${reviewTarget}`, {
+                          id: toastId,
+                        })
+                      } else {
+                        toast.info(
+                          `No active review to cancel for ${reviewTarget}`,
+                          { id: toastId }
+                        )
+                      }
+                    })
+                    .catch(error => {
+                      toast.error(`Failed to cancel review: ${error}`, {
                         id: toastId,
                       })
-                    } else {
-                      toast.info(
-                        `No active review to cancel for ${reviewTarget}`,
-                        { id: toastId }
-                      )
-                    }
-                  })
-                  .catch(error => {
-                    toast.error(`Failed to cancel review: ${error}`, {
-                      id: toastId,
                     })
-                  })
+                },
               },
-            },
-          })
+            }
+          )
 
           // Fire-and-forget: detect and link PR if not already linked
           if (!worktree.pr_number) {
@@ -1261,19 +1592,31 @@ ${resolveInstructions}`
           }
 
           try {
-            const result = await invoke<ReviewResponse>('run_review_with_ai', {
-              worktreePath: worktree.path,
-              customPrompt: preferences?.magic_prompts?.code_review,
-              model: preferences?.magic_prompt_models?.code_review_model,
-              customProfileName: resolveMagicPromptProvider(
-                preferences?.magic_prompt_providers,
-                'code_review_provider',
-                preferences?.default_provider
-              ),
-              reasoningEffort:
-                preferences?.magic_prompt_efforts?.code_review_effort ?? null,
-              reviewRunId,
-            })
+            const result = await invoke<ReviewResponse>(
+              reviewSource === 'coderabbit-cli'
+                ? 'run_coderabbit_review'
+                : 'run_review_with_ai',
+              reviewSource === 'coderabbit-cli'
+                ? {
+                    worktreePath: worktree.path,
+                    reviewRunId,
+                    reviewType: 'all',
+                  }
+                : {
+                    worktreePath: worktree.path,
+                    customPrompt: preferences?.magic_prompts?.code_review,
+                    model: preferences?.magic_prompt_models?.code_review_model,
+                    customProfileName: resolveMagicPromptProvider(
+                      preferences?.magic_prompt_providers,
+                      'code_review_provider',
+                      preferences?.default_provider
+                    ),
+                    reasoningEffort:
+                      preferences?.magic_prompt_efforts?.code_review_effort ??
+                      null,
+                    reviewRunId,
+                  }
+            )
 
             const newSession = await invoke<Session>('create_session', {
               worktreeId: selectedWorktreeId,
@@ -1318,11 +1661,11 @@ ${resolveInstructions}`
 
             const findingCount = result.findings.length
             toast.success(
-              `Review done on ${reviewTarget} (${findingCount} findings)`,
+              `${reviewSource === 'coderabbit-cli' ? 'CodeRabbit CLI review' : 'Review'} done on ${reviewTarget} (${findingCount} findings)`,
               {
                 id: toastId,
                 action: {
-                  label: 'Open',
+                  label: toastActionLabel('Open'),
                   onClick: () => {
                     const { setActiveSession, clearActiveWorktree } =
                       useChatStore.getState()
@@ -1408,6 +1751,113 @@ ${resolveInstructions}`
     executeGitDirectly,
   ])
 
+  const detectLinkPrForCurrentBranch = useCallback(async () => {
+    if (!selectedWorktreeId || !worktree?.path) return
+
+    setIsDetectingLinkPr(true)
+    try {
+      const result = await invoke<DetectPrResponse | null>(
+        'detect_and_link_pr',
+        {
+          worktreeId: selectedWorktreeId,
+          worktreePath: worktree.path,
+        }
+      )
+
+      if (!result) return
+
+      setDetectedLinkPr(result)
+      setLinkPrNumber(String(result.pr_number))
+      queryClient.invalidateQueries({
+        queryKey: projectsQueryKeys.worktrees(worktree.project_id),
+      })
+      queryClient.invalidateQueries({
+        queryKey: [...projectsQueryKeys.all, 'worktree', selectedWorktreeId],
+      })
+      triggerImmediateGitPoll()
+      if (worktree.project_id) fetchWorktreesStatus(worktree.project_id)
+    } catch (error) {
+      setLinkPrError(`Failed to search current branch for PR: ${error}`)
+    } finally {
+      setIsDetectingLinkPr(false)
+    }
+  }, [queryClient, selectedWorktreeId, worktree?.path, worktree?.project_id])
+
+  const handleLinkPrSubmit = useCallback(async () => {
+    if (!selectedWorktreeId || !worktree?.path) return
+
+    const prNumber = Number.parseInt(linkPrNumber.trim().replace(/^#/, ''), 10)
+    if (!Number.isInteger(prNumber) || prNumber <= 0) {
+      setLinkPrError('Enter a valid PR number')
+      return
+    }
+
+    setIsLinkingPr(true)
+    setLinkPrError(null)
+    try {
+      const result = await linkWorktreePr(
+        selectedWorktreeId,
+        worktree.path,
+        prNumber
+      )
+
+      queryClient.invalidateQueries({
+        queryKey: projectsQueryKeys.worktrees(worktree.project_id),
+      })
+      queryClient.invalidateQueries({
+        queryKey: [...projectsQueryKeys.all, 'worktree', selectedWorktreeId],
+      })
+      triggerImmediateGitPoll()
+      if (worktree.project_id) fetchWorktreesStatus(worktree.project_id)
+
+      toast.success(`Linked PR #${result.pr_number}: ${result.title}`, {
+        action: {
+          label: toastActionLabel('Open'),
+          onClick: () => openExternal(result.pr_url),
+        },
+      })
+      setLinkPrDialogOpen(false)
+      setLinkPrNumber('')
+    } catch (error) {
+      const message = `Failed to link PR: ${error}`
+      setLinkPrError(message)
+      toast.error(message)
+    } finally {
+      setIsLinkingPr(false)
+    }
+  }, [
+    linkPrNumber,
+    queryClient,
+    selectedWorktreeId,
+    worktree?.path,
+    worktree?.project_id,
+  ])
+
+  const confirmRevertLastCommit = useCallback(() => {
+    setRevertConfirmOpen(false)
+    setMagicModalOpen(false)
+
+    if (!selectedWorktreeId) {
+      notify('No worktree selected', undefined, { type: 'error' })
+      return
+    }
+
+    if (
+      CANVAS_ALLOWED_OPTIONS.has('revert-last-commit') &&
+      !CANVAS_NAVIGATE_AND_DISPATCH_OPTIONS.has('revert-last-commit') &&
+      !useChatStore.getState().activeWorktreePath
+    ) {
+      executeGitDirectly('revert-last-commit')
+      return
+    }
+
+    window.dispatchEvent(
+      new CustomEvent('magic-command', {
+        detail: { command: 'revert-last-commit' },
+      })
+    )
+  }, [executeGitDirectly, selectedWorktreeId, setMagicModalOpen])
+
   const executeAction = useCallback(
     async (option: MagicOption) => {
       // Block disabled options on canvas
@@ -1415,7 +1865,18 @@ ${resolveInstructions}`
         return
       }
 
-      // release-notes only needs a project selected, not a worktree
+      if (option === 'review') {
+        if (!selectedWorktreeId || !worktree?.path) {
+          notify('No worktree selected', undefined, { type: 'error' })
+          setMagicModalOpen(false)
+          return
+        }
+        setMagicModalOpen(false)
+        setReviewMethodDialogOpen(true)
+        return
+      }
+
+      // Release generation only needs a project selected, not a worktree
       if (option === 'release-notes') {
         if (!selectedProjectId) {
           notify('No project selected', undefined, { type: 'error' })
@@ -1445,15 +1906,30 @@ ${resolveInstructions}`
         return
       }
 
-      // Create recap: dispatch open-recap event (handled by ChatWindow or canvas hooks)
-      if (option === 'create-recap') {
-        if (!activeSessionId) {
-          toast.info('No active session to create a recap for')
+      if (option === 'revert-last-commit') {
+        if (!worktree?.path) {
+          notify('No worktree selected', undefined, { type: 'error' })
           setMagicModalOpen(false)
           return
         }
+        setRevertConfirmOpen(true)
+        return
+      }
+
+      if (option === 'link-pr') {
+        if (!worktree?.path) {
+          notify('No worktree selected', undefined, { type: 'error' })
+          setMagicModalOpen(false)
+          return
+        }
+        setLinkPrNumber(worktree.pr_number ? String(worktree.pr_number) : '')
+        setDetectedLinkPr(null)
+        setLinkPrError(null)
         setMagicModalOpen(false)
-        window.dispatchEvent(new CustomEvent('open-recap'))
+        setLinkPrDialogOpen(true)
+        if (!worktree.pr_number) {
+          void detectLinkPrForCurrentBranch()
+        }
         return
       }
 
@@ -1583,6 +2059,7 @@ ${resolveInstructions}`
       activeSessionId,
       worktree?.path,
       worktree?.pr_number,
+      detectLinkPrForCurrentBranch,
     ]
   )
 
@@ -1640,6 +2117,39 @@ ${resolveInstructions}`
 
   return (
     <>
+      <ReviewMethodModal
+        open={reviewMethodDialogOpen}
+        onOpenChange={setReviewMethodDialogOpen}
+        onAiReview={() => executeGitDirectly('review', undefined, 'ai')}
+        onCodeRabbitCliReview={() =>
+          executeGitDirectly('review', undefined, 'coderabbit-cli')
+        }
+        onCodeRabbitPrReview={() =>
+          executeGitDirectly('review', undefined, 'coderabbit-pr')
+        }
+        codeRabbitPrAvailable={Boolean(worktree?.pr_number)}
+      />
+      <AlertDialog open={revertConfirmOpen} onOpenChange={setRevertConfirmOpen}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Revert last commit?</AlertDialogTitle>
+            <AlertDialogDescription>
+              This will undo the latest local commit on{' '}
+              <span className="font-medium text-foreground">
+                {worktree?.branch ?? worktree?.name ?? 'this worktree'}
+              </span>
+              . Your working tree changes from that commit will be restored, but
+              this action can be disruptive.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>Cancel</AlertDialogCancel>
+            <AlertDialogAction onClick={confirmRevertLastCommit}>
+              Revert last commit
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
       <Dialog open={magicModalOpen} onOpenChange={handleOpenChange}>
         <DialogContent
           ref={contentRef}
@@ -1677,7 +2187,6 @@ ${resolveInstructions}`
                         const isDisabled =
                           (isOnCanvas &&
                             !CANVAS_ALLOWED_OPTIONS.has(option.id)) ||
-                          (option.id === 'create-recap' && !activeSessionId) ||
                           (option.id === 'investigate-issue' &&
                             !hasIssueContexts) ||
                           (option.id === 'investigate-pr' && !hasPrContexts) ||
@@ -1721,6 +2230,77 @@ ${resolveInstructions}`
                 </div>
               )
             )}
+          </div>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={linkPrDialogOpen} onOpenChange={setLinkPrDialogOpen}>
+        <DialogContent className="sm:max-w-[420px]">
+          <DialogHeader>
+            <DialogTitle>Link pull request</DialogTitle>
+          </DialogHeader>
+
+          <div className="space-y-4">
+            <div className="space-y-2">
+              <Label htmlFor="manual-pr-number">PR number</Label>
+              <Input
+                id="manual-pr-number"
+                inputMode="numeric"
+                placeholder="123"
+                value={linkPrNumber}
+                onChange={e => {
+                  setLinkPrNumber(e.target.value)
+                  setDetectedLinkPr(null)
+                  setLinkPrError(null)
+                }}
+                onKeyDown={e => {
+                  if (e.key === 'Enter') {
+                    e.preventDefault()
+                    handleLinkPrSubmit()
+                  }
+                }}
+                disabled={isDetectingLinkPr}
+                autoFocus
+              />
+              {isDetectingLinkPr && (
+                <div className="flex items-center gap-2 text-xs text-muted-foreground">
+                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                  <span>Checking current branch for an open PR…</span>
+                </div>
+              )}
+              {detectedLinkPr && (
+                <p className="text-sm text-foreground">
+                  Found PR #{detectedLinkPr.pr_number}: {detectedLinkPr.title}
+                </p>
+              )}
+              {linkPrError && (
+                <p className="text-sm text-destructive">{linkPrError}</p>
+              )}
+              <p className="text-xs text-muted-foreground">
+                Jean will validate this PR with GitHub and store the link on the
+                current worktree.
+              </p>
+            </div>
+
+            <div className="flex justify-end gap-2">
+              <Button
+                variant="outline"
+                onClick={() => setLinkPrDialogOpen(false)}
+                disabled={isLinkingPr || isDetectingLinkPr}
+              >
+                Cancel
+              </Button>
+              <Button
+                onClick={handleLinkPrSubmit}
+                disabled={isLinkingPr || isDetectingLinkPr}
+              >
+                {isDetectingLinkPr
+                  ? 'Checking…'
+                  : isLinkingPr
+                    ? 'Linking…'
+                    : 'Link PR'}
+              </Button>
+            </div>
           </div>
         </DialogContent>
       </Dialog>
@@ -1822,6 +2402,13 @@ ${resolveInstructions}`
                     >
                       <SelectTrigger
                         size="sm"
+                        hideIcon={
+                          installedBackends.filter(backend =>
+                            ['claude', 'codex', 'opencode', 'grok'].includes(
+                              backend
+                            )
+                          ).length <= 1
+                        }
                         onClick={() => setInvestigateSelectionMode('custom')}
                       >
                         <SelectValue />
@@ -1835,6 +2422,9 @@ ${resolveInstructions}`
                         )}
                         {installedBackends.includes('opencode') && (
                           <SelectItem value="opencode">OpenCode</SelectItem>
+                        )}
+                        {installedBackends.includes('grok') && (
+                          <SelectItem value="grok">Grok (Beta)</SelectItem>
                         )}
                       </SelectContent>
                     </Select>
@@ -1851,7 +2441,10 @@ ${resolveInstructions}`
                         setCustomInvestigateModel(value)
                       }}
                     >
-                      <SelectTrigger size="sm">
+                      <SelectTrigger
+                        size="sm"
+                        hideIcon={customInvestigateModelOptions.length <= 1}
+                      >
                         <SelectValue />
                       </SelectTrigger>
                       <SelectContent>
@@ -1962,6 +2555,13 @@ ${resolveInstructions}`
                     >
                       <SelectTrigger
                         size="sm"
+                        hideIcon={
+                          installedBackends.filter(backend =>
+                            ['claude', 'codex', 'opencode', 'grok'].includes(
+                              backend
+                            )
+                          ).length <= 1
+                        }
                         onClick={() => setResolveSelectionMode('custom')}
                       >
                         <SelectValue />
@@ -1975,6 +2575,9 @@ ${resolveInstructions}`
                         )}
                         {installedBackends.includes('opencode') && (
                           <SelectItem value="opencode">OpenCode</SelectItem>
+                        )}
+                        {installedBackends.includes('grok') && (
+                          <SelectItem value="grok">Grok (Beta)</SelectItem>
                         )}
                       </SelectContent>
                     </Select>
@@ -1991,7 +2594,10 @@ ${resolveInstructions}`
                         setCustomResolveModel(value)
                       }}
                     >
-                      <SelectTrigger size="sm">
+                      <SelectTrigger
+                        size="sm"
+                        hideIcon={customResolveModelOptions.length <= 1}
+                      >
                         <SelectValue />
                       </SelectTrigger>
                       <SelectContent>

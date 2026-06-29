@@ -1,6 +1,16 @@
-import { describe, it, expect, beforeEach } from 'vitest'
+import { describe, it, expect, beforeEach, vi } from 'vitest'
+
+const { mockInvoke } = vi.hoisted(() => ({
+  mockInvoke: vi.fn().mockResolvedValue(undefined),
+}))
+
+vi.mock('@/lib/transport', () => ({
+  invoke: mockInvoke,
+}))
+
 import { useChatStore } from './chat-store'
 import type {
+  ContentBlock,
   ToolCall,
   QueuedMessage,
   CodexCommandApprovalRequest,
@@ -13,6 +23,9 @@ import type { ReviewResponse } from '@/types/projects'
 
 describe('ChatStore', () => {
   beforeEach(() => {
+    vi.clearAllMocks()
+    mockInvoke.mockResolvedValue(undefined)
+
     useChatStore.setState({
       activeWorktreeId: null,
       activeWorktreePath: null,
@@ -23,11 +36,13 @@ describe('ChatStore', () => {
       worktreePaths: {},
       sendingSessionIds: {},
       sendStartedAt: {},
+      completedDurations: {},
       waitingForInputSessionIds: {},
       sessionWorktreeMap: {},
       streamingContents: {},
       activeToolCalls: {},
       streamingContentBlocks: {},
+      streamingReplayContentBlocks: {},
       streamingThinkingContent: {},
       inputDrafts: {},
       executionModes: {},
@@ -80,6 +95,46 @@ describe('ChatStore', () => {
       const state = useChatStore.getState()
       expect(state.sessionWorktreeMap['session-1']).toBe('worktree-1')
       expect(state.sessionWorktreeMap['session-2']).toBe('worktree-2')
+    })
+
+    it('marks sessions opened by default when setting active session', async () => {
+      const handler = vi.fn()
+      window.addEventListener('session-opened', handler)
+
+      useChatStore.getState().setActiveSession('worktree-1', 'session-1')
+
+      expect(mockInvoke).toHaveBeenCalledWith('set_session_last_opened', {
+        sessionId: 'session-1',
+      })
+
+      await Promise.resolve()
+
+      expect(handler).toHaveBeenCalledTimes(1)
+      const event = handler.mock.calls[0]?.[0]
+      expect(event).toMatchObject({
+        detail: { sessionIds: ['session-1'] },
+      })
+
+      window.removeEventListener('session-opened', handler)
+    })
+
+    it('can set active session without marking it opened', async () => {
+      const handler = vi.fn()
+      window.addEventListener('session-opened', handler)
+
+      useChatStore
+        .getState()
+        .setActiveSession('worktree-1', 'session-1', { markOpened: false })
+
+      await Promise.resolve()
+
+      expect(mockInvoke).not.toHaveBeenCalled()
+      expect(handler).not.toHaveBeenCalled()
+      expect(useChatStore.getState().activeSessionIds['worktree-1']).toBe(
+        'session-1'
+      )
+
+      window.removeEventListener('session-opened', handler)
     })
   })
 
@@ -197,7 +252,40 @@ describe('ChatStore', () => {
       const state = useChatStore.getState()
       expect(state.sendingSessionIds['session-1']).toBeUndefined()
       expect(state.sendStartedAt['session-1']).toBeUndefined()
+      expect(state.completedDurations['session-1']).toBeGreaterThanOrEqual(0)
       expect(state.reviewingSessions['session-1']).toBe(true)
+    })
+
+    it('stores completed duration when a session completes', () => {
+      const nowSpy = vi.spyOn(Date, 'now')
+      nowSpy.mockReturnValueOnce(10_000).mockReturnValueOnce(25_000)
+
+      const { addSendingSession, completeSession } = useChatStore.getState()
+      addSendingSession('session-1')
+
+      useChatStore.setState({
+        streamingContents: { 'session-1': 'Done' },
+      })
+
+      completeSession('session-1')
+
+      const state = useChatStore.getState()
+      expect(state.completedDurations['session-1']).toBe(15_000)
+      expect(state.sendStartedAt['session-1']).toBeUndefined()
+
+      nowSpy.mockRestore()
+    })
+
+    it('clears previous completed duration when a new send starts', () => {
+      useChatStore.setState({
+        completedDurations: { 'session-1': 12_000 },
+      })
+
+      useChatStore.getState().addSendingSession('session-1', 20_000)
+
+      const state = useChatStore.getState()
+      expect(state.completedDurations['session-1']).toBeUndefined()
+      expect(state.sendStartedAt['session-1']).toBe(20_000)
     })
 
     it('blocks fast completion when no current streaming state exists', () => {
@@ -247,9 +335,28 @@ describe('ChatStore', () => {
       const state = useChatStore.getState()
       expect(state.sendingSessionIds['session-1']).toBeUndefined()
       expect(state.sendStartedAt['session-1']).toBeUndefined()
+      expect(state.completedDurations['session-1']).toBeGreaterThanOrEqual(0)
       expect(state.pendingPermissionDenials['session-1']).toBeUndefined()
       expect(state.deniedMessageContext['session-1']).toBeUndefined()
       expect(state.reviewingSessions['session-1']).toBe(true)
+    })
+
+    it('stores completed duration when a session fails after running', () => {
+      const nowSpy = vi.spyOn(Date, 'now')
+      nowSpy.mockReturnValueOnce(30_000)
+
+      useChatStore.setState({
+        sendingSessionIds: { 'session-1': true },
+        sendStartedAt: { 'session-1': 20_000 },
+      })
+
+      useChatStore.getState().failSession('session-1')
+
+      expect(useChatStore.getState().completedDurations['session-1']).toBe(
+        10_000
+      )
+
+      nowSpy.mockRestore()
     })
   })
 
@@ -418,6 +525,68 @@ describe('ChatStore', () => {
     })
   })
 
+  describe('streaming replay dedupe', () => {
+    const replayBlocks: ContentBlock[] = [
+      { type: 'text', text: 'Before tool. ' },
+      { type: 'tool_use', tool_call_id: 'tool-1' },
+      { type: 'text', text: 'After tool.' },
+    ]
+
+    it('consumes replayed text and tool blocks without changing rendered order', () => {
+      const store = useChatStore.getState()
+
+      store.addTextBlock('session-1', 'Before tool. ')
+      store.addToolBlock('session-1', 'tool-1')
+      store.addTextBlock('session-1', 'After tool.')
+      store.setStreamingReplayContentBlocks('session-1', replayBlocks)
+
+      expect(
+        store.consumeStreamingReplayText('session-1', 'Before tool. ')
+      ).toBe('')
+      expect(store.consumeStreamingReplayToolBlock('session-1', 'tool-1')).toBe(
+        true
+      )
+      expect(store.consumeStreamingReplayText('session-1', 'After tool.')).toBe(
+        ''
+      )
+
+      expect(
+        useChatStore.getState().getStreamingContentBlocks('session-1')
+      ).toEqual(replayBlocks)
+      expect(
+        useChatStore.getState().streamingReplayContentBlocks['session-1']
+      ).toBeUndefined()
+    })
+
+    it('clears replay dedupe and keeps new text when incoming text does not match', () => {
+      const store = useChatStore.getState()
+
+      store.setStreamingReplayContentBlocks('session-1', replayBlocks)
+
+      expect(store.consumeStreamingReplayText('session-1', 'New output')).toBe(
+        'New output'
+      )
+      expect(
+        useChatStore.getState().streamingReplayContentBlocks['session-1']
+      ).toBeUndefined()
+    })
+
+    it('returns the non-replayed suffix when a text chunk crosses the replay boundary', () => {
+      const store = useChatStore.getState()
+
+      store.setStreamingReplayContentBlocks('session-1', [
+        { type: 'text', text: 'Old' },
+      ])
+
+      expect(store.consumeStreamingReplayText('session-1', 'OldNew')).toBe(
+        'New'
+      )
+      expect(
+        useChatStore.getState().streamingReplayContentBlocks['session-1']
+      ).toBeUndefined()
+    })
+  })
+
   describe('execution mode', () => {
     it('cycles execution mode', () => {
       const { cycleExecutionMode, getExecutionMode } = useChatStore.getState()
@@ -574,6 +743,53 @@ describe('ChatStore', () => {
 
       expect(getQueueLength('session-1')).toBe(0)
     })
+
+    it('moves middle message to front', () => {
+      const { enqueueMessage, moveQueuedMessageFront, getQueuedMessages } =
+        useChatStore.getState()
+
+      enqueueMessage('session-1', createMockMessage('msg-1', 'First'))
+      enqueueMessage('session-1', createMockMessage('msg-2', 'Second'))
+      enqueueMessage('session-1', createMockMessage('msg-3', 'Third'))
+
+      moveQueuedMessageFront('session-1', 'msg-2')
+
+      expect(getQueuedMessages('session-1').map(m => m.id)).toEqual([
+        'msg-2',
+        'msg-1',
+        'msg-3',
+      ])
+    })
+
+    it('moves last message to front', () => {
+      const { enqueueMessage, moveQueuedMessageFront, getQueuedMessages } =
+        useChatStore.getState()
+
+      enqueueMessage('session-1', createMockMessage('msg-1', 'First'))
+      enqueueMessage('session-1', createMockMessage('msg-2', 'Second'))
+
+      moveQueuedMessageFront('session-1', 'msg-2')
+
+      expect(getQueuedMessages('session-1').map(m => m.id)).toEqual([
+        'msg-2',
+        'msg-1',
+      ])
+    })
+
+    it('move-to-front is a no-op for unknown id or already-first message', () => {
+      const { enqueueMessage, moveQueuedMessageFront } = useChatStore.getState()
+
+      enqueueMessage('session-1', createMockMessage('msg-1', 'First'))
+      enqueueMessage('session-1', createMockMessage('msg-2', 'Second'))
+
+      const before = useChatStore.getState().messageQueues['session-1']
+      moveQueuedMessageFront('session-1', 'unknown-id')
+      // Same reference — no subscribers notified
+      expect(useChatStore.getState().messageQueues['session-1']).toBe(before)
+
+      moveQueuedMessageFront('session-1', 'msg-1')
+      expect(useChatStore.getState().messageQueues['session-1']).toBe(before)
+    })
   })
 
   describe('permission approvals', () => {
@@ -621,6 +837,52 @@ describe('ChatStore', () => {
       clearPendingDenials('session-1')
 
       expect(getPendingDenials('session-1')).toHaveLength(0)
+    })
+
+    it('preserves pending denials and context when a session completes', () => {
+      const deniedContext = {
+        message: 'run tests',
+        model: 'opus',
+        executionMode: 'plan' as const,
+        thinkingLevel: 'off' as const,
+      }
+
+      useChatStore.setState({
+        pendingPermissionDenials: { 'session-1': denials },
+        deniedMessageContext: { 'session-1': deniedContext },
+        sendingSessionIds: { 'session-1': true },
+        streamingContents: { 'session-1': 'Permission required' },
+      })
+
+      useChatStore.getState().completeSession('session-1')
+
+      const state = useChatStore.getState()
+      expect(state.pendingPermissionDenials['session-1']).toEqual(denials)
+      expect(state.deniedMessageContext['session-1']).toEqual(deniedContext)
+      expect(state.sendingSessionIds['session-1']).toBeUndefined()
+    })
+
+    it('preserves pending denials and context when a session fails', () => {
+      const deniedContext = {
+        message: 'run tests',
+        model: 'opus',
+        executionMode: 'plan' as const,
+        thinkingLevel: 'off' as const,
+      }
+
+      useChatStore.setState({
+        pendingPermissionDenials: { 'session-1': denials },
+        deniedMessageContext: { 'session-1': deniedContext },
+        sendingSessionIds: { 'session-1': true },
+        streamingContents: { 'session-1': 'Permission required' },
+      })
+
+      useChatStore.getState().failSession('session-1')
+
+      const state = useChatStore.getState()
+      expect(state.pendingPermissionDenials['session-1']).toEqual(denials)
+      expect(state.deniedMessageContext['session-1']).toEqual(deniedContext)
+      expect(state.sendingSessionIds['session-1']).toBeUndefined()
     })
   })
 
@@ -1099,6 +1361,39 @@ describe('ChatStore', () => {
 
       setSessionReviewing('session-1', false)
       expect(isSessionReviewing('session-1')).toBe(false)
+    })
+  })
+
+  describe('pending files', () => {
+    it('deduplicates pending files by source scope and relative path', () => {
+      const { addPendingFile } = useChatStore.getState()
+
+      addPendingFile('session-1', {
+        id: 'file-current',
+        relativePath: 'src/App.tsx',
+        extension: 'tsx',
+        isDirectory: false,
+      })
+      addPendingFile('session-1', {
+        id: 'file-current-dupe',
+        relativePath: 'src/App.tsx',
+        extension: 'tsx',
+        isDirectory: false,
+      })
+      addPendingFile('session-1', {
+        id: 'file-linked',
+        relativePath: 'src/App.tsx',
+        sourceRootPath: '/tmp/linked',
+        sourceProjectId: 'linked',
+        sourceProjectName: 'Linked',
+        extension: 'tsx',
+        isDirectory: false,
+      })
+
+      expect(useChatStore.getState().pendingFiles['session-1']).toHaveLength(2)
+      expect(
+        useChatStore.getState().pendingFiles['session-1']?.map(file => file.id)
+      ).toEqual(['file-current', 'file-linked'])
     })
   })
 })

@@ -30,7 +30,7 @@ import {
   extractTextFilePaths,
 } from '../message-content-utils'
 import { navigateToApprovedWorktree } from '../worktree-approval-navigation'
-import { markWorktreeSilentReady } from '@/services/worktree-silent-ready'
+import type { CliBackend } from '@/types/preferences'
 
 const THINKING_LEVEL_VALUES = new Set<ThinkingLevel>([
   'off',
@@ -66,26 +66,52 @@ function mapCodexReasoningToEffort(
 }
 
 function getDefaultModelForBackend(
-  backend: 'claude' | 'codex' | 'opencode' | 'cursor' | undefined,
+  backend: CliBackend | undefined,
   preferences:
     | {
         selected_model?: string | null
         selected_codex_model?: string | null
         selected_opencode_model?: string | null
         selected_cursor_model?: string | null
+        selected_pi_model?: string | null
+        selected_commandcode_model?: string | null
+        selected_grok_model?: string | null
       }
     | undefined
 ): string {
   if (backend === 'codex') {
-    return preferences?.selected_codex_model ?? 'gpt-5.4'
+    return preferences?.selected_codex_model ?? 'gpt-5.5'
   }
   if (backend === 'opencode') {
-    return preferences?.selected_opencode_model ?? 'opencode/gpt-5.3-codex'
+    return preferences?.selected_opencode_model ?? 'opencode/gpt-5.5'
   }
   if (backend === 'cursor') {
     return preferences?.selected_cursor_model ?? 'cursor/auto'
   }
-  return preferences?.selected_model ?? 'claude-opus-4-7'
+  if (backend === 'pi') {
+    return preferences?.selected_pi_model ?? 'pi/sonnet'
+  }
+  if (backend === 'commandcode') {
+    return preferences?.selected_commandcode_model ?? 'commandcode/default'
+  }
+  if (backend === 'grok') {
+    return preferences?.selected_grok_model ?? 'grok/grok-composer-2.5-fast'
+  }
+  return preferences?.selected_model ?? 'claude-opus-4-8[1m]'
+}
+
+function clearWorktreeApprovalUiState(
+  sessionId: string,
+  options: { preserveToolCalls: boolean }
+) {
+  const store = useChatStore.getState()
+  if (!options.preserveToolCalls) {
+    store.clearToolCalls(sessionId)
+    store.clearStreamingContentBlocks(sessionId)
+  }
+  store.setSessionReviewing(sessionId, false)
+  store.setWaitingForInput(sessionId, false)
+  store.setPendingPlanMessageId(sessionId, null)
 }
 
 interface UseWorktreeApprovalParams {
@@ -168,13 +194,11 @@ export function useWorktreeApproval({
         })
       }
 
-      // Clear waiting state on original session
-      const store = useChatStore.getState()
-      store.clearToolCalls(sessionId)
-      store.clearStreamingContentBlocks(sessionId)
-      store.setSessionReviewing(sessionId, false)
-      store.setWaitingForInput(sessionId, false)
-      store.setPendingPlanMessageId(sessionId, null)
+      // Clear waiting state on original session. Codex keeps plan tasks in its
+      // native update_plan/CodexPlan state, so preserve those tool calls.
+      clearWorktreeApprovalUiState(sessionId, {
+        preserveToolCalls: card.session.backend === 'codex',
+      })
 
       invoke('update_session_state', {
         worktreeId,
@@ -214,8 +238,6 @@ export function useWorktreeApproval({
         toast.error(`Failed to create worktree: ${err}`)
         return
       }
-      markWorktreeSilentReady(pendingWorktree.id)
-
       // Step 4: Wait for worktree to be ready
       let readyWorktree: Worktree
       try {
@@ -381,7 +403,7 @@ export function useWorktreeApproval({
         effortLevel = mapCodexReasoningToEffort(modeEffortPref)
       }
       const resolvedPlanFilePath =
-        card.planFilePath || store.getPlanFilePath(sessionId)
+        card.planFilePath || useChatStore.getState().getPlanFilePath(sessionId)
       const planFileLine = resolvedPlanFilePath
         ? `\nPlan file: ${resolvedPlanFilePath}\n`
         : ''
@@ -426,8 +448,15 @@ export function useWorktreeApproval({
       if (backend) {
         chatStore.setSelectedBackend(
           newSession.id,
-          backend as 'claude' | 'codex' | 'opencode' | 'cursor'
+          backend as
+            | 'claude'
+            | 'codex'
+            | 'opencode'
+            | 'cursor'
+            | 'pi'
+            | 'commandcode'
         )
+        chatStore.setSelectedBackend(newSession.id, backend as CliBackend)
       }
 
       queryClient.setQueryData<Session>(

@@ -35,7 +35,7 @@ export function KeybindingHints({ hints, className }: KeybindingHintsProps) {
           variant="ghost"
           size="icon"
           className={cn(
-            'absolute bottom-4 left-4 z-10 hidden sm:inline-flex h-7 w-7 rounded-full border border-border/30 bg-background/60 backdrop-blur-md text-muted-foreground hover:text-foreground',
+            'absolute bottom-4 left-4 z-10 hidden sm:inline-flex h-7 w-7 rounded-full border border-border/30 bg-background/60 text-muted-foreground hover:text-foreground',
             className
           )}
         >

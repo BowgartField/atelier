@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import {
   computeSessionCardData,
+  getEffectiveSessionWaiting,
   type ChatStoreState,
 } from './session-card-utils'
 import type { Session } from '@/types/chat'
@@ -33,7 +34,6 @@ describe('computeSessionCardData', () => {
       waitingForInputSessionIds: {},
       reviewingSessions: {},
       pendingPermissionDenials: {},
-      sessionDigests: {},
       sessionLabels: {},
       ...overrides,
     }
@@ -144,6 +144,25 @@ describe('computeSessionCardData', () => {
     expect(card.status).toBe('review')
   })
 
+  it('ignores stale Zustand waiting flag when remote run completed normally', () => {
+    const session: Session = {
+      ...createBaseSession(),
+      waiting_for_input: false,
+      is_reviewing: false,
+      last_run_status: 'completed',
+      last_run_execution_mode: 'build',
+    }
+    const storeState = createBaseStoreState({
+      waitingForInputSessionIds: { 'session-1': true },
+    })
+
+    const card = computeSessionCardData(session, storeState)
+
+    expect(getEffectiveSessionWaiting(session, storeState)).toBe(false)
+    expect(card.isWaiting).toBe(false)
+    expect(card.status).toBe('completed')
+  })
+
   it('ignores stale persisted waiting_for_input on completed non-plan run', () => {
     const session: Session = {
       ...createBaseSession(),
@@ -172,6 +191,60 @@ describe('computeSessionCardData', () => {
 
     const card = computeSessionCardData(session, storeState)
 
+    expect(card.isWaiting).toBe(true)
+    expect(card.status).toBe('waiting')
+  })
+
+  it('honors persisted waiting_for_input when completed run paused on a question', () => {
+    const session: Session = {
+      ...createBaseSession(),
+      waiting_for_input: true,
+      waiting_for_input_type: 'question',
+      last_run_status: 'completed',
+      last_run_execution_mode: 'build',
+    }
+    const storeState = createBaseStoreState()
+
+    const card = computeSessionCardData(session, storeState)
+
+    expect(card.isWaiting).toBe(true)
+    expect(card.hasQuestion).toBe(true)
+    expect(card.status).toBe('waiting')
+  })
+
+  it('clears waiting once a completed question run is answered', () => {
+    const session: Session = {
+      ...createBaseSession(),
+      waiting_for_input: false,
+      waiting_for_input_type: 'question',
+      last_run_status: 'completed',
+      last_run_execution_mode: 'build',
+    }
+    const storeState = createBaseStoreState()
+
+    const card = computeSessionCardData(session, storeState)
+
+    expect(card.isWaiting).toBe(false)
+    expect(card.status).not.toBe('waiting')
+  })
+
+  it('recovers legacy completed plan sessions that have a pending plan id but stale review flags', () => {
+    const session: Session = {
+      ...createBaseSession(),
+      waiting_for_input: false,
+      waiting_for_input_type: 'plan',
+      is_reviewing: true,
+      pending_plan_message_id: 'plan-message-1',
+      last_run_status: 'completed',
+      last_run_execution_mode: 'plan',
+    }
+    const storeState = createBaseStoreState({
+      reviewingSessions: { 'session-1': true },
+    })
+
+    const card = computeSessionCardData(session, storeState)
+
+    expect(getEffectiveSessionWaiting(session, storeState)).toBe(true)
     expect(card.isWaiting).toBe(true)
     expect(card.status).toBe('waiting')
   })

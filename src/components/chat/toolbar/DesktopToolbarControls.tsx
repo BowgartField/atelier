@@ -5,8 +5,10 @@ import {
   FolderOpen,
   GitMerge,
   GitPullRequest,
+  Paperclip,
   Shield,
   ShieldAlert,
+  Wand2,
 } from 'lucide-react'
 import { useCallback } from 'react'
 import { Kbd } from '@/components/ui/kbd'
@@ -25,7 +27,7 @@ import {
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu'
-import type { CustomCliProfile } from '@/types/preferences'
+import type { CliBackend, CustomCliProfile } from '@/types/preferences'
 import type {
   EffortLevel,
   ExecutionMode,
@@ -50,7 +52,10 @@ import type {
 import { openExternal } from '@/lib/platform'
 import { cn } from '@/lib/utils'
 import {
+  CODEX_EFFORT_LEVEL_OPTIONS,
   EFFORT_LEVEL_OPTIONS,
+  GROK_EFFORT_LEVEL_OPTIONS,
+  PI_EFFORT_LEVEL_OPTIONS,
   THINKING_LEVEL_OPTIONS,
 } from '@/components/chat/toolbar/toolbar-options'
 import {
@@ -63,7 +68,7 @@ import { DockBurgerButton } from '@/components/chat/toolbar/DockBurgerButton'
 
 interface DesktopToolbarControlsProps {
   hasPendingQuestions: boolean
-  selectedBackend: 'claude' | 'codex' | 'opencode' | 'cursor'
+  selectedBackend: CliBackend
   selectedModel: string
   selectedProvider: string | null
   selectedThinkingLevel: ThinkingLevel
@@ -108,16 +113,13 @@ interface DesktopToolbarControlsProps {
   onResolvePrConflicts: () => void
   onLoadContext: () => void
   onAttach: () => void
-  installedBackends: ('claude' | 'codex' | 'opencode' | 'cursor')[]
+  installedBackends: CliBackend[]
   onSetExecutionMode: (mode: ExecutionMode) => void
   availableExecutionModes: ExecutionMode[]
   onToggleMcpServer: (name: string) => void
 
   handleModelChange: (value: string) => void
-  handleBackendModelChange: (
-    backend: 'claude' | 'codex' | 'opencode' | 'cursor',
-    model: string
-  ) => void
+  handleBackendModelChange: (backend: CliBackend, model: string) => void
   handleProviderChange: (value: string) => void
   handleThinkingLevelChange: (value: string) => void
   handleEffortLevelChange: (value: string) => void
@@ -166,7 +168,7 @@ export function DesktopToolbarControls({
   setProviderDropdownOpen,
   setThinkingDropdownOpen,
   onMcpDropdownOpenChange: _onMcpDropdownOpenChange,
-  onOpenMagicModal: _onOpenMagicModal,
+  onOpenMagicModal,
   onOpenProjectSettings: _onOpenProjectSettings,
   onResolvePrConflicts,
   onLoadContext,
@@ -187,6 +189,32 @@ export function DesktopToolbarControls({
   handleViewLinear,
   handleViewSavedContext,
 }: DesktopToolbarControlsProps) {
+  const isPi = selectedBackend === 'pi'
+  const isGrok = selectedBackend === 'grok'
+  const usesEffortControl = useAdaptiveThinking || isCodex || isPi || isGrok
+  const effortLevelOptions = isPi
+    ? PI_EFFORT_LEVEL_OPTIONS
+    : isCodex
+      ? CODEX_EFFORT_LEVEL_OPTIONS
+      : isGrok
+        ? GROK_EFFORT_LEVEL_OPTIONS
+        : EFFORT_LEVEL_OPTIONS
+  const displayedEffortLevel =
+    isCodex || isPi
+      ? selectedEffortLevel === 'max'
+        ? 'high'
+        : selectedEffortLevel === 'ultracode'
+          ? 'xhigh'
+          : selectedEffortLevel
+      : isGrok && selectedEffortLevel === 'ultracode'
+        ? 'max'
+        : selectedEffortLevel
+  const displayedEffortLabel =
+    effortLevelOptions.find(o => o.value === displayedEffortLevel)?.label ??
+    displayedEffortLevel
+  const hideReasoningControl =
+    hideThinkingLevel || selectedBackend === 'commandcode'
+
   // Prevent Radix from restoring focus to the trigger button;
   // redirect focus to the chat input instead.
   const focusChatInput = useCallback((e: Event) => {
@@ -206,9 +234,37 @@ export function DesktopToolbarControls({
     <>
       <DockBurgerButton
         activeMcpCount={activeMcpCount}
-        onAttach={onAttach}
         className="hidden @xl:flex"
       />
+
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <button
+            type="button"
+            aria-label="Magic"
+            className="hidden @xl:flex h-8 items-center gap-1 px-2 text-xs font-medium text-muted-foreground transition-colors hover:bg-muted/80 hover:text-foreground disabled:pointer-events-none disabled:opacity-50"
+            onClick={onOpenMagicModal}
+          >
+            <Wand2 className="h-3.5 w-3.5" />
+          </button>
+        </TooltipTrigger>
+        <TooltipContent>Magic (⌘M)</TooltipContent>
+      </Tooltip>
+
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <button
+            type="button"
+            aria-label="Attachments"
+            disabled={hasPendingQuestions}
+            className="hidden @xl:flex h-8 items-center gap-1 px-2 text-xs font-medium text-muted-foreground transition-colors hover:bg-muted/80 hover:text-foreground disabled:pointer-events-none disabled:opacity-50"
+            onClick={onAttach}
+          >
+            <Paperclip className="h-3.5 w-3.5" />
+          </button>
+        </TooltipTrigger>
+        <TooltipContent>Attachments</TooltipContent>
+      </Tooltip>
 
       <div className="hidden @xl:block h-4 w-px bg-border/50" />
 
@@ -492,9 +548,7 @@ export function DesktopToolbarControls({
         </>
       )}
 
-      {customCliProfiles.length > 0 &&
-        !providerLocked &&
-        selectedBackend === 'claude' && (
+      {customCliProfiles.length > 0 && selectedBackend === 'claude' && (
           <>
             <div className="hidden @xl:block h-4 w-px bg-border/50" />
             <DropdownMenu
@@ -506,7 +560,6 @@ export function DesktopToolbarControls({
                   <DropdownMenuTrigger asChild>
                     <button
                       type="button"
-                      disabled={hasPendingQuestions}
                       className="hidden @xl:flex h-8 items-center gap-1.5 px-3 text-xs font-medium text-muted-foreground transition-colors hover:bg-muted/80 hover:text-foreground disabled:pointer-events-none disabled:opacity-50"
                     >
                       <span>{providerDisplayName}</span>
@@ -558,7 +611,7 @@ export function DesktopToolbarControls({
       <div className="hidden @xl:block h-4 w-px bg-border/50" />
 
       <DesktopBackendModelPicker
-        disabled={hasPendingQuestions}
+        disabled={false}
         sessionHasMessages={sessionHasMessages}
         providerLocked={providerLocked}
         triggerClassName="rounded-none border-0 bg-transparent px-3"
@@ -571,11 +624,11 @@ export function DesktopToolbarControls({
         onBackendModelChange={handleBackendModelChange}
       />
 
-      {!hideThinkingLevel && (
+      {!hideReasoningControl && (
         <div className="hidden @xl:block h-4 w-px bg-border/50" />
       )}
 
-      {hideThinkingLevel ? null : useAdaptiveThinking || isCodex ? (
+      {hideReasoningControl ? null : usesEffortControl ? (
         <DropdownMenu
           open={thinkingDropdownOpen}
           onOpenChange={setThinkingDropdownOpen}
@@ -585,22 +638,15 @@ export function DesktopToolbarControls({
               <DropdownMenuTrigger asChild>
                 <button
                   type="button"
-                  disabled={hasPendingQuestions}
                   className="hidden @xl:flex h-8 items-center gap-1.5 px-3 text-xs font-medium text-muted-foreground transition-colors hover:bg-muted/80 hover:text-foreground disabled:pointer-events-none disabled:opacity-50"
                 >
                   <Brain className="h-3.5 w-3.5 text-purple-600 dark:text-purple-400" />
-                  <span>
-                    {
-                      EFFORT_LEVEL_OPTIONS.find(
-                        o => o.value === selectedEffortLevel
-                      )?.label
-                    }
-                  </span>
+                  <span>{displayedEffortLabel}</span>
                 </button>
               </DropdownMenuTrigger>
             </TooltipTrigger>
             <TooltipContent>
-              {`Effort: ${EFFORT_LEVEL_OPTIONS.find(o => o.value === selectedEffortLevel)?.label} (⌘⇧E)`}
+              {`Effort: ${displayedEffortLabel} (⌘⇧E)`}
             </TooltipContent>
           </Tooltip>
           <DropdownMenuContent
@@ -609,10 +655,10 @@ export function DesktopToolbarControls({
             onCloseAutoFocus={focusChatInput}
           >
             <DropdownMenuRadioGroup
-              value={selectedEffortLevel}
+              value={displayedEffortLevel}
               onValueChange={handleEffortLevelChange}
             >
-              {EFFORT_LEVEL_OPTIONS.map((option, i) => (
+              {effortLevelOptions.map((option, i) => (
                 <DropdownMenuRadioItem key={option.value} value={option.value}>
                   <Brain className="mr-2 h-4 w-4" />
                   {option.label}
@@ -635,7 +681,6 @@ export function DesktopToolbarControls({
               <DropdownMenuTrigger asChild>
                 <button
                   type="button"
-                  disabled={hasPendingQuestions}
                   className="hidden @xl:flex h-8 items-center gap-1.5 px-3 text-xs font-medium text-muted-foreground transition-colors hover:bg-muted/80 hover:text-foreground disabled:pointer-events-none disabled:opacity-50"
                 >
                   <Brain
@@ -688,7 +733,7 @@ export function DesktopToolbarControls({
       <ExecutionModeDropdown
         executionMode={executionMode}
         availableModes={availableExecutionModes}
-        disabled={hasPendingQuestions}
+        disabled={false}
         onSetExecutionMode={onSetExecutionMode}
         className="hidden @xl:flex"
         onCloseAutoFocus={focusChatInput}

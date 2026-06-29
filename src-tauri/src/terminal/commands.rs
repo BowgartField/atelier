@@ -1,4 +1,5 @@
 use serde::Serialize;
+#[cfg(unix)]
 use std::collections::{HashMap, HashSet};
 use tauri::AppHandle;
 
@@ -6,7 +7,10 @@ use super::pty::{
     kill_all_terminals as pty_kill_all_terminals, kill_terminal, resize_terminal, spawn_terminal,
     write_to_terminal,
 };
-use super::registry::{get_all_terminal_ids, has_terminal, TERMINAL_SESSIONS};
+#[cfg(unix)]
+use super::registry::TERMINAL_SESSIONS;
+use super::registry::{get_all_terminal_ids, has_terminal};
+#[cfg(unix)]
 use crate::platform::silent_command;
 use crate::projects::git::read_jean_config;
 
@@ -53,6 +57,29 @@ pub async fn start_terminal(
         rows,
         command,
         command_args,
+    )
+}
+
+/// Prepare context-only command args for an embedded backend terminal session.
+///
+/// This intentionally avoids Jean chat execution controls such as model,
+/// effort, execution mode, approval policy, and sandbox settings. It only
+/// passes the combined Jean instructions and loaded context through the
+/// backend's native context mechanism.
+#[tauri::command]
+pub async fn prepare_backend_terminal_context(
+    app: AppHandle,
+    session_id: String,
+    worktree_id: String,
+    backend: String,
+) -> Result<crate::chat::context_instructions::PreparedBackendTerminalContext, String> {
+    let backend = crate::chat::context_instructions::TerminalContextBackend::parse(&backend)
+        .ok_or_else(|| format!("Unsupported backend terminal context: {backend}"))?;
+    crate::chat::context_instructions::prepare_backend_terminal_context(
+        &app,
+        &session_id,
+        &worktree_id,
+        backend,
     )
 }
 
@@ -171,7 +198,7 @@ pub async fn get_terminal_listening_ports() -> Vec<TerminalPortInfo> {
     #[cfg(not(unix))]
     {
         // lsof is not available on Windows
-        return Vec::new();
+        Vec::new()
     }
 
     #[cfg(unix)]

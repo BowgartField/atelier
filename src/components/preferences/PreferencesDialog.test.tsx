@@ -10,6 +10,30 @@ vi.mock('./panes/GeneralPane', () => ({
   GeneralPane: () => <div>General pane</div>,
 }))
 
+vi.mock('./panes/ClaudePane', () => ({
+  ClaudePane: () => <div>Claude pane</div>,
+}))
+
+vi.mock('./panes/CodexPane', () => ({
+  CodexPane: () => <div>Codex pane</div>,
+}))
+
+vi.mock('./panes/OpenCodePane', () => ({
+  OpenCodePane: () => <div>OpenCode pane</div>,
+}))
+
+vi.mock('./panes/CursorPane', () => ({
+  CursorPane: () => <div>Cursor pane</div>,
+}))
+
+vi.mock('./panes/GitHubPane', () => ({
+  GitHubPane: () => <div>GitHub CLI pane</div>,
+}))
+
+vi.mock('./panes/CodeRabbitPane', () => ({
+  CodeRabbitPane: () => <div>CodeRabbit CLI pane</div>,
+}))
+
 vi.mock('./panes/AppearancePane', () => ({
   AppearancePane: () => <div>Appearance pane</div>,
 }))
@@ -21,6 +45,10 @@ vi.mock('./panes/KeybindingsPane', async importOriginal => {
     KeybindingsPane: () => <div>Keybindings pane</div>,
   }
 })
+
+vi.mock('./panes/TerminalPane', () => ({
+  TerminalPane: () => <div>Terminal pane</div>,
+}))
 
 vi.mock('./panes/MagicPromptsPane', async importOriginal => {
   const actual = await importOriginal<typeof MagicPromptsPaneModule>()
@@ -75,7 +103,7 @@ describe('PreferencesDialog', () => {
 
     const dialog = screen.getByRole('dialog')
     const desktopHeaderActions = dialog.querySelector<HTMLElement>(
-      'div[class~="ml-auto"][class~="md:flex"]'
+      'div[class~="ml-auto"][class~="lg:flex"]'
     )
 
     if (!desktopHeaderActions) {
@@ -95,6 +123,50 @@ describe('PreferencesDialog', () => {
     })
   })
 
+  it('renders desktop settings navigation in grouped order', () => {
+    render(<PreferencesDialog />)
+
+    const dialog = screen.getByRole('dialog')
+    const navigationMenu = dialog.querySelector<HTMLElement>(
+      '[data-sidebar="menu"]'
+    )
+
+    if (!navigationMenu) {
+      throw new Error('Expected desktop navigation menu to be rendered')
+    }
+
+    expect(
+      within(navigationMenu)
+        .getAllByRole('button')
+        .map(button => button.textContent)
+    ).toEqual([
+      'General',
+      'Appearance',
+      'Keybindings',
+      'Claude',
+      'Codex',
+      'OpenCode',
+      'Cursor',
+      'PI',
+      'Command Code',
+      'Grok (Beta)',
+      'GitHub CLI',
+      'CodeRabbit CLI',
+      'Terminal',
+      'Magic Prompts',
+      'Opinionated',
+      'Providers',
+      'Web Access',
+      'MCP Servers',
+      'Integrations',
+      'Usage',
+      'Experimental',
+    ])
+    expect(
+      navigationMenu.querySelectorAll('[data-sidebar="separator"]')
+    ).toHaveLength(5)
+  })
+
   it('keeps the dialog open when Escape clears the desktop search', async () => {
     const user = userEvent.setup()
 
@@ -102,7 +174,7 @@ describe('PreferencesDialog', () => {
 
     const dialog = screen.getByRole('dialog')
     const desktopHeaderActions = dialog.querySelector<HTMLElement>(
-      'div[class~="ml-auto"][class~="md:flex"]'
+      'div[class~="ml-auto"][class~="lg:flex"]'
     )
 
     if (!desktopHeaderActions) {
@@ -159,7 +231,7 @@ describe('PreferencesDialog', () => {
 
     const dialog = screen.getByRole('dialog')
     const desktopHeaderActions = dialog.querySelector<HTMLElement>(
-      'div[class~="ml-auto"][class~="md:flex"]'
+      'div[class~="ml-auto"][class~="lg:flex"]'
     )
 
     if (!desktopHeaderActions) {

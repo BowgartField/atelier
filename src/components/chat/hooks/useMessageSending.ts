@@ -1,15 +1,23 @@
 import { useCallback, type RefObject } from 'react'
 import { generateId } from '@/lib/uuid'
 import { toast } from 'sonner'
+import { invoke } from '@/lib/transport'
 import { useChatStore } from '@/store/chat-store'
 import {
   chatQueryKeys,
   cancelChatMessage,
   persistEnqueue,
+  steerCodexTurn,
+  steerOpencodeTurn,
+  steerPiTurn,
 } from '@/services/chat'
 import { skillQueryKeys } from '@/services/skills'
 import { buildMcpConfigJson } from '@/services/mcp'
-import { DEFAULT_PARALLEL_EXECUTION_PROMPT } from '@/types/preferences'
+import { buildMessageWithRefs } from '@/components/chat/message-with-refs'
+import {
+  DEFAULT_PARALLEL_EXECUTION_PROMPT,
+  type CliBackend,
+} from '@/types/preferences'
 import type {
   QueuedMessage,
   ExecutionMode,
@@ -35,7 +43,7 @@ interface UseMessageSendingParams {
   isCodexBackendRef: RefObject<boolean>
   mcpServersDataRef: RefObject<McpServerInfo[] | undefined>
   enabledMcpServersRef: RefObject<string[]>
-  selectedBackendRef: RefObject<'claude' | 'codex' | 'opencode' | 'cursor'>
+  selectedBackendRef: RefObject<CliBackend>
   preferences:
     | {
         custom_cli_profiles?: { name: string }[]
@@ -43,15 +51,24 @@ interface UseMessageSendingParams {
         magic_prompts?: { parallel_execution?: string | null }
         chrome_enabled?: boolean
         ai_language?: string
+        codex_goal_execution_mode?: 'build' | 'yolo'
+        codex_auto_steer_enabled?: boolean
+        opencode_auto_steer_enabled?: boolean
+        pi_auto_steer_enabled?: boolean
       }
     | undefined
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   sendMessage: { mutate: (args: any, opts?: any) => void }
+  createSession: {
+    mutateAsync: (args: {
+      worktreeId: string
+      worktreePath: string
+    }) => Promise<Session>
+  }
   queryClient: QueryClient
   markAtBottom: () => void
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   sessionsData: any
-  setInputDraft: (sessionId: string, draft: string) => void
   clearInputDraft: (sessionId: string) => void
   clearChatInputState: () => void
 }
@@ -77,10 +94,10 @@ export function useMessageSending({
   selectedBackendRef,
   preferences,
   sendMessage,
+  createSession,
   queryClient,
   markAtBottom,
   sessionsData,
-  setInputDraft,
   clearInputDraft,
   clearChatInputState,
 }: UseMessageSendingParams) {
@@ -98,60 +115,6 @@ export function useMessageSending({
       }
     },
     [preferences?.custom_cli_profiles]
-  )
-
-  // Helper to build full message with attachment references for backend
-  const buildMessageWithRefs = useCallback(
-    (queuedMsg: QueuedMessage): string => {
-      let message = queuedMsg.message
-
-      if (queuedMsg.pendingFiles.length > 0) {
-        const fileRefs = queuedMsg.pendingFiles
-          .map(f =>
-            f.isDirectory
-              ? `[Directory: ${f.relativePath} - Use Glob and Read tools to explore this directory]`
-              : `[File: ${f.relativePath} - Use the Read tool to view this file]`
-          )
-          .join('\n')
-        message = message ? `${message}\n\n${fileRefs}` : fileRefs
-      }
-
-      if (queuedMsg.pendingSkills.length > 0) {
-        const skillRefs = queuedMsg.pendingSkills
-          .map(
-            s =>
-              `[Skill: ${s.path} - Read and use this skill to guide your response]`
-          )
-          .join('\n')
-        message = message ? `${message}\n\n${skillRefs}` : skillRefs
-      }
-
-      if (queuedMsg.pendingImages.length > 0) {
-        const imageRefs = queuedMsg.pendingImages
-          .map(
-            img =>
-              `[Image attached: ${img.path} - Use the Read tool to view this image]`
-          )
-          .join('\n')
-        message = message ? `${message}\n\n${imageRefs}` : imageRefs
-      }
-
-      if (queuedMsg.pendingTextFiles.length > 0) {
-        if (!message) {
-          message = 'Please check the attached text as reference.'
-        }
-        const textFileRefs = queuedMsg.pendingTextFiles
-          .map(
-            tf =>
-              `[Text file attached: ${tf.path} - Use the Read tool to view this file]`
-          )
-          .join('\n')
-        message = `${message}\n\n${textFileRefs}`
-      }
-
-      return message
-    },
-    []
   )
 
   // Helper to send a queued message immediately
@@ -235,7 +198,6 @@ export function useMessageSending({
       activeSessionId,
       activeWorktreeId,
       activeWorktreePath,
-      buildMessageWithRefs,
       sendMessage,
       queryClient,
       preferences?.parallel_execution_prompt_enabled,
@@ -246,101 +208,50 @@ export function useMessageSending({
     ]
   )
 
-  // GitDiffModal: add diff reference to input
+  // GitDiffModal: create a fresh current-worktree session with the diff
+  // reference drafted. This avoids sending/queueing into an already-running
+  // session while keeping the user in control of the prompt before submit.
   const handleGitDiffAddToPrompt = useCallback(
-    (reference: string) => {
-      if (activeSessionId) {
-        const { inputDrafts } = useChatStore.getState()
-        const currentInput = inputDrafts[activeSessionId] ?? ''
-        const separator = currentInput.length > 0 ? '\n' : ''
-        setInputDraft(
-          activeSessionId,
-          `${currentInput}${separator}${reference}`
-        )
-      }
-    },
-    [activeSessionId, setInputDraft]
-  )
+    async (reference: string) => {
+      if (!activeWorktreeId || !activeWorktreePath) return
 
-  // GitDiffModal: execute diff prompt immediately
-  const handleGitDiffExecutePrompt = useCallback(
-    (reference: string) => {
-      if (!activeSessionId || !activeWorktreeId || !activeWorktreePath) return
-
-      const {
-        inputDrafts,
-        setLastSentMessage,
-        setError,
-        setSelectedModel,
-        setExecutingMode,
-        clearInputDraft: clearDraft,
-      } = useChatStore.getState()
-      const currentInput = inputDrafts[activeSessionId] ?? ''
-      const separator = currentInput.length > 0 ? '\n' : ''
-      const message = `${currentInput}${separator}${reference}`
-
-      const model = selectedModelRef.current
-      const thinkingLevel = selectedThinkingLevelRef.current
-
-      setLastSentMessage(activeSessionId, message)
-      setError(activeSessionId, null)
-      clearDraft(activeSessionId)
-      // NOTE: addSendingSession is called in onMutate (chat.ts) so it batches
-      // with the optimistic user message in a single React render pass.
-      setSelectedModel(activeSessionId, model)
-      setExecutingMode(activeSessionId, 'build')
-
-      const diffResolved = resolveCustomProfile(
-        model,
-        selectedProviderRef.current
-      )
-      sendMessage.mutate(
-        {
-          sessionId: activeSessionId,
+      let newSession: Session
+      try {
+        newSession = await createSession.mutateAsync({
           worktreeId: activeWorktreeId,
           worktreePath: activeWorktreePath,
-          message,
-          model: diffResolved.model,
-          customProfileName: diffResolved.customProfileName,
-          executionMode: 'build',
-          thinkingLevel,
-          effortLevel:
-            useAdaptiveThinkingRef.current || isCodexBackendRef.current
-              ? selectedEffortLevelRef.current
-              : undefined,
-          mcpConfig: buildMcpConfigJson(
-            mcpServersDataRef.current ?? [],
-            enabledMcpServersRef.current,
-            selectedBackendRef.current
-          ),
-          parallelExecutionPrompt:
-            preferences?.parallel_execution_prompt_enabled
-              ? (preferences.magic_prompts?.parallel_execution ??
-                DEFAULT_PARALLEL_EXECUTION_PROMPT)
-              : undefined,
-          chromeEnabled: preferences?.chrome_enabled ?? false,
-          aiLanguage: preferences?.ai_language,
-          backend:
-            selectedBackendRef.current !== 'claude'
-              ? selectedBackendRef.current
-              : undefined,
-        },
-        { onSettled: () => inputRef.current?.focus() }
-      )
+        })
+      } catch (err) {
+        toast.error(`Failed to create session: ${err}`)
+        return
+      }
+
+      const store = useChatStore.getState()
+      const currentInput = activeSessionId
+        ? (store.inputDrafts[activeSessionId] ?? '')
+        : ''
+      const separator = currentInput.length > 0 ? '\n' : ''
+      const draft = `${currentInput}${separator}${reference}`
+
+      if (activeSessionId) {
+        store.copySessionSettings(activeSessionId, newSession.id)
+      }
+      store.setActiveSession(activeWorktreeId, newSession.id)
+      store.setInputDraft(newSession.id, draft)
+      inputRef.current?.focus?.()
     },
     [
       activeSessionId,
       activeWorktreeId,
       activeWorktreePath,
-      preferences,
-      sendMessage,
-      resolveCustomProfile,
+      createSession,
+      inputRef,
     ]
   )
 
   // Form submit handler
   const handleSubmit = useCallback(
-    (e: React.FormEvent) => {
+    async (e: React.FormEvent) => {
       e.preventDefault()
 
       const {
@@ -356,6 +267,7 @@ export function useMessageSending({
         enqueueMessage,
         isSending: checkIsSendingNow,
         setSessionReviewing,
+        setExecutionMode,
       } = useChatStore.getState()
       const liveInputValue = inputRef.current?.value
       const textMessage = (
@@ -391,7 +303,66 @@ export function useMessageSending({
       }
 
       let message = textMessage
-      if (textMessage.startsWith('/')) {
+      let startedCodexGoalTurn = false
+      // Intercept Codex /goal slash. /goal alone and /goal clear are
+      // pure RPC calls (no turn); /goal <objective> sets the goal, switches
+      // to the configured goal execution mode, and starts a turn immediately.
+      if (
+        selectedBackendRef.current === 'codex' &&
+        /^\/goal(\s|$)/.test(textMessage)
+      ) {
+        const arg = textMessage.replace(/^\/goal\s*/, '').trim()
+        const sessionId = activeSessionId
+        const worktreeId = activeWorktreeId
+        const worktreePath = activeWorktreePath
+
+        if (!arg) {
+          clearInputDraft(sessionId)
+          clearChatInputState()
+          void invoke<string | null>('codex_goal_get', {
+            worktreeId,
+            worktreePath,
+            sessionId,
+          })
+            .then(goal =>
+              toast.message(goal ? `Current goal: ${goal}` : 'No goal set')
+            )
+            .catch(err => toast.error(`/goal failed: ${err}`))
+          return
+        }
+        if (arg === 'clear') {
+          clearInputDraft(sessionId)
+          clearChatInputState()
+          void invoke('codex_goal_clear', {
+            worktreeId,
+            worktreePath,
+            sessionId,
+          }).catch(err => toast.error(`/goal failed: ${err}`))
+          return
+        }
+
+        // /goal <objective>: persist goal, then start work in the configured
+        // mode so the active goal is not left as passive metadata.
+        try {
+          await invoke('codex_goal_set', {
+            worktreeId,
+            worktreePath,
+            sessionId,
+            objective: arg,
+          })
+        } catch (err) {
+          toast.error(`/goal failed: ${err}`)
+          return
+        }
+        const configuredGoalMode = preferences?.codex_goal_execution_mode
+        const goalMode: ExecutionMode =
+          configuredGoalMode === 'yolo' ? 'yolo' : 'build'
+        setExecutionMode(sessionId, goalMode)
+        executionModeRef.current = goalMode
+        message = `Work toward the active goal:\n\n${arg}`
+        startedCodexGoalTurn = true
+      }
+      if (!startedCodexGoalTurn && textMessage.startsWith('/')) {
         const slashName = textMessage.slice(1).split(/\s/)[0] ?? ''
         const params = textMessage.slice(1 + slashName.length).trim()
         const claudeSkills =
@@ -402,9 +373,19 @@ export function useMessageSending({
           queryClient.getQueryData<{ name: string }[]>(
             skillQueryKeys.codexSkills()
           ) ?? []
+        const opencodeSkills =
+          queryClient.getQueryData<{ name: string }[]>(
+            skillQueryKeys.opencodeSkills()
+          ) ?? []
+        const cursorSkills =
+          queryClient.getQueryData<{ name: string }[]>(
+            skillQueryKeys.cursorSkills()
+          ) ?? []
         const isSkill =
           claudeSkills.some(s => s.name === slashName) ||
-          codexSkills.some(s => s.name === slashName)
+          codexSkills.some(s => s.name === slashName) ||
+          opencodeSkills.some(s => s.name === slashName) ||
+          cursorSkills.some(s => s.name === slashName)
         if (!isSkill) {
           const claudeCommands =
             queryClient.getQueryData<{ name: string; path: string }[]>(
@@ -437,7 +418,6 @@ export function useMessageSending({
       clearPendingSkills(activeSessionId)
       clearPendingTextFiles(activeSessionId)
       setSessionReviewing(activeSessionId, false)
-      useChatStore.getState().clearPendingDigest(activeSessionId)
 
       clearChatInputState()
 
@@ -448,6 +428,12 @@ export function useMessageSending({
 
       const mode = executionModeRef.current
       const thinkingLvl = selectedThinkingLevelRef.current
+      const selectedBackend = selectedBackendRef.current
+      const usesEffortLevel =
+        useAdaptiveThinkingRef.current ||
+        isCodexBackendRef.current ||
+        selectedBackend === 'pi' ||
+        selectedBackend === 'grok'
       const queuedMessage: QueuedMessage = {
         id: generateId(),
         message,
@@ -459,19 +445,15 @@ export function useMessageSending({
         provider: selectedProviderRef.current,
         executionMode: mode,
         thinkingLevel: thinkingLvl,
-        effortLevel:
-          useAdaptiveThinkingRef.current || isCodexBackendRef.current
-            ? selectedEffortLevelRef.current
-            : undefined,
+        effortLevel: usesEffortLevel
+          ? selectedEffortLevelRef.current
+          : undefined,
         mcpConfig: buildMcpConfigJson(
           mcpServersDataRef.current ?? [],
           enabledMcpServersRef.current,
           selectedBackendRef.current
         ),
-        backend:
-          selectedBackendRef.current !== 'claude'
-            ? selectedBackendRef.current
-            : undefined,
+        backend: selectedBackend !== 'claude' ? selectedBackend : undefined,
         queuedAt: Date.now(),
       }
 
@@ -482,6 +464,64 @@ export function useMessageSending({
         `[Send] handleSubmit sessionId=${activeSessionId} isSending=${isSendingNow}`
       )
       if (isSendingNow) {
+        // Auto-steer: inject the prompt into a steer-capable running turn
+        // instead of queueing. Attachments can't be injected mid-turn; steer
+        // failures (turn ended / not started yet) fall back to the normal queue.
+        const hasAttachments =
+          images.length > 0 ||
+          files.length > 0 ||
+          textFiles.length > 0 ||
+          skills.length > 0
+        const backend = selectedBackendRef.current
+        const autoSteerEnabled =
+          backend === 'opencode'
+            ? (preferences?.opencode_auto_steer_enabled ?? true)
+            : backend === 'pi'
+              ? (preferences?.pi_auto_steer_enabled ?? true)
+              : (preferences?.codex_auto_steer_enabled ?? true)
+        const canSteerWithAttachments = backend === 'codex'
+        if (
+          (backend === 'codex' || backend === 'opencode' || backend === 'pi') &&
+          autoSteerEnabled &&
+          (!hasAttachments || canSteerWithAttachments)
+        ) {
+          try {
+            const steerMessage = buildMessageWithRefs(queuedMessage)
+            if (backend === 'pi') {
+              await steerPiTurn(activeWorktreeId, activeSessionId, steerMessage)
+            } else if (backend === 'opencode') {
+              await steerOpencodeTurn(
+                activeWorktreeId,
+                activeWorktreePath,
+                activeSessionId,
+                steerMessage
+              )
+            } else {
+              if (hasAttachments) {
+                await steerCodexTurn(
+                  activeWorktreeId,
+                  activeSessionId,
+                  steerMessage,
+                  queuedMessage
+                )
+              } else {
+                await steerCodexTurn(
+                  activeWorktreeId,
+                  activeSessionId,
+                  steerMessage
+                )
+              }
+            }
+            console.log(
+              `[Send] handleSubmit STEERED into running ${backend} turn`
+            )
+            return
+          } catch (err) {
+            console.log(
+              `[Send] handleSubmit steer failed, falling back to queue: ${err}`
+            )
+          }
+        }
         console.log(`[Send] handleSubmit ENQUEUING (session is sending)`)
         enqueueMessage(activeSessionId, queuedMessage)
         persistEnqueue(
@@ -548,6 +588,5 @@ export function useMessageSending({
     handleSubmit,
     handleCancel,
     handleGitDiffAddToPrompt,
-    handleGitDiffExecutePrompt,
   }
 }

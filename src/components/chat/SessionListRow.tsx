@@ -5,8 +5,8 @@ import {
   EyeOff,
   FileText,
   Pencil,
+  RefreshCw,
   Shield,
-  Sparkles,
   Tag,
   Terminal,
   Trash2,
@@ -31,6 +31,7 @@ import {
   statusConfig,
   type SessionCardProps,
 } from './session-card-utils'
+import { canReconnectSession } from '@/services/chat'
 
 export const SessionListRow = forwardRef<HTMLDivElement, SessionCardProps>(
   function SessionListRow(
@@ -41,7 +42,6 @@ export const SessionListRow = forwardRef<HTMLDivElement, SessionCardProps>(
       onArchive,
       onDelete,
       onPlanView,
-      onRecapView,
       onApprove,
       onYolo,
       onClearContextApprove,
@@ -49,6 +49,7 @@ export const SessionListRow = forwardRef<HTMLDivElement, SessionCardProps>(
       onWorktreeYoloApprove,
       onToggleLabel,
       onToggleReview,
+      onReconnect,
       isRenaming,
       renameValue,
       onRenameValueChange,
@@ -59,9 +60,9 @@ export const SessionListRow = forwardRef<HTMLDivElement, SessionCardProps>(
     ref
   ) {
     const config = statusConfig[card.status]
-    const hasRecap = card.hasRecap
     const hasPlan = !!(card.planFilePath || card.planContent)
     const resumeCommand = getResumeCommand(card.session)
+    const canReconnect = canReconnectSession(card.session)
     const renameInputRef = useCallback((node: HTMLInputElement | null) => {
       if (node) {
         node.focus()
@@ -174,7 +175,7 @@ export const SessionListRow = forwardRef<HTMLDivElement, SessionCardProps>(
                     }}
                   >
                     YOLO
-                    <Kbd className="ml-1 h-3.5 text-[9px] bg-destructive-foreground/20 text-destructive-foreground">
+                    <Kbd className="ml-1 h-3.5 text-[9px] bg-white/20 text-white">
                       {formatShortcutDisplay(
                         DEFAULT_KEYBINDINGS.approve_plan_yolo
                       )}
@@ -190,7 +191,7 @@ export const SessionListRow = forwardRef<HTMLDivElement, SessionCardProps>(
                       }}
                     >
                       Clear Context and yolo
-                      <Kbd className="ml-1 h-3.5 text-[9px] bg-destructive-foreground/20 text-destructive-foreground">
+                      <Kbd className="ml-1 h-3.5 text-[9px] bg-white/20 text-white">
                         {formatShortcutDisplay(
                           DEFAULT_KEYBINDINGS.approve_plan_clear_context
                         )}
@@ -281,11 +282,13 @@ export const SessionListRow = forwardRef<HTMLDivElement, SessionCardProps>(
               Copy Resume Command
             </ContextMenuItem>
           )}
+          {onReconnect && canReconnect && (
+            <ContextMenuItem onSelect={onReconnect}>
+              <RefreshCw className="mr-2 h-4 w-4" />
+              Reconnect
+            </ContextMenuItem>
+          )}
           <ContextMenuSeparator />
-          <ContextMenuItem disabled={!hasRecap} onSelect={onRecapView}>
-            <Sparkles className="mr-2 h-4 w-4" />
-            Recap
-          </ContextMenuItem>
           <ContextMenuItem disabled={!hasPlan} onSelect={onPlanView}>
             <FileText className="mr-2 h-4 w-4" />
             Plan

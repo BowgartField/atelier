@@ -1,11 +1,6 @@
 import { useState, useEffect } from 'react'
 import { formatDuration } from '../time-utils'
 
-/**
- * Returns a live elapsed time string (e.g. "23s") that ticks every second.
- * Uses state to store the computed duration, updated via interval, to avoid
- * calling Date.now() during render.
- */
 export function useElapsedTime(startTime: number | null): string | null {
   const [elapsed, setElapsed] = useState<number | null>(null)
 

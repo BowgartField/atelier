@@ -9,6 +9,8 @@ import {
   SVG_EXTENSION,
 } from '../image-constants'
 import { isNativeApp } from '@/lib/environment'
+import { dragHasFiles } from '@/lib/drag-drop-utils'
+import { processAttachmentFiles } from '../attachment-processing'
 
 /** Tracks image paths currently being processed to prevent duplicates */
 const processingPaths = new Set<string>()
@@ -24,16 +26,74 @@ interface UseDragAndDropImagesResult {
 }
 
 /**
- * Hook to handle drag-and-drop of image files using Tauri's native file drop.
+ * Hook to handle drag-and-drop of image files.
  *
- * Uses Tauri's onDragDropEvent which provides direct file paths,
- * more efficient than JavaScript's DataTransfer API.
+ * In Tauri, native onDragDropEvent provides direct file paths when enabled.
+ * When Tauri native drag/drop is disabled (required for native browser DnD
+ * libraries like Pragmatic drag and drop), this falls back to browser
+ * DataTransfer.files and saves files through the same pasted-image path.
  */
 export function useDragAndDropImages(
   sessionId: string | undefined,
   options?: UseDragAndDropImagesOptions
 ): UseDragAndDropImagesResult {
   const [isDragging, setIsDragging] = useState(false)
+
+  useEffect(() => {
+    if (options?.disabled) return
+
+    let browserLastDropTime = 0
+
+    const hasFiles = (event: DragEvent) => dragHasFiles(event.dataTransfer)
+
+    const handleBrowserDragEnter = (event: DragEvent) => {
+      if (!hasFiles(event)) return
+      setIsDragging(true)
+    }
+
+    const handleBrowserDragOver = (event: DragEvent) => {
+      if (!hasFiles(event)) return
+      event.preventDefault()
+      setIsDragging(true)
+    }
+
+    const handleBrowserDrop = (event: DragEvent) => {
+      if (!hasFiles(event)) return
+      event.preventDefault()
+      setIsDragging(false)
+
+      const now = Date.now()
+      if (now - browserLastDropTime < 500) return
+      browserLastDropTime = now
+
+      if (!sessionId) {
+        toast.error('No active session')
+        return
+      }
+
+      const files = event.dataTransfer?.files
+      if (!files || files.length === 0) return
+      processAttachmentFiles(files, sessionId)
+    }
+
+    const handleBrowserDragLeave = (event: DragEvent) => {
+      if (!hasFiles(event)) return
+      if (event.relatedTarget != null) return
+      setIsDragging(false)
+    }
+
+    window.addEventListener('dragenter', handleBrowserDragEnter)
+    window.addEventListener('dragover', handleBrowserDragOver)
+    window.addEventListener('drop', handleBrowserDrop)
+    window.addEventListener('dragleave', handleBrowserDragLeave)
+
+    return () => {
+      window.removeEventListener('dragenter', handleBrowserDragEnter)
+      window.removeEventListener('dragover', handleBrowserDragOver)
+      window.removeEventListener('drop', handleBrowserDrop)
+      window.removeEventListener('dragleave', handleBrowserDragLeave)
+    }
+  }, [sessionId, options?.disabled])
 
   useEffect(() => {
     if (options?.disabled || !isNativeApp()) return
@@ -128,7 +188,7 @@ export function useDragAndDropImages(
 /**
  * Process a dropped SVG file by reading its text content and saving as a text file.
  */
-async function processDroppedSvg(
+export async function processDroppedSvg(
   sourcePath: string,
   sessionId: string
 ): Promise<void> {
@@ -165,7 +225,7 @@ async function processDroppedSvg(
 /**
  * Process a dropped image file by saving it via Tauri and adding to pending images.
  */
-async function processDroppedImage(
+export async function processDroppedImage(
   sourcePath: string,
   sessionId: string
 ): Promise<void> {

@@ -134,6 +134,28 @@ describe('TerminalStore', () => {
       expect(terminals[0]?.label).toBe('Dev Server')
     })
 
+    it('adds session terminals without activating or opening the panel', () => {
+      const { addTerminal, getTerminals, isTerminalPanelOpen } =
+        useTerminalStore.getState()
+
+      const id = addTerminal('worktree-1', null, 'Terminal', {
+        kind: 'session',
+        activate: false,
+        openPanel: false,
+      })
+
+      const state = useTerminalStore.getState()
+      expect(getTerminals('worktree-1')).toHaveLength(1)
+      expect(getTerminals('worktree-1')[0]).toMatchObject({
+        id,
+        kind: 'session',
+        label: 'Terminal',
+      })
+      expect(state.activeTerminalIds['worktree-1']).toBeUndefined()
+      expect(isTerminalPanelOpen('worktree-1')).toBe(false)
+      expect(state.terminalVisible).toBe(false)
+    })
+
     it('removes a terminal', () => {
       const { addTerminal, removeTerminal, getTerminals } =
         useTerminalStore.getState()
@@ -166,6 +188,23 @@ describe('TerminalStore', () => {
       )
     })
 
+    it('does not fall back to session terminals when removing the active panel terminal', () => {
+      const { addTerminal, removeTerminal } = useTerminalStore.getState()
+
+      const panelId = addTerminal('worktree-1')
+      addTerminal('worktree-1', null, 'Terminal', {
+        kind: 'session',
+        activate: false,
+        openPanel: false,
+      })
+
+      removeTerminal('worktree-1', panelId)
+
+      expect(useTerminalStore.getState().activeTerminalIds['worktree-1']).toBe(
+        ''
+      )
+    })
+
     it('sets active terminal', () => {
       const { addTerminal, setActiveTerminal } = useTerminalStore.getState()
 
@@ -176,6 +215,47 @@ describe('TerminalStore', () => {
       expect(useTerminalStore.getState().activeTerminalIds['worktree-1']).toBe(
         id1
       )
+    })
+
+    it('does not set a session terminal as the active panel terminal', () => {
+      const { addTerminal, setActiveTerminal } = useTerminalStore.getState()
+
+      const panelId = addTerminal('worktree-1')
+      const sessionId = addTerminal('worktree-1', 'codex', 'Codex', {
+        kind: 'session',
+        activate: false,
+        openPanel: false,
+      })
+
+      setActiveTerminal('worktree-1', sessionId)
+
+      expect(useTerminalStore.getState().activeTerminalIds['worktree-1']).toBe(
+        panelId
+      )
+    })
+
+    it('reorders panel terminals while preserving session terminals and active terminal', () => {
+      const { addTerminal, reorderPanelTerminals } = useTerminalStore.getState()
+
+      const panelA = addTerminal('worktree-1', null, 'A')
+      const sessionId = addTerminal('worktree-1', null, 'Session Terminal', {
+        kind: 'session',
+        activate: false,
+        openPanel: false,
+      })
+      const panelB = addTerminal('worktree-1', null, 'B')
+      const panelC = addTerminal('worktree-1', null, 'C')
+
+      reorderPanelTerminals('worktree-1', [panelC, panelA, panelB])
+
+      const state = useTerminalStore.getState()
+      expect(state.terminals['worktree-1']?.map(t => t.id)).toEqual([
+        panelC,
+        sessionId,
+        panelA,
+        panelB,
+      ])
+      expect(state.activeTerminalIds['worktree-1']).toBe(panelC)
     })
 
     it('gets terminals for worktree', () => {
@@ -285,9 +365,39 @@ describe('TerminalStore', () => {
       expect(state.terminalVisible).toBe(true)
       expect(isTerminalPanelOpen('worktree-1')).toBe(true)
     })
+
+    it('does not reuse a running session terminal for side-panel runs', () => {
+      const { addTerminal, startRun, setTerminalRunning, getTerminals } =
+        useTerminalStore.getState()
+
+      const sessionTerminalId = addTerminal('worktree-1', 'codex', 'Codex', {
+        kind: 'session',
+        activate: false,
+        openPanel: false,
+      })
+      setTerminalRunning(sessionTerminalId, true)
+
+      const runTerminalId = startRun('worktree-1', 'codex')
+
+      expect(runTerminalId).not.toBe(sessionTerminalId)
+      expect(getTerminals('worktree-1')).toHaveLength(2)
+      expect(useTerminalStore.getState().activeTerminalIds['worktree-1']).toBe(
+        runTerminalId
+      )
+    })
   })
 
   describe('closeAllTerminals', () => {
+    it('returns the same state reference when there is nothing to close', () => {
+      const { closeAllTerminals } = useTerminalStore.getState()
+      const before = useTerminalStore.getState()
+
+      const closedIds = closeAllTerminals('worktree-1')
+
+      expect(closedIds).toHaveLength(0)
+      expect(useTerminalStore.getState()).toBe(before)
+    })
+
     it('removes all terminals for worktree and returns IDs', () => {
       const { addTerminal, closeAllTerminals, getTerminals } =
         useTerminalStore.getState()
@@ -343,6 +453,35 @@ describe('TerminalStore', () => {
 
       const closedIds = closeAllTerminals('worktree-1')
       expect(closedIds).toHaveLength(0)
+    })
+  })
+
+  describe('closePanelTerminals', () => {
+    it('closes only panel terminals and preserves session terminals', () => {
+      const { addTerminal, closePanelTerminals, getTerminals } =
+        useTerminalStore.getState()
+
+      const panelId = addTerminal('worktree-1')
+      const sessionId = addTerminal('worktree-1', null, 'Terminal', {
+        kind: 'session',
+        activate: false,
+        openPanel: false,
+      })
+
+      const closedIds = closePanelTerminals('worktree-1')
+
+      expect(closedIds).toEqual([panelId])
+      expect(getTerminals('worktree-1')).toHaveLength(1)
+      expect(getTerminals('worktree-1')[0]).toMatchObject({
+        id: sessionId,
+        kind: 'session',
+      })
+      expect(useTerminalStore.getState().activeTerminalIds['worktree-1']).toBe(
+        ''
+      )
+      expect(useTerminalStore.getState().terminalPanelOpen['worktree-1']).toBe(
+        false
+      )
     })
   })
 

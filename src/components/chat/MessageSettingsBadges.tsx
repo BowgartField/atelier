@@ -1,10 +1,11 @@
 import { memo } from 'react'
 import {
-  MODEL_OPTIONS,
-  THINKING_LEVEL_OPTIONS,
   EFFORT_LEVEL_OPTIONS,
+  PI_EFFORT_LEVEL_OPTIONS,
+  THINKING_LEVEL_OPTIONS,
 } from '@/components/chat/toolbar/toolbar-options'
-import { formatOpencodeModelLabel } from '@/components/chat/toolbar/toolbar-utils'
+import { getMessagePromptModelLabel } from '@/components/chat/message-settings-labels'
+import { isCodexModel } from '@/types/preferences'
 import type { EffortLevel, ExecutionMode, ThinkingLevel } from '@/types/chat'
 
 interface MessageSettingsBadgesProps {
@@ -24,28 +25,34 @@ export const MessageSettingsBadges = memo(function MessageSettingsBadges({
 }: MessageSettingsBadgesProps) {
   if (!model) return null
 
-  const modelLabel =
-    MODEL_OPTIONS.find(o => o.value === model)?.label ??
-    (model.includes('/') ? formatOpencodeModelLabel(model) : model)
+  const modelLabel = getMessagePromptModelLabel(model)
+  const isCodex =
+    !model.startsWith('pi/') && (isCodexModel(model) || model.includes('codex'))
+  const executionModeLabel = executionMode
+    ? executionMode.charAt(0).toUpperCase() + executionMode.slice(1)
+    : null
+
+  const effortOptions = model.startsWith('pi/')
+    ? PI_EFFORT_LEVEL_OPTIONS
+    : EFFORT_LEVEL_OPTIONS
 
   const effortLabel = effortLevel
-    ? (EFFORT_LEVEL_OPTIONS.find(o => o.value === effortLevel)?.label ??
-      effortLevel)
+    ? (effortOptions.find(o => o.value === effortLevel)?.label ?? effortLevel)
     : null
 
   const thinkingLabel =
-    thinkingLevel && thinkingLevel !== 'off'
+    !isCodex && thinkingLevel && thinkingLevel !== 'off'
       ? (THINKING_LEVEL_OPTIONS.find(o => o.value === thinkingLevel)?.label ??
         thinkingLevel)
       : null
 
   return (
-    <div className="flex items-center gap-1.5 text-[10px] text-muted-foreground/50">
+    <div className="flex items-center text-[10px] text-muted-foreground/50">
       <span>{modelLabel}</span>
-      {executionMode && <span className="capitalize">· {executionMode}</span>}
-      {!isCursor && effortLabel && <span>· {effortLabel}</span>}
+      {executionModeLabel && <span>&nbsp;· {executionModeLabel}</span>}
+      {!isCursor && effortLabel && <span>&nbsp;· {effortLabel}</span>}
       {!isCursor && !effortLabel && thinkingLabel && (
-        <span>· {thinkingLabel}</span>
+        <span>&nbsp;· {thinkingLabel}</span>
       )}
     </div>
   )

@@ -72,6 +72,22 @@ export function convertFileSrc(filePath: string, protocol = 'asset'): string {
   return filePath
 }
 
+/**
+ * Convert an absolute project/worktree file path to a browser-loadable URL.
+ * Native mode can use Tauri's asset protocol directly; browser mode uses the
+ * authenticated project-file endpoint, which validates the path against known
+ * project/worktree roots before serving it.
+ */
+export function convertProjectFileSrc(filePath: string): string {
+  if (isNativeApp()) {
+    return convertFileSrc(filePath)
+  }
+
+  const token = localStorage.getItem('jean-http-token') || ''
+  const params = token ? `?token=${encodeURIComponent(token)}` : ''
+  return `/api/project-files/${encodeURIComponent(filePath)}${params}`
+}
+
 /** Unlisten function type — compatible with Tauri's UnlistenFn. */
 export type UnlistenFn = () => void
 
@@ -129,33 +145,49 @@ export async function listen<T>(
   return wsTransport.listen<T>(event, handler)
 }
 
+/**
+ * Request buffered terminal events from the backend. Used by browser-mode
+ * terminal reattachment after a full page refresh, when in-memory sequence
+ * tracking was lost but the Rust PTY and replay buffer are still alive.
+ */
+export function requestTerminalReplay(terminalId: string, lastSeq = 0): void {
+  if (isNativeApp()) return
+  wsTransport.requestTerminalReplay(terminalId, lastSeq)
+}
+
 // ---------------------------------------------------------------------------
 // Initial data preloading (used in browser mode)
 // ---------------------------------------------------------------------------
 
 export interface InitialData {
-  projects: unknown[]
+  projects?: unknown[]
   // Tiered payload: worktrees/sessions are present only for the selected
   // project; other projects are lazy-loaded by TanStack Query hooks on
   // navigation.
   worktreesByProject?: Record<string, unknown[]>
   sessionsByWorktree?: Record<string, unknown> // worktreeId -> WorktreeSessions
   activeSessions?: Record<string, unknown> // sessionId -> Session (with messages)
+  activeSessionWorktreeIds?: Record<string, string> // sessionId -> worktreeId
   runningSessions?: string[] // sessionIds with active CLI processes
   replayEvents?: BootstrapEvent[]
-  preferences: unknown
-  uiState: unknown
+  preferences?: unknown
+  uiState?: unknown
   appDataDir?: string
+  serverPlatform?: 'mac' | 'windows' | 'linux'
+  webBuildId?: string
+  appVersion?: string
 }
 
 let initialDataPromise: Promise<InitialData | null> | null = null
 let initialDataResolved = false
+let reconnectInitialDataPromise: Promise<InitialData | null> | null = null
 
 /**
  * Build the /api/init URL with the given query params.
  * Centralizes token + selected_project + active_sessions encoding.
  */
 function buildInitUrl(opts: {
+  mode?: 'initial' | 'reconnect'
   selectedProjectId?: string | null
   activeSessionIds?: Record<string, string>
 }): string {
@@ -164,6 +196,7 @@ function buildInitUrl(opts: {
 
   const params = new URLSearchParams()
   if (token) params.set('token', token)
+  if (opts.mode === 'reconnect') params.set('mode', 'reconnect')
   if (opts.selectedProjectId) {
     params.set('selected_project', opts.selectedProjectId)
   }
@@ -232,13 +265,53 @@ export async function refetchInitialData(
   if (isNativeApp()) return null
 
   try {
-    const url = buildInitUrl({ selectedProjectId, activeSessionIds })
+    const url = buildInitUrl({
+      mode: 'reconnect',
+      selectedProjectId,
+      activeSessionIds,
+    })
     const response = await fetch(url)
     if (!response.ok) return null
     return (await response.json()) as InitialData
   } catch {
     return null
   }
+}
+
+/**
+ * Start loading reconnect bootstrap data while the WebSocket is still
+ * reconnecting, so the UI can re-seed immediately once the socket is open.
+ */
+export function prefetchReconnectInitialData(
+  activeSessionIds?: Record<string, string>,
+  selectedProjectId?: string | null
+): Promise<InitialData | null> {
+  if (!reconnectInitialDataPromise) {
+    reconnectInitialDataPromise = refetchInitialData(
+      activeSessionIds,
+      selectedProjectId
+    )
+  }
+  return reconnectInitialDataPromise
+}
+
+/**
+ * Use the in-flight reconnect bootstrap fetch if one exists; otherwise fetch
+ * now. The consumed promise is cleared so a future reconnect gets fresh data.
+ */
+export async function consumeReconnectInitialData(
+  activeSessionIds?: Record<string, string>,
+  selectedProjectId?: string | null
+): Promise<InitialData | null> {
+  const prefetched = reconnectInitialDataPromise
+  const promise =
+    prefetched ?? refetchInitialData(activeSessionIds, selectedProjectId)
+  reconnectInitialDataPromise = null
+  const data = await promise
+  if (!data && prefetched) {
+    return refetchInitialData(activeSessionIds, selectedProjectId)
+  }
+  return data
 }
 
 /**
@@ -272,7 +345,7 @@ interface PendingRequest {
 }
 
 interface WsMessage {
-  type: 'response' | 'error' | 'event'
+  type: 'response' | 'error' | 'event' | 'heartbeat'
   id?: string
   data?: unknown
   error?: string
@@ -300,7 +373,8 @@ class WsTransport {
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null
   private connectWatchdog: ReturnType<typeof setTimeout> | null = null
   /** Periodic check that we're seeing inbound traffic from the server.
-   *  Server pings every 20s, so a 50s gap means the connection is dead. */
+   *  The server sends app-level heartbeats every 20s because browser JS cannot
+   *  observe protocol ping/pong frames, so a 50s gap means the connection is dead. */
   private livenessTimer: ReturnType<typeof setInterval> | null = null
   private _lastInbound = 0
   private queue: { data: string; resolve: () => void }[] = []
@@ -328,6 +402,18 @@ class WsTransport {
   private _lastSeqByTerminal = new Map<string, number>()
   /** Terminals that were running when we (potentially) disconnected. */
   private _activeTerminals = new Set<string>()
+
+  constructor() {
+    // Reconnect instantly when the page returns to the foreground or the
+    // network comes back. Mobile browsers suspend background tabs and freeze
+    // JS timers, so the livenessTimer cannot detect a dead socket until it
+    // resumes — these listeners give us an immediate wake trigger.
+    if (typeof window !== 'undefined') {
+      document.addEventListener('visibilitychange', this.handleWake)
+      window.addEventListener('online', this.handleWake)
+      window.addEventListener('pageshow', this.handleWake)
+    }
+  }
 
   get connected(): boolean {
     return this._connected
@@ -579,8 +665,9 @@ class WsTransport {
     }
   }
 
-  // Commands that spawn CLI processes and can run for extended periods.
-  // These get a 10-minute timeout instead of the default 60s.
+  // Commands that spawn/attach to long-lived processes or are critical to
+  // terminal lifecycle. These get an extended timeout instead of the default
+  // 60s so idle/reconnect edges do not falsely fail terminal sessions.
   private static readonly LONG_RUNNING_COMMANDS: ReadonlySet<string> = new Set([
     'send_chat_message',
     'run_review_with_ai',
@@ -590,17 +677,32 @@ class WsTransport {
     'install_claude_cli',
     'install_codex_cli',
     'install_opencode_cli',
+    'install_pi_cli',
     'install_gh_cli',
+    'install_coderabbit_cli',
+    'update_coderabbit_cli',
+    'run_coderabbit_review',
+    'trigger_coderabbit_pr_review',
+    'start_terminal',
+    'terminal_write',
+    'terminal_resize',
+    'stop_terminal',
+    'get_active_terminals',
+    'has_active_terminal',
+    'get_terminal_listening_ports',
   ])
   private static readonly LONG_TIMEOUT = 30 * 60_000
   private static readonly DEFAULT_TIMEOUT = 60_000
   private static readonly CONNECT_TIMEOUT = 12_000
   private static readonly MAX_QUEUE_SIZE = 500
   /** If no inbound traffic for this long, assume connection is dead.
-   *  Must exceed server PONG_TIMEOUT (45s) — browser auto-replies to
-   *  server pings, so any healthy connection sees inbound frames every 20s. */
+   *  Must exceed the server's app-level heartbeat interval (20s); protocol
+   *  ping/pong alone is not visible to browser JavaScript. */
   private static readonly INBOUND_TIMEOUT = 50_000
   private static readonly LIVENESS_CHECK_INTERVAL = 10_000
+  /** After a resume, wait this long for queued inbound frames to flush before
+   *  judging an OPEN socket stale (avoids false reconnects on a healthy socket). */
+  private static readonly WAKE_RECHECK_DELAY = 3_000
 
   /** Call a backend command over WebSocket. */
   async invoke<T>(command: string, args?: Record<string, unknown>): Promise<T> {
@@ -662,6 +764,30 @@ class WsTransport {
     })
   }
 
+  /** Request terminal replay and keep this terminal tracked for reconnects. */
+  requestTerminalReplay(terminalId: string, lastSeq = 0): void {
+    this._activeTerminals.add(terminalId)
+    const currentLastSeq = this._lastSeqByTerminal.get(terminalId)
+    const effectiveLastSeq =
+      currentLastSeq == null ? lastSeq : Math.max(lastSeq, currentLastSeq)
+    this._lastSeqByTerminal.set(terminalId, effectiveLastSeq)
+
+    const payload = JSON.stringify({
+      type: 'terminal_replay',
+      terminal_id: terminalId,
+      last_seq: effectiveLastSeq,
+    })
+
+    if (this.ws?.readyState === WebSocket.OPEN) {
+      this.ws.send(payload)
+      return
+    }
+
+    if (this._connectEnabled) {
+      this.connect()
+    }
+  }
+
   /** Register an event listener. Returns an unlisten function. */
   listen<T>(
     event: string,
@@ -704,6 +830,11 @@ class WsTransport {
   }
 
   private handleMessage(msg: WsMessage): void {
+    if (msg.type === 'heartbeat') {
+      // onmessage already refreshed _lastInbound. No listener dispatch.
+      return
+    }
+
     if (msg.type === 'response' && msg.id) {
       const pending = this.pending.get(msg.id)
       if (pending) {
@@ -825,6 +956,47 @@ class WsTransport {
     if (!this.livenessTimer) return
     clearInterval(this.livenessTimer)
     this.livenessTimer = null
+  }
+
+  /** Re-check the connection when the page returns to the foreground or the
+   *  network comes back. Fires on visibilitychange / online / pageshow. */
+  private handleWake = (): void => {
+    if (!this._connectEnabled) return
+    // visibilitychange also fires on hide — only act when the page is visible.
+    if (typeof document !== 'undefined' && document.hidden) return
+
+    const state = this.ws?.readyState
+    if (state === WebSocket.CONNECTING) return // connectWatchdog covers this
+
+    if (state === WebSocket.OPEN) {
+      // Socket claims to be open. After a suspend it may be a zombie, but a
+      // healthy socket also looks stale until queued heartbeats are delivered.
+      // Re-check shortly, once any buffered inbound traffic has landed.
+      setTimeout(() => {
+        if (
+          this.ws?.readyState === WebSocket.OPEN &&
+          Date.now() - this._lastInbound > WsTransport.INBOUND_TIMEOUT
+        ) {
+          console.warn(
+            '[WsTransport] Stale socket after resume, forcing reconnect'
+          )
+          try {
+            this.ws.close()
+          } catch {
+            // Ignore close errors; onclose schedules the reconnect.
+          }
+        }
+      }, WsTransport.WAKE_RECHECK_DELAY)
+      return
+    }
+
+    // Disconnected — reconnect immediately instead of waiting out the backoff.
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer)
+      this.reconnectTimer = null
+    }
+    this.reconnectAttempt = 0
+    this.connect()
   }
 
   private forceReconnect(): void {

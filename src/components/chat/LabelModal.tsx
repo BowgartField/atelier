@@ -7,7 +7,7 @@ import {
   DialogTitle,
 } from '@/components/ui/dialog'
 import { Input } from '@/components/ui/input'
-import { Tag, Check, Pencil } from 'lucide-react'
+import { Tag, Check, Pencil, Pin, Trash2 } from 'lucide-react'
 import { useChatStore } from '@/store/chat-store'
 import type { LabelData } from '@/types/chat'
 import { getLabelTextColor } from '@/lib/label-colors'
@@ -32,12 +32,22 @@ interface LabelModalProps {
   onClose: () => void
   sessionId: string | null
   currentLabel: LabelData | null
+  /** Multi-label mode current labels. */
+  currentLabels?: LabelData[]
+  /** Label selection mode. Sessions stay single; worktrees can use multi. */
+  mode?: 'single' | 'multi'
   /** Custom apply handler. If provided, called instead of default setSessionLabel */
   onApply?: (label: LabelData | null) => void
+  /** Custom multi-label apply handler. */
+  onApplyLabels?: (labels: LabelData[]) => void
   /** Additional labels to include in the custom labels list (e.g. worktree labels) */
   extraLabels?: LabelData[]
   /** Callback when a label's color is edited (e.g. to propagate to worktree labels) */
   onColorChange?: (labelName: string, newColor: string) => void
+  /** Callback when a label is pinned/unpinned as a project filter tab. */
+  onPinnedChange?: (label: LabelData, pinned: boolean) => void
+  /** Callback when a custom label should be deleted from the project. */
+  onDeleteLabel?: (label: LabelData) => void
 }
 
 export function LabelModal({
@@ -45,9 +55,14 @@ export function LabelModal({
   onClose,
   sessionId,
   currentLabel,
+  currentLabels,
+  mode = 'single',
   onApply,
+  onApplyLabels,
   extraLabels,
   onColorChange,
+  onPinnedChange,
+  onDeleteLabel,
 }: LabelModalProps) {
   const [inputValue, setInputValue] = useState('')
   const [selectedColor, setSelectedColor] = useState(
@@ -85,17 +100,37 @@ export function LabelModal({
   // Get the label data for current label (for preset labels, use default yellow)
   const getLabelData = useCallback(
     (name: string): LabelData => {
+      const selected =
+        mode === 'multi'
+          ? currentLabels?.find(l => l.name === name)
+          : currentLabel?.name === name
+            ? currentLabel
+            : undefined
       // Check local color overrides first (instant feedback before async refetch)
-      if (colorOverrides[name]) return { name, color: colorOverrides[name] }
+      if (colorOverrides[name]) {
+        return { ...(selected ?? { name }), color: colorOverrides[name] }
+      }
+      const extra = extraLabels?.find(l => l.name === name)
+      if (selected) {
+        return extra?.pinned ? { ...selected, pinned: true } : selected
+      }
       // Check if this label name exists in sessionLabels or extraLabels (has a color)
       const existing = Object.values(sessionLabels).find(l => l.name === name)
-      if (existing) return existing
-      const extra = extraLabels?.find(l => l.name === name)
+      if (existing) {
+        return extra?.pinned ? { ...existing, pinned: true } : existing
+      }
       if (extra) return extra
       // Preset labels get yellow by default
       return { name, color: '#eab308' }
     },
-    [sessionLabels, colorOverrides, extraLabels]
+    [
+      sessionLabels,
+      colorOverrides,
+      extraLabels,
+      currentLabel,
+      currentLabels,
+      mode,
+    ]
   )
 
   // Update all sessions that use a given label name to use a new color
@@ -112,8 +147,32 @@ export function LabelModal({
     []
   )
 
+  const selectedLabels = useMemo(
+    () =>
+      mode === 'multi'
+        ? (currentLabels ?? [])
+        : currentLabel
+          ? [currentLabel]
+          : [],
+    [mode, currentLabels, currentLabel]
+  )
+
+  const isLabelSelected = useCallback(
+    (name: string) => selectedLabels.some(label => label.name === name),
+    [selectedLabels]
+  )
+
   const applyLabel = useCallback(
     (labelData: LabelData | null) => {
+      if (mode === 'multi') {
+        const next = labelData
+          ? isLabelSelected(labelData.name)
+            ? selectedLabels.filter(label => label.name !== labelData.name)
+            : [...selectedLabels, labelData]
+          : []
+        onApplyLabels?.(next)
+        return
+      }
       if (onApply) {
         onApply(labelData)
         onClose()
@@ -123,7 +182,15 @@ export function LabelModal({
       useChatStore.getState().setSessionLabel(sessionId, labelData)
       onClose()
     },
-    [sessionId, onClose, onApply]
+    [
+      mode,
+      selectedLabels,
+      isLabelSelected,
+      onApplyLabels,
+      onApply,
+      onClose,
+      sessionId,
+    ]
   )
 
   // Start editing an existing label's color
@@ -186,8 +253,12 @@ export function LabelModal({
         e.preventDefault()
         const labelName = allLabelNames[focusedIndex]
         if (labelName) {
-          const isAlreadySelected = currentLabel?.name === labelName
-          applyLabel(isAlreadySelected ? null : getLabelData(labelName))
+          const isAlreadySelected = isLabelSelected(labelName)
+          applyLabel(
+            isAlreadySelected
+              ? getLabelData(labelName)
+              : getLabelData(labelName)
+          )
         }
       } else if (e.key === 'Backspace') {
         const isInputFocused = (e.target as HTMLElement)?.tagName === 'INPUT'
@@ -204,10 +275,11 @@ export function LabelModal({
       selectedColor,
       allLabelNames,
       focusedIndex,
-      currentLabel,
+      isLabelSelected,
       getLabelData,
       applyLabel,
       saveEditedColor,
+      mode,
     ]
   )
 
@@ -217,6 +289,34 @@ export function LabelModal({
       applyLabel({ name: trimmed, color: selectedColor })
     }
   }, [inputValue, selectedColor, applyLabel])
+
+  const togglePinned = useCallback(
+    (labelData: LabelData, e: React.MouseEvent) => {
+      e.stopPropagation()
+      if (mode !== 'multi') return
+
+      if (onPinnedChange) {
+        onPinnedChange(labelData, !labelData.pinned)
+        return
+      }
+
+      const next = selectedLabels.map(label =>
+        label.name === labelData.name
+          ? { ...label, pinned: !label.pinned }
+          : label
+      )
+      onApplyLabels?.(next)
+    },
+    [mode, onApplyLabels, onPinnedChange, selectedLabels]
+  )
+
+  const deleteLabel = useCallback(
+    (labelData: LabelData, e: React.MouseEvent) => {
+      e.stopPropagation()
+      onDeleteLabel?.(labelData)
+    },
+    [onDeleteLabel]
+  )
 
   // Are we in edit mode?
   const isEditing = isCreatingCustom || editingLabelName
@@ -233,14 +333,14 @@ export function LabelModal({
         <DialogHeader>
           <DialogTitle className="flex items-center gap-2">
             <Tag className="h-4 w-4" />
-            Session Label
+            {mode === 'multi' ? 'Worktree Labels' : 'Session Label'}
           </DialogTitle>
           <DialogDescription>
             {editingLabelName
               ? `Choose a color for "${editingLabelName}".`
               : isCreatingCustom
                 ? 'Choose a color for your label.'
-                : 'Pick a label or create a custom one.'}
+                : 'Pick labels or create a custom one.'}
           </DialogDescription>
         </DialogHeader>
 
@@ -312,7 +412,7 @@ export function LabelModal({
             <div className="flex flex-col gap-0.5">
               {allLabelNames.map((labelName, i) => {
                 const labelData = getLabelData(labelName)
-                const isSelected = currentLabel?.name === labelName
+                const isSelected = isLabelSelected(labelName)
                 const isCustom = !PRESET_LABELS.includes(labelName)
                 return (
                   <button
@@ -325,7 +425,9 @@ export function LabelModal({
                           : 'hover:bg-accent/50'
                     }`}
                     onClick={() =>
-                      isSelected ? applyLabel(null) : applyLabel(labelData)
+                      applyLabel(
+                        isSelected && mode === 'single' ? null : labelData
+                      )
                     }
                     onMouseEnter={() => setFocusedIndex(i)}
                     tabIndex={-1}
@@ -335,11 +437,30 @@ export function LabelModal({
                       style={{ backgroundColor: labelData.color }}
                     />
                     <span className="flex-1 truncate">{labelName}</span>
-                    {isCustom && (
-                      <Pencil
-                        className="h-3 w-3 opacity-0 group-hover:opacity-50 hover:!opacity-100 transition-opacity mr-1"
-                        onClick={e => startEditColor(labelData, e)}
+                    {mode === 'multi' && (
+                      <Pin
+                        className={`h-3 w-3 transition-opacity mr-1 ${
+                          labelData.pinned
+                            ? 'opacity-100'
+                            : 'opacity-0 group-hover:opacity-50 hover:!opacity-100'
+                        }`}
+                        onClick={e => togglePinned(labelData, e)}
                       />
+                    )}
+                    {isSelected && <Check className="h-3 w-3 mr-1" />}
+                    {isCustom && (
+                      <>
+                        {onDeleteLabel && (
+                          <Trash2
+                            className="h-3 w-3 opacity-0 group-hover:opacity-50 hover:!opacity-100 transition-opacity mr-1 text-destructive"
+                            onClick={e => deleteLabel(labelData, e)}
+                          />
+                        )}
+                        <Pencil
+                          className="h-3 w-3 opacity-0 group-hover:opacity-50 hover:!opacity-100 transition-opacity mr-1"
+                          onClick={e => startEditColor(labelData, e)}
+                        />
+                      </>
                     )}
                   </button>
                 )
@@ -372,7 +493,11 @@ export function LabelModal({
             <>
               <span>
                 <kbd className="px-1 rounded border bg-muted">↵</kbd>{' '}
-                {editingLabelName ? 'save' : 'create'}
+                {editingLabelName
+                  ? 'save'
+                  : mode === 'multi'
+                    ? 'add'
+                    : 'create'}
               </span>
               <span>
                 <kbd className="px-1 rounded border bg-muted">esc</kbd> back
@@ -384,7 +509,7 @@ export function LabelModal({
                 <kbd className="px-1 rounded border bg-muted">↵</kbd> apply
               </span>
               <span>
-                <kbd className="px-1 rounded border bg-muted">⌫</kbd> remove
+                <kbd className="px-1 rounded border bg-muted">⌫</kbd> clear
               </span>
               <span>
                 <kbd className="px-1 rounded border bg-muted">↑↓</kbd> navigate

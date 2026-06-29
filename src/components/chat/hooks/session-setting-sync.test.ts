@@ -43,6 +43,15 @@ describe('applySessionSettingToSession', () => {
     })
   })
 
+  it('updates effort level', () => {
+    expect(
+      applySessionSettingToSession(baseSession, 'effortLevel', 'xhigh')
+    ).toMatchObject({
+      selected_effort_level: 'xhigh',
+      selected_thinking_level: 'off',
+    })
+  })
+
   it('updates execution mode', () => {
     expect(
       applySessionSettingToSession(baseSession, 'executionMode', 'yolo')

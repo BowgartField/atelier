@@ -94,6 +94,7 @@
   --sidebar-accent-foreground: oklch(0.205 0 0);
   --sidebar-border: oklch(0.922 0 0);
   --sidebar-ring: oklch(0.708 0 0);
+  --toast-background: var(--popover);
   --safe-area-top: env(safe-area-inset-top, 0px);
   --safe-area-right: env(safe-area-inset-right, 0px);
   --safe-area-bottom: env(safe-area-inset-bottom, 0px);
@@ -135,6 +136,8 @@
   --sidebar-accent-foreground: #fafafa;
   --sidebar-border: #323232; /* coolgray-500 */
   --sidebar-ring: #fcd452;
+  --toast-background: #2a2a2a; /* distinct from app bg (#101010) and chat input (#181818) */
+  --toast-border: #3a3a3a;
 }
 
 /* Wave animation for vibing indicator */
@@ -356,14 +359,14 @@
   }
 }
 
-/* Pulsing glow for running terminal icon indicator */
+/* Pulsing glow for running terminal icon indicator (opacity-based, GPU-friendly) */
 @keyframes icon-glow {
   0%,
   100% {
-    filter: drop-shadow(0 0 2px rgba(250, 204, 21, 0.5));
+    opacity: 0.7;
   }
   50% {
-    filter: drop-shadow(0 0 5px rgba(250, 204, 21, 0.8));
+    opacity: 1;
   }
 }
 
@@ -454,10 +457,23 @@
 
 /* Ensure toast notifications remain clickable above Radix modal overlays.
    Radix Dialog (modal mode) sets pointer-events:none on <body>;
-   Sonner already renders at z-index:999999999, we just restore pointer events. */
-[data-sonner-toaster],
+   App Toaster sets an explicit topmost z-index, and this restores pointer events. */
+[data-sonner-toaster] {
+  position: fixed !important;
+  z-index: 2147483647 !important;
+  pointer-events: auto !important;
+}
+
 [data-sonner-toaster] [data-sonner-toast] {
   pointer-events: auto !important;
+}
+
+/* Make text column grow so action/cancel buttons align to the right edge
+   regardless of title length. Sonner ships [data-content] with flex-column
+   only; without flex:1 the buttons sit flush to text and shift per-toast. */
+[data-sonner-toaster] [data-sonner-toast] [data-content] {
+  flex: 1 1 auto;
+  min-width: 0;
 }
 
 /* Ensures the title bar window controls (minimize, maximize, close) remain clickable
@@ -499,6 +515,17 @@ code,
 pre,
 kbd {
   font-family: var(--font-family-mono) !important;
+}
+
+/* Keyboard shortcut indicators only make sense in the native desktop app. */
+body:not(.native-app) kbd {
+  display: none !important;
+}
+
+@media (max-width: 767px) {
+  kbd {
+    display: none !important;
+  }
 }
 
 /* UI text styling - font-sans uses UI font preference */
@@ -604,14 +631,28 @@ kbd {
   scrollbar-color: var(--border) transparent;
 }
 
-.xterm,
-.xterm .xterm-viewport,
-.xterm .xterm-screen,
-.xterm .xterm-screen canvas {
-  background-color: var(--background) !important;
+.xterm .composition-view {
+  color: var(--foreground) !important;
 }
 
-.xterm .composition-view {
-  background-color: var(--background) !important;
-  color: var(--foreground) !important;
+@media (prefers-reduced-motion: reduce) {
+  .animate-wave,
+  .animate-blink,
+  .animate-border-spin,
+  .animate-icon-glow,
+  .animate-dots,
+  .square-spinner::before,
+  .card-border-spin::before {
+    animation: none !important;
+  }
+}
+
+.window-blurred .animate-wave,
+.window-blurred .animate-blink,
+.window-blurred .animate-border-spin,
+.window-blurred .animate-icon-glow,
+.window-blurred .animate-dots,
+.window-blurred .card-border-spin::before,
+.window-blurred .square-spinner::before {
+  animation-play-state: paused !important;
 }

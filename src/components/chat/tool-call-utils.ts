@@ -1,5 +1,13 @@
-import type { ToolCall, ContentBlock, Todo, PlanToolInput } from '@/types/chat'
-import { isTodoWrite, isCollabToolCall, isPlanToolCall } from '@/types/chat'
+import type { ToolCall, ContentBlock, Todo, PlanToolInput, Question } from '@/types/chat'
+import {
+  isTodoWrite,
+  isCollabToolCall,
+  isPlanToolCall,
+  isAskUserQuestion,
+  getAskUserQuestions,
+  normalizeQuestionMultipleField,
+  normalizeCodexQuestions,
+} from '@/types/chat'
 
 /** Check if a tool is a task/agent container (Claude CLI uses both names) */
 function isAgentTool(name: string): boolean {
@@ -119,6 +127,7 @@ export type TimelineItem =
   | { type: 'askUserQuestion'; tool: ToolCall; introText?: string; key: string }
   | { type: 'enterPlanMode'; tool: ToolCall; key: string }
   | { type: 'exitPlanMode'; tool: ToolCall; key: string }
+  | { type: 'userInput'; texts: string[]; key: string }
   | { type: 'unknown'; rawType: string; rawData: unknown; key: string }
 
 export interface ResolvedPlanContent {
@@ -258,8 +267,11 @@ export function buildTimeline(
   // This respects the actual output sequence - text blocks indicate Task completion
   let currentTaskId: string | null = null
   for (const block of normalizedBlocks) {
-    if (block.type === 'text' && block.text.trim()) {
-      // Text breaks the Task context - the agent has returned
+    if (
+      (block.type === 'text' && block.text.trim()) ||
+      block.type === 'user_input'
+    ) {
+      // Text (or an injected user message) breaks the Task context
       currentTaskId = null
     } else if (block.type === 'tool_use') {
       const tool = toolCallMap.get(block.tool_call_id)
@@ -309,19 +321,28 @@ export function buildTimeline(
         result.push({ type: 'text', text: block.text, key: `text-${i}` })
         lastTextIndex = result.length - 1
       }
+    } else if (block.type === 'user_input') {
+      // User text injected mid-turn (Codex turn/steer) — always rendered.
+      // Consecutive steered prompts merge into one connected group.
+      if (block.text.trim()) {
+        const last = result[result.length - 1]
+        if (last && last.type === 'userInput') {
+          last.texts.push(block.text)
+        } else {
+          result.push({
+            type: 'userInput',
+            texts: [block.text],
+            key: `input-${i}`,
+          })
+        }
+      }
     } else if (block.type === 'tool_use') {
       // tool_use block
       const toolCall = toolCallMap.get(block.tool_call_id)
       if (!toolCall) continue
 
       // Handle special tools
-      if (
-        (toolCall.name === 'AskUserQuestion' || toolCall.name === 'question') &&
-        typeof toolCall.input === 'object' &&
-        toolCall.input !== null &&
-        'questions' in toolCall.input &&
-        Array.isArray((toolCall.input as { questions: unknown }).questions)
-      ) {
+      if (isAskUserQuestion(toolCall)) {
         // Skip if we've already processed this AskUserQuestion
         if (renderedAskUserQuestions.has(toolCall.id)) continue
         renderedAskUserQuestions.add(toolCall.id)
@@ -338,10 +359,23 @@ export function buildTimeline(
           }
         }
 
+        const rawQuestions = getAskUserQuestions(toolCall.input) ?? []
+        const questionToolCall = {
+          ...toolCall,
+          input: {
+            questions:
+              toolCall.name === 'request_user_input'
+                ? normalizeCodexQuestions(rawQuestions)
+                : normalizeQuestionMultipleField(
+                    rawQuestions as (Question & { multiple?: boolean })[]
+                  ),
+          },
+        }
+
         // Render inline in natural position (not at end)
         result.push({
           type: 'askUserQuestion',
-          tool: toolCall,
+          tool: questionToolCall,
           introText,
           key: `ask-${toolCall.id}`,
         })
@@ -575,6 +609,29 @@ export function isDuplicatePlanTextBlock(
   const extracted = extractPlanSectionFromText(text)
   if (!extracted) return false
   return normalizePlanText(extracted) === normalizePlanText(resolvedPlanContent)
+}
+
+export function getIntroTextBeforeDuplicatePlan(
+  text: string,
+  resolvedPlanContent: string | null
+): string | null {
+  if (!resolvedPlanContent) return null
+
+  // If the whole assistant text is the rendered plan, there is no separate intro
+  // to show. This happens when Codex final_answer is mirrored into CodexPlan.
+  if (normalizePlanText(text) === normalizePlanText(resolvedPlanContent)) {
+    return null
+  }
+
+  const split = splitTextAroundPlan(text)
+  if (!split.plan) return null
+  if (
+    normalizePlanText(split.plan) !== normalizePlanText(resolvedPlanContent)
+  ) {
+    return null
+  }
+
+  return split.beforePlan
 }
 
 export function getPlanTextBlockIndicesToHide(

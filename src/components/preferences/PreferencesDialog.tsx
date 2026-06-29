@@ -10,7 +10,10 @@ import {
   Puzzle,
   FlaskConical,
   Globe,
+  Github,
+  Rabbit,
   Sparkles,
+  Terminal,
   type LucideIcon,
 } from 'lucide-react'
 import {
@@ -44,13 +47,31 @@ import {
   SidebarMenuButton,
   SidebarMenuItem,
   SidebarProvider,
+  SidebarSeparator,
 } from '@/components/ui/sidebar'
 import { useUIStore, type PreferencePane } from '@/store/ui-store'
 import type { KeybindingAction } from '@/types/keybindings'
+import { ClaudeIcon } from '@/components/icons/ClaudeIcon'
+import { CodexIcon } from '@/components/icons/CodexIcon'
+import { OpenCodeIcon } from '@/components/icons/OpenCodeIcon'
+import { CursorIcon } from '@/components/icons/CursorIcon'
+import { PiIcon } from '@/components/icons/PiIcon'
+import { CommandCodeIcon } from '@/components/icons/CommandCodeIcon'
+import { GrokIcon } from '@/components/icons/GrokIcon'
 import type { MagicPrompts } from '@/types/preferences'
 import { GeneralPane } from './panes/GeneralPane'
+import { ClaudePane } from './panes/ClaudePane'
+import { CodexPane } from './panes/CodexPane'
+import { OpenCodePane } from './panes/OpenCodePane'
+import { CursorPane } from './panes/CursorPane'
+import { PiPane } from './panes/PiPane'
+import { CommandCodePane } from './panes/CommandCodePane'
+import { GrokPane } from './panes/GrokPane'
+import { GitHubPane } from './panes/GitHubPane'
+import { CodeRabbitPane } from './panes/CodeRabbitPane'
 import { AppearancePane } from './panes/AppearancePane'
 import { KeybindingsPane } from './panes/KeybindingsPane'
+import { TerminalPane } from './panes/TerminalPane'
 import { MagicPromptsPane } from './panes/MagicPromptsPane'
 import { McpServersPane } from './panes/McpServersPane'
 import { ProvidersPane } from './panes/ProvidersPane'
@@ -65,73 +86,176 @@ import {
 } from './preferences-search'
 import { PreferencesSearchBar } from './PreferencesSearchBar'
 
-const navigationItems = [
+interface NavigationItem {
+  type: 'item'
+  id: PreferencePane
+  name: string
+  icon: LucideIcon
+  desktopOnly?: boolean
+}
+
+interface NavigationSeparator {
+  type: 'separator'
+  id: string
+}
+
+const navigationEntries: (NavigationItem | NavigationSeparator)[] = [
   {
-    id: 'general' as const,
+    type: 'item',
+    id: 'general',
     name: 'General',
     icon: Settings,
   },
   {
-    id: 'opinionated' as const,
+    type: 'item',
+    id: 'appearance',
+    name: 'Appearance',
+    icon: Palette,
+  },
+  {
+    type: 'item',
+    id: 'keybindings',
+    name: 'Keybindings',
+    icon: Keyboard,
+    desktopOnly: true,
+  },
+  { type: 'separator', id: 'interface-separator' },
+  {
+    type: 'item',
+    id: 'claude',
+    name: 'Claude',
+    icon: ClaudeIcon,
+  },
+  {
+    type: 'item',
+    id: 'codex',
+    name: 'Codex',
+    icon: CodexIcon,
+  },
+  {
+    type: 'item',
+    id: 'opencode',
+    name: 'OpenCode',
+    icon: OpenCodeIcon,
+  },
+  {
+    type: 'item',
+    id: 'cursor',
+    name: 'Cursor',
+    icon: CursorIcon,
+  },
+  {
+    type: 'item',
+    id: 'pi',
+    name: 'PI',
+    icon: PiIcon,
+  },
+  {
+    type: 'item',
+    id: 'commandcode',
+    name: 'Command Code',
+    icon: CommandCodeIcon,
+  },
+  {
+    type: 'item',
+    id: 'grok',
+    name: 'Grok (Beta)',
+    icon: GrokIcon,
+  },
+  {
+    type: 'item',
+    id: 'github',
+    name: 'GitHub CLI',
+    icon: Github,
+  },
+  {
+    type: 'item',
+    id: 'coderabbit',
+    name: 'CodeRabbit CLI',
+    icon: Rabbit,
+  },
+  { type: 'separator', id: 'backend-separator' },
+  {
+    type: 'item',
+    id: 'terminal',
+    name: 'Terminal',
+    icon: Terminal,
+  },
+  {
+    type: 'item',
+    id: 'magic-prompts',
+    name: 'Magic Prompts',
+    icon: Wand2,
+  },
+  {
+    type: 'item',
+    id: 'opinionated',
     name: 'Opinionated',
     icon: Sparkles,
   },
+  { type: 'separator', id: 'connectivity-separator' },
   {
-    id: 'web-access' as const,
+    type: 'item',
+    id: 'providers',
+    name: 'Providers',
+    icon: Blocks,
+  },
+  {
+    type: 'item',
+    id: 'web-access',
     name: 'Web Access',
     icon: Globe,
     desktopOnly: true,
   },
   {
-    id: 'providers' as const,
-    name: 'Providers',
-    icon: Blocks,
-  },
-  {
-    id: 'usage' as const,
-    name: 'Usage',
-    icon: BarChart3,
-  },
-  {
-    id: 'appearance' as const,
-    name: 'Appearance',
-    icon: Palette,
-  },
-  {
-    id: 'keybindings' as const,
-    name: 'Keybindings',
-    icon: Keyboard,
-    desktopOnly: true,
-  },
-  {
-    id: 'magic-prompts' as const,
-    name: 'Magic Prompts',
-    icon: Wand2,
-  },
-  {
-    id: 'mcp-servers' as const,
+    type: 'item',
+    id: 'mcp-servers',
     name: 'MCP Servers',
     icon: Plug,
   },
   {
-    id: 'integrations' as const,
+    type: 'item',
+    id: 'integrations',
     name: 'Integrations',
     icon: Puzzle,
   },
+  { type: 'separator', id: 'account-separator' },
   {
-    id: 'experimental' as const,
+    type: 'item',
+    id: 'usage',
+    name: 'Usage',
+    icon: BarChart3,
+  },
+  { type: 'separator', id: 'advanced-separator' },
+  {
+    type: 'item',
+    id: 'experimental',
     name: 'Experimental',
     icon: FlaskConical,
   },
 ]
 
+const navigationItems = navigationEntries.filter(
+  (entry): entry is NavigationItem => entry.type === 'item'
+)
+
 const paneIconMap: Record<PreferencePane, LucideIcon> = {
   general: Settings,
+  claude: ClaudeIcon,
+  codex: CodexIcon,
+  opencode: OpenCodeIcon,
+  cursor: CursorIcon,
+  pi: PiIcon,
+  commandcode: CommandCodeIcon,
+  grok: GrokIcon,
+  github: Github,
+  coderabbit: Rabbit,
   opinionated: Sparkles,
   providers: Blocks,
   usage: BarChart3,
   appearance: Palette,
   keybindings: Keyboard,
+  terminal: Terminal,
   'magic-prompts': Wand2,
   'mcp-servers': Plug,
   integrations: Puzzle,
@@ -143,10 +267,28 @@ const getPaneTitle = (pane: PreferencePane): string => {
   switch (pane) {
     case 'general':
       return 'General'
+    case 'claude':
+      return 'Claude'
+    case 'codex':
+      return 'Codex'
+    case 'opencode':
+      return 'OpenCode'
+    case 'cursor':
+      return 'Cursor'
+    case 'pi':
+      return 'PI'
+    case 'commandcode':
+      return 'Command Code'
+    case 'github':
+      return 'GitHub CLI'
+    case 'coderabbit':
+      return 'CodeRabbit CLI'
     case 'appearance':
       return 'Appearance'
     case 'keybindings':
       return 'Keybindings'
+    case 'terminal':
+      return 'Terminal'
     case 'magic-prompts':
       return 'Magic Prompts'
     case 'mcp-servers':
@@ -540,27 +682,33 @@ export function PreferencesDialog() {
         </DialogDescription>
 
         <SidebarProvider className="!min-h-0 !h-full items-stretch overflow-hidden">
-          <Sidebar collapsible="none" className="hidden md:flex">
+          <Sidebar collapsible="none" className="hidden lg:flex">
             <SidebarContent>
               <SidebarGroup>
                 <SidebarGroupContent>
                   <SidebarMenu>
-                    {navigationItems.map(item => (
-                      <SidebarMenuItem key={item.id}>
-                        <SidebarMenuButton
-                          asChild
-                          isActive={activePane === item.id}
-                        >
-                          <button
-                            onClick={() => handlePaneSelect(item.id)}
-                            className="w-full"
+                    {navigationEntries.map(entry =>
+                      entry.type === 'separator' ? (
+                        <li key={entry.id} aria-hidden="true" className="py-1">
+                          <SidebarSeparator className="mx-0" />
+                        </li>
+                      ) : (
+                        <SidebarMenuItem key={entry.id}>
+                          <SidebarMenuButton
+                            asChild
+                            isActive={activePane === entry.id}
                           >
-                            <item.icon />
-                            <span>{item.name}</span>
-                          </button>
-                        </SidebarMenuButton>
-                      </SidebarMenuItem>
-                    ))}
+                            <button
+                              onClick={() => handlePaneSelect(entry.id)}
+                              className="w-full"
+                            >
+                              <entry.icon />
+                              <span>{entry.name}</span>
+                            </button>
+                          </SidebarMenuButton>
+                        </SidebarMenuItem>
+                      )
+                    )}
                   </SidebarMenu>
                 </SidebarGroupContent>
               </SidebarGroup>
@@ -575,7 +723,7 @@ export function PreferencesDialog() {
                   value={activePane}
                   onValueChange={v => handlePaneSelect(v as PreferencePane)}
                 >
-                  <SelectTrigger className="md:hidden w-full">
+                  <SelectTrigger className="lg:hidden w-full">
                     <SelectValue />
                   </SelectTrigger>
                   <SelectContent>
@@ -590,10 +738,10 @@ export function PreferencesDialog() {
                 </Select>
                 <ModalCloseButton
                   size="lg"
-                  className="md:hidden"
+                  className="lg:hidden"
                   onClick={() => handleOpenChange(false)}
                 />
-                <Breadcrumb className="hidden md:block">
+                <Breadcrumb className="hidden lg:block">
                   <BreadcrumbList>
                     <BreadcrumbItem>
                       <BreadcrumbLink href="#">Settings</BreadcrumbLink>
@@ -607,7 +755,7 @@ export function PreferencesDialog() {
                   </BreadcrumbList>
                 </Breadcrumb>
 
-                <div className="ml-auto hidden md:flex items-center gap-2">
+                <div className="ml-auto hidden lg:flex items-center gap-2">
                   <PreferencesSearchBar
                     variant="desktop"
                     searchValue={searchValue}
@@ -635,7 +783,7 @@ export function PreferencesDialog() {
 
             <div
               ref={scrollContainerRef}
-              className="flex flex-1 flex-col gap-4 overflow-y-auto p-4 min-h-0"
+              className="flex min-w-0 flex-1 flex-col gap-4 overflow-x-hidden overflow-y-auto p-4 min-h-0"
             >
               <PreferencesSearchBar
                 variant="mobile"
@@ -654,59 +802,112 @@ export function PreferencesDialog() {
               />
 
               {activePane === 'general' && (
-                <div id="pref-pane-general">
+                <div id="pref-pane-general" className="min-w-0 max-w-full">
                   <GeneralPane />
                 </div>
               )}
+              {activePane === 'claude' && (
+                <div id="pref-pane-claude" className="min-w-0 max-w-full">
+                  <ClaudePane />
+                </div>
+              )}
+              {activePane === 'codex' && (
+                <div id="pref-pane-codex" className="min-w-0 max-w-full">
+                  <CodexPane />
+                </div>
+              )}
+              {activePane === 'opencode' && (
+                <div id="pref-pane-opencode" className="min-w-0 max-w-full">
+                  <OpenCodePane />
+                </div>
+              )}
+              {activePane === 'cursor' && (
+                <div id="pref-pane-cursor" className="min-w-0 max-w-full">
+                  <CursorPane />
+                </div>
+              )}
+              {activePane === 'pi' && (
+                <div id="pref-pane-pi" className="min-w-0 max-w-full">
+                  <PiPane />
+                </div>
+              )}
+              {activePane === 'commandcode' && (
+                <div id="pref-pane-commandcode" className="min-w-0 max-w-full">
+                  <CommandCodePane />
+                </div>
+              )}
+              {activePane === 'grok' && (
+                <div id="pref-pane-grok">
+                  <GrokPane />
+                </div>
+              )}
+              {activePane === 'github' && (
+                <div id="pref-pane-github" className="min-w-0 max-w-full">
+                  <GitHubPane />
+                </div>
+              )}
+              {activePane === 'coderabbit' && (
+                <div id="pref-pane-coderabbit" className="min-w-0 max-w-full">
+                  <CodeRabbitPane />
+                </div>
+              )}
               {activePane === 'appearance' && (
-                <div id="pref-pane-appearance">
+                <div id="pref-pane-appearance" className="min-w-0 max-w-full">
                   <AppearancePane />
                 </div>
               )}
               {activePane === 'keybindings' && (
-                <div id="pref-pane-keybindings">
+                <div id="pref-pane-keybindings" className="min-w-0 max-w-full">
                   <KeybindingsPane searchTargetAction={searchTargetAction} />
                 </div>
               )}
+              {activePane === 'terminal' && (
+                <div id="pref-pane-terminal" className="min-w-0 max-w-full">
+                  <TerminalPane />
+                </div>
+              )}
               {activePane === 'magic-prompts' && (
-                <div id="pref-pane-magic-prompts">
+                <div
+                  id="pref-pane-magic-prompts"
+                  className="min-w-0 max-w-full"
+                >
                   <MagicPromptsPane
                     searchTargetPromptKey={searchTargetPromptKey}
                   />
                 </div>
               )}
               {activePane === 'mcp-servers' && (
-                <div id="pref-pane-mcp-servers">
+                <div id="pref-pane-mcp-servers" className="min-w-0 max-w-full">
                   <McpServersPane />
                 </div>
               )}
               {activePane === 'providers' && (
-                <div id="pref-pane-providers">
+                <div id="pref-pane-providers" className="min-w-0 max-w-full">
                   <ProvidersPane />
                 </div>
               )}
               {activePane === 'usage' && (
-                <div id="pref-pane-usage">
+                <div id="pref-pane-usage" className="min-w-0 max-w-full">
                   <UsagePane />
                 </div>
               )}
               {activePane === 'integrations' && (
-                <div id="pref-pane-integrations">
+                <div id="pref-pane-integrations" className="min-w-0 max-w-full">
                   <IntegrationsPane />
                 </div>
               )}
               {activePane === 'experimental' && (
-                <div id="pref-pane-experimental">
+                <div id="pref-pane-experimental" className="min-w-0 max-w-full">
                   <ExperimentalPane />
                 </div>
               )}
               {activePane === 'opinionated' && (
-                <div id="pref-pane-opinionated">
+                <div id="pref-pane-opinionated" className="min-w-0 max-w-full">
                   <OpinionatedPane />
                 </div>
               )}
               {activePane === 'web-access' && (
-                <div id="pref-pane-web-access">
+                <div id="pref-pane-web-access" className="min-w-0 max-w-full">
                   <WebAccessPane />
                 </div>
               )}

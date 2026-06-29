@@ -4,11 +4,16 @@ import { useTerminalStore } from '@/store/terminal-store'
 import { useUIStore } from '@/store/ui-store'
 import {
   addTerminalTabForShortcut,
+  blurFocusedTerminalForShortcut,
   closeActiveTerminalTabForShortcut,
+  findKeybindingAction,
   getTerminalShortcutWorktreeId,
+  isPlainSessionTerminalFocused,
+  shouldAllowKeybindingThroughOpenOverlay,
   shouldLetPlanDialogHandleAction,
   switchActiveTerminalTabByIndexForShortcut,
 } from './useMainWindowEventListeners'
+import { DEFAULT_KEYBINDINGS } from '@/types/keybindings'
 
 const { mockInvoke, mockListen, mockDisposeTerminal } = vi.hoisted(() => ({
   mockInvoke: vi.fn().mockResolvedValue(undefined),
@@ -37,6 +42,24 @@ function focusTerminal() {
   const input = document.createElement('textarea')
   terminal.appendChild(input)
   document.body.appendChild(terminal)
+
+  input.focus()
+  return input
+}
+
+function focusPlainSessionTerminal() {
+  document.body.innerHTML = ''
+
+  const root = document.createElement('div')
+  root.setAttribute('data-terminal-surface', 'session')
+
+  const terminal = document.createElement('div')
+  terminal.className = 'xterm'
+
+  const input = document.createElement('textarea')
+  terminal.appendChild(input)
+  root.appendChild(terminal)
+  document.body.appendChild(root)
 
   input.focus()
   return input
@@ -119,7 +142,19 @@ describe('useMainWindowEventListeners terminal shortcuts', () => {
       planDialogOpen: false,
       gitDiffModalOpen: false,
       githubDashboardOpen: false,
+      sessionPrimarySurface: {},
+      sessionTerminalIds: {},
+      newSessionModeTarget: null,
     })
+  })
+
+  it('maps Option+Cmd arrow shortcuts to medium chat scroll actions', () => {
+    expect(findKeybindingAction('mod+alt+arrowup', DEFAULT_KEYBINDINGS)).toBe(
+      'scroll_chat_up_medium'
+    )
+    expect(findKeybindingAction('mod+alt+arrowdown', DEFAULT_KEYBINDINGS)).toBe(
+      'scroll_chat_down_medium'
+    )
   })
 
   it('does not resolve terminal shortcuts when the terminal is open but unfocused', () => {
@@ -190,6 +225,38 @@ describe('useMainWindowEventListeners terminal shortcuts', () => {
     expect(
       useTerminalStore.getState().terminals['modal-worktree']
     ).toHaveLength(2)
+  })
+
+  it('lets focused full-screen plain terminal sessions own keybindings', () => {
+    focusPlainSessionTerminal()
+
+    useChatStore.setState({ activeWorktreeId: 'worktree-1' })
+    useUIStore.setState({
+      sessionPrimarySurface: { 'session-1': 'terminal' },
+      sessionTerminalIds: { 'session-1': 'term-1' },
+    })
+
+    expect(isPlainSessionTerminalFocused()).toBe(true)
+    expect(getTerminalShortcutWorktreeId()).toBeNull()
+    expect(addTerminalTabForShortcut()).toBe(false)
+  })
+
+  it('unfocuses focused full-screen plain terminal sessions for the escape hatch shortcut', () => {
+    const input = focusPlainSessionTerminal()
+
+    expect(document.activeElement).toBe(input)
+    expect(blurFocusedTerminalForShortcut()).toBe(true)
+    expect(document.activeElement).not.toBe(input)
+    expect(isPlainSessionTerminalFocused()).toBe(false)
+  })
+
+  it('unfocuses focused side terminals for the escape hatch shortcut', () => {
+    const input = focusTerminal()
+
+    expect(document.activeElement).toBe(input)
+    expect(blurFocusedTerminalForShortcut()).toBe(true)
+    expect(document.activeElement).not.toBe(input)
+    expect(getTerminalShortcutWorktreeId()).toBeNull()
   })
 
   it('uses the terminal shortcut path to close the active terminal tab for the modal worktree', () => {
@@ -309,5 +376,54 @@ describe('shouldLetPlanDialogHandleAction', () => {
   it('returns false for non-approve actions or when the dialog is closed', () => {
     expect(shouldLetPlanDialogHandleAction('open_plan', true)).toBe(false)
     expect(shouldLetPlanDialogHandleAction('approve_plan', false)).toBe(false)
+  })
+})
+
+describe('dialog overlay keybinding passthrough', () => {
+  beforeEach(() => {
+    useUIStore.setState({
+      gitDiffModalOpen: false,
+      openInModalOpen: false,
+    })
+  })
+
+  it('maps Cmd/Ctrl+O to the Open In action', () => {
+    expect(
+      findKeybindingAction('mod+o', {
+        open_in_modal: 'mod+o',
+        open_magic_modal: 'mod+m',
+      })
+    ).toBe('open_in_modal')
+  })
+
+  it('allows Open In through while the git diff modal is open', () => {
+    useUIStore.setState({ gitDiffModalOpen: true })
+
+    expect(
+      shouldAllowKeybindingThroughOpenOverlay(
+        'open_in_modal',
+        useUIStore.getState()
+      )
+    ).toBe(true)
+  })
+
+  it('keeps unrelated shortcuts blocked by an open git diff modal', () => {
+    useUIStore.setState({ gitDiffModalOpen: true })
+
+    expect(
+      shouldAllowKeybindingThroughOpenOverlay(
+        'open_magic_modal',
+        useUIStore.getState()
+      )
+    ).toBe(false)
+  })
+
+  it('does not allow Open In through other dialogs', () => {
+    expect(
+      shouldAllowKeybindingThroughOpenOverlay(
+        'open_in_modal',
+        useUIStore.getState()
+      )
+    ).toBe(false)
   })
 })

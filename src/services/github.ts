@@ -2,6 +2,7 @@ import { useQuery } from '@tanstack/react-query'
 import { invoke } from '@/lib/transport'
 import { logger } from '@/lib/logger'
 import type {
+  GitHubLabel,
   GitHubIssue,
   GitHubIssueDetail,
   GitHubIssueListResult,
@@ -18,24 +19,50 @@ import type {
 } from '@/types/github'
 import { isTauri } from './projects'
 
+function getErrorMessage(error: unknown): string {
+  if (!error) return ''
+  return error instanceof Error ? error.message : String(error)
+}
+
+/**
+ * GitHub CLI can suggest `gh auth login` for repositories whose remotes are
+ * not hosted on a known GitHub host. Those are repository eligibility errors,
+ * not authentication failures.
+ */
+export function isUnsupportedGitHubRepoError(error: unknown): boolean {
+  const lower = getErrorMessage(error).toLowerCase()
+  if (!lower) return false
+
+  return (
+    lower.includes('none of the git remotes configured') ||
+    lower.includes('no git remotes found') ||
+    lower.includes('known github host') ||
+    lower.includes('not a github repository') ||
+    lower.includes('remote url is not a github repository') ||
+    lower.includes('could not resolve repository') ||
+    lower.includes('not a git repository')
+  )
+}
+
 /**
  * Check if an error is a GitHub CLI authentication or installation error.
  *
- * Matches:
- * - Auth errors: "GitHub CLI not authenticated. Run 'gh auth login' first."
- * - Auth prompt: stderr containing "gh auth login"
- * - Binary not found: "The system cannot find the file specified."
- *
- * Does NOT match generic gh failures (no remotes, repo not found, etc.)
+ * Repository eligibility errors (GitLab/no remote/unknown host) are explicitly
+ * excluded even if the gh stderr suggests running `gh auth login`.
  */
 export function isGhAuthError(error: unknown): boolean {
-  if (!error) return false
-  const message = error instanceof Error ? error.message : String(error)
+  if (!error || isUnsupportedGitHubRepoError(error)) return false
+  const message = getErrorMessage(error)
   const lower = message.toLowerCase()
 
   return (
-    lower.includes('not authenticated') ||
+    lower.includes('github cli not authenticated') ||
     lower.includes('gh auth login') ||
+    lower.includes('not logged into any github hosts') ||
+    lower.includes('you are not logged into any github hosts') ||
+    lower.includes('requires authentication') ||
+    lower.includes('authentication required') ||
+    lower.includes('bad credentials') ||
     lower.includes('the system cannot find the file specified')
   )
 }
@@ -43,6 +70,8 @@ export function isGhAuthError(error: unknown): boolean {
 // Query keys for GitHub
 export const githubQueryKeys = {
   all: ['github'] as const,
+  labels: (projectPath: string) =>
+    [...githubQueryKeys.all, 'labels', projectPath] as const,
   issues: (projectPath: string, state: string) =>
     [...githubQueryKeys.all, 'issues', projectPath, state] as const,
   issue: (projectPath: string, issueNumber: number) =>
@@ -125,6 +154,32 @@ export const githubQueryKeys = {
           'loaded-advisory-contexts',
           sessionId,
         ] as const),
+}
+
+export function useGitHubLabels(
+  projectPath: string | null,
+  options?: { enabled?: boolean; staleTime?: number }
+) {
+  return useQuery({
+    queryKey: githubQueryKeys.labels(projectPath ?? ''),
+    queryFn: async (): Promise<GitHubLabel[]> => {
+      if (!isTauri() || !projectPath) return []
+
+      try {
+        logger.debug('Fetching GitHub labels', { projectPath })
+        return await invoke<GitHubLabel[]>('list_github_labels', {
+          projectPath,
+        })
+      } catch (error) {
+        logger.error('Failed to load GitHub labels', { error, projectPath })
+        throw error
+      }
+    },
+    enabled: (options?.enabled ?? true) && !!projectPath,
+    staleTime: options?.staleTime ?? 1000 * 60 * 10,
+    gcTime: 1000 * 60 * 30,
+    retry: 1,
+  })
 }
 
 /**
@@ -1193,12 +1248,14 @@ export async function removeAdvisoryContext(
 export async function getAdvisoryContextContent(
   sessionId: string,
   ghsaId: string,
-  projectPath: string
+  projectPath: string,
+  worktreeId?: string | null
 ): Promise<string> {
   return invoke<string>('get_advisory_context_content', {
     sessionId,
     ghsaId,
     projectPath,
+    worktreeId: worktreeId ?? undefined,
   })
 }
 

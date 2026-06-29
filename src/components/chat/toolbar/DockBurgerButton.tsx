@@ -2,16 +2,11 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import {
   Archive,
   Command,
-  Github,
   LayoutDashboard,
   Menu,
-  Paperclip,
   Plug,
   Plus,
-  Terminal,
 } from 'lucide-react'
-import { useQueryClient } from '@tanstack/react-query'
-import { toast } from 'sonner'
 import { cn } from '@/lib/utils'
 import {
   DropdownMenu,
@@ -28,48 +23,34 @@ import {
   TooltipTrigger,
 } from '@/components/ui/tooltip'
 import { useIsMobile } from '@/hooks/use-mobile'
-import { invoke } from '@/lib/transport'
-import { useWsConnectionStatus } from '@/lib/transport'
-import { isNativeApp } from '@/lib/environment'
-import { openExternal, preOpenWindow } from '@/lib/platform'
-import { copyToClipboard } from '@/lib/clipboard'
 import { useUIStore } from '@/store/ui-store'
 import { useChatStore } from '@/store/chat-store'
 import { useProjectsStore } from '@/store/projects-store'
-import { useTerminalStore } from '@/store/terminal-store'
-import { chatQueryKeys } from '@/services/chat'
 import { usePreferences } from '@/services/preferences'
-import { useWorktree, type GitHubRemote } from '@/services/projects'
 import {
   useCodexCliAuth,
   useCodexCliStatus,
   useCodexUsage,
 } from '@/services/codex-cli'
-import type { WorktreeSessions } from '@/types/chat'
 import { DEFAULT_KEYBINDINGS, formatShortcutDisplay } from '@/types/keybindings'
-import { getResumeCommand } from '@/components/chat/session-card-utils'
+import type { CliBackend } from '@/types/preferences'
 
 interface DockBurgerButtonProps {
   /** Number of enabled MCP servers; shown as a badge next to the MCP item. */
   activeMcpCount?: number
-  /** Attach-images handler — opens native file picker (see ChatWindow). */
-  onAttach?: () => void
   /** Extra classes merged onto the trigger button (e.g. responsive visibility). */
   className?: string
 }
 
 export function DockBurgerButton({
   activeMcpCount = 0,
-  onAttach,
   className,
 }: DockBurgerButtonProps = {}) {
   const isMobile = useIsMobile()
-  const queryClient = useQueryClient()
   const { data: preferences } = usePreferences()
 
-  const selectedProjectId = useProjectsStore(state => state.selectedProjectId)
-  const selectedWorktreeId = useProjectsStore(state => state.selectedWorktreeId)
   const activeWorktreeId = useChatStore(state => state.activeWorktreeId)
+  const selectedWorktreeId = useProjectsStore(state => state.selectedWorktreeId)
   const sessionChatModalOpen = useUIStore(state => state.sessionChatModalOpen)
   const sessionChatModalWorktreeId = useUIStore(
     state => state.sessionChatModalWorktreeId
@@ -77,7 +58,6 @@ export function DockBurgerButton({
   const currentWorktreeId = sessionChatModalOpen
     ? (sessionChatModalWorktreeId ?? activeWorktreeId ?? selectedWorktreeId)
     : (activeWorktreeId ?? selectedWorktreeId)
-  const { data: worktree } = useWorktree(isMobile ? currentWorktreeId : null)
   const activeSessionId = useChatStore(state =>
     currentWorktreeId ? state.activeSessionIds[currentWorktreeId] : undefined
   )
@@ -86,12 +66,11 @@ export function DockBurgerButton({
   )
 
   const [menuOpen, setMenuOpen] = useState(false)
-  const [resumeCommand, setResumeCommand] = useState<string | null>(null)
   const triggerRef = useRef<HTMLButtonElement>(null)
 
   const activeBackend = (selectedBackend ??
     preferences?.default_backend ??
-    'claude') as 'claude' | 'codex' | 'opencode' | 'cursor'
+    'claude') as CliBackend
 
   const codexStatus = useCodexCliStatus()
   const codexAuth = useCodexCliAuth({
@@ -116,38 +95,9 @@ export function DockBurgerButton({
   const sessionText = sessionPct === null ? '--' : `${Math.round(sessionPct)}`
   const weeklyText = weeklyPct === null ? '--' : `${Math.round(weeklyPct)}`
 
-  const getActiveResumeCommand = useCallback(() => {
-    const { selectedWorktreeId: worktreeId } = useProjectsStore.getState()
-    if (!worktreeId) return null
-    const sessionId = useChatStore.getState().activeSessionIds[worktreeId]
-    if (!sessionId) return null
-    const cached =
-      queryClient.getQueryData<WorktreeSessions>(
-        chatQueryKeys.sessions(worktreeId)
-      ) ??
-      queryClient.getQueryData<WorktreeSessions>([
-        ...chatQueryKeys.sessions(worktreeId),
-        'with-counts',
-      ])
-    const session = cached?.sessions?.find(s => s.id === sessionId)
-    return session ? getResumeCommand(session) : null
-  }, [queryClient])
-
-  const handleOpenChange = useCallback(
-    (open: boolean) => {
-      setMenuOpen(open)
-      if (open) setResumeCommand(getActiveResumeCommand())
-    },
-    [getActiveResumeCommand]
-  )
-
   const toggleMenu = useCallback(() => {
-    setMenuOpen(prev => {
-      const next = !prev
-      if (next) setResumeCommand(getActiveResumeCommand())
-      return next
-    })
-  }, [getActiveResumeCommand])
+    setMenuOpen(prev => !prev)
+  }, [])
 
   // Global shortcut — only respond when this instance is the visible variant.
   // Both desktop + mobile burgers mount; CSS (`hidden`/`@xl:hidden`) hides one.
@@ -162,58 +112,6 @@ export function DockBurgerButton({
     return () => window.removeEventListener('toggle-quick-menu', handler)
   }, [toggleMenu])
 
-  const handleCopyResumeCommand = useCallback(() => {
-    const commandToCopy = getActiveResumeCommand() ?? resumeCommand
-    if (!commandToCopy) return
-    void copyToClipboard(commandToCopy)
-      .then(() => toast.success('Resume command copied'))
-      .catch(() => toast.error('Failed to copy resume command'))
-  }, [getActiveResumeCommand, resumeCommand])
-
-  const handleOpenGitHub = useCallback(() => {
-    const branch = worktree?.branch
-    if (!branch) {
-      if (isNativeApp()) {
-        if (selectedProjectId) {
-          invoke('open_project_on_github', { projectId: selectedProjectId })
-        }
-      } else {
-        const targetPath = worktree?.path
-        if (targetPath) {
-          const win = preOpenWindow()
-          invoke<string>('get_github_repo_url', { repoPath: targetPath })
-            .then(url => openExternal(url, win))
-            .catch(() => {
-              win?.close()
-              toast.error('Failed to open GitHub')
-            })
-        }
-      }
-      return
-    }
-    const targetPath = worktree?.path
-    if (!targetPath) return
-    const win = preOpenWindow()
-    invoke<GitHubRemote[]>('get_github_remotes', { repoPath: targetPath })
-      .then(remotes => {
-        if (!remotes || remotes.length <= 1) {
-          const url = remotes?.[0]?.url
-          if (url) openExternal(`${url}/tree/${branch}`, win)
-          else win?.close()
-        } else {
-          win?.close()
-          useUIStore.getState().openRemotePicker(targetPath, remoteName => {
-            const remote = remotes.find(r => r.name === remoteName)
-            if (remote) openExternal(`${remote.url}/tree/${branch}`)
-          })
-        }
-      })
-      .catch(() => {
-        win?.close()
-        toast.error('Failed to fetch remotes')
-      })
-  }, [worktree?.branch, worktree?.path, selectedProjectId])
-
   const githubShortcut = formatShortcutDisplay(
     (preferences?.keybindings?.open_github_dashboard ??
       DEFAULT_KEYBINDINGS.open_github_dashboard) as string
@@ -222,17 +120,9 @@ export function DockBurgerButton({
     (preferences?.keybindings?.open_quick_menu ??
       DEFAULT_KEYBINDINGS.open_quick_menu) as string
   )
-  const terminalShortcut = formatShortcutDisplay(
-    (preferences?.keybindings?.toggle_terminal ??
-      DEFAULT_KEYBINDINGS.toggle_terminal) as string
-  )
-
-  const isWebAccess = !isNativeApp()
-  const connected = useWsConnectionStatus()
-  const showConnectionIndicator = isWebAccess
 
   return (
-    <DropdownMenu open={menuOpen} onOpenChange={handleOpenChange}>
+    <DropdownMenu open={menuOpen} onOpenChange={setMenuOpen}>
       <Tooltip>
         <TooltipTrigger asChild>
           <DropdownMenuTrigger asChild>
@@ -278,24 +168,20 @@ export function DockBurgerButton({
         >
           <Command className="mr-2 h-4 w-4" />
           Command Palette
-          <DropdownMenuShortcut>⌘K</DropdownMenuShortcut>
+          {!isMobile && <DropdownMenuShortcut>⌘K</DropdownMenuShortcut>}
         </DropdownMenuItem>
         <DropdownMenuItem
           onClick={() => useUIStore.getState().setGitHubDashboardOpen(true)}
         >
           <LayoutDashboard className="mr-2 h-4 w-4" />
           GitHub Dashboard
-          <DropdownMenuShortcut>{githubShortcut}</DropdownMenuShortcut>
+          {!isMobile && (
+            <DropdownMenuShortcut>{githubShortcut}</DropdownMenuShortcut>
+          )}
         </DropdownMenuItem>
 
         <DropdownMenuSeparator />
 
-        {onAttach && (
-          <DropdownMenuItem onClick={onAttach}>
-            <Paperclip className="mr-2 h-4 w-4" />
-            Attachments
-          </DropdownMenuItem>
-        )}
         <DropdownMenuItem
           onClick={() =>
             useUIStore.getState().openPreferencesPane('mcp-servers')
@@ -313,31 +199,6 @@ export function DockBurgerButton({
             <DropdownMenuShortcut>{activeMcpCount}</DropdownMenuShortcut>
           )}
         </DropdownMenuItem>
-        {isMobile && currentWorktreeId && (
-          <DropdownMenuItem onClick={handleOpenGitHub}>
-            <Github className="mr-2 h-4 w-4" />
-            GitHub
-          </DropdownMenuItem>
-        )}
-        {currentWorktreeId && (
-          <DropdownMenuItem
-            onClick={() =>
-              useTerminalStore
-                .getState()
-                .toggleModalTerminal(currentWorktreeId)
-            }
-          >
-            <Terminal className="mr-2 h-4 w-4" />
-            Terminal
-            <DropdownMenuShortcut>{terminalShortcut}</DropdownMenuShortcut>
-          </DropdownMenuItem>
-        )}
-        {resumeCommand && (
-          <DropdownMenuItem onClick={handleCopyResumeCommand}>
-            <Terminal className="mr-2 h-4 w-4" />
-            Copy Resume Command
-          </DropdownMenuItem>
-        )}
 
         {!isMobile && showCodexUsage && (
           <>
@@ -353,24 +214,6 @@ export function DockBurgerButton({
                 {sessionText}|{weeklyText}%
               </DropdownMenuShortcut>
             </DropdownMenuItem>
-          </>
-        )}
-
-        {showConnectionIndicator && (
-          <>
-            <DropdownMenuSeparator />
-            <div
-              className="relative flex select-none items-center gap-2 rounded-sm px-2 py-1.5 text-sm text-foreground"
-              role="status"
-              aria-live="polite"
-            >
-              <span className="inline-flex size-4 shrink-0 items-center justify-center">
-                <span
-                  className={`inline-block size-2 rounded-full ${connected ? 'bg-green-500' : 'bg-red-500 animate-pulse'}`}
-                />
-              </span>
-              {connected ? 'Connected' : 'Reconnecting'}
-            </div>
           </>
         )}
       </DropdownMenuContent>

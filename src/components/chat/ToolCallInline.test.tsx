@@ -1,10 +1,29 @@
 import { fireEvent, render, screen } from '@/test/test-utils'
 import { describe, expect, it, vi } from 'vitest'
 import { ToolCallInline } from './ToolCallInline'
+import type { ComponentProps } from 'react'
+import type * as InlineFileDiffModule from './InlineFileDiff'
+
+const inlineFileDiffProps = vi.hoisted(() => [] as Record<string, unknown>[])
+type InlineFileDiffProps = ComponentProps<
+  typeof InlineFileDiffModule.InlineFileDiff
+>
 
 vi.mock('@/services/preferences', () => ({
   usePreferences: () => ({ data: undefined }),
 }))
+
+vi.mock('./InlineFileDiff', async importOriginal => {
+  const actual = (await importOriginal()) as typeof InlineFileDiffModule
+
+  return {
+    ...actual,
+    InlineFileDiff: (props: InlineFileDiffProps) => {
+      inlineFileDiffProps.push(props as unknown as Record<string, unknown>)
+      return actual.InlineFileDiff(props)
+    },
+  }
+})
 
 describe('ToolCallInline', () => {
   it('renders Cursor EnterPlanMode instructions', () => {
@@ -72,8 +91,120 @@ describe('ToolCallInline', () => {
     expect(expandedContent).toBeInTheDocument()
   })
 
-  it('renders FileChange diffs without duplicate raw output', () => {
+  it('renders Command Code read_file calls as file reads', () => {
     render(
+      <ToolCallInline
+        toolCall={{
+          id: 'tool-commandcode-read-1',
+          name: 'read_file',
+          input: {
+            absolutePath: '/Users/example/project/package.json',
+            limit: 20,
+          },
+        }}
+      />
+    )
+
+    expect(screen.getByText('Read 20 lines')).toBeInTheDocument()
+    expect(screen.getByText('package.json')).toBeInTheDocument()
+    expect(screen.queryByText(/unhandled tool/i)).not.toBeInTheDocument()
+
+    fireEvent.click(screen.getByRole('button'))
+
+    expect(
+      screen.getByText((_, element) =>
+        Boolean(
+          element?.classList.contains('whitespace-pre-wrap') &&
+          element.textContent ===
+            'Path: /Users/example/project/package.json\nLimit: 20'
+        )
+      )
+    ).toBeInTheDocument()
+  })
+
+  it('renders Command Code shell_command calls as Bash', () => {
+    render(
+      <ToolCallInline
+        toolCall={{
+          id: 'tool-commandcode-shell-1',
+          name: 'shell_command',
+          input: {
+            command: 'date',
+          },
+        }}
+      />
+    )
+
+    expect(screen.getByText('Bash')).toBeInTheDocument()
+    expect(screen.getByText('date')).toBeInTheDocument()
+    expect(screen.queryByText(/unhandled tool/i)).not.toBeInTheDocument()
+  })
+
+  it('renders additional Command Code snake_case tools without the unhandled fallback', () => {
+    const tools = [
+      {
+        id: 'tool-write',
+        name: 'write_file',
+        input: {
+          filePath: '/Users/example/project/.ai/demo.md',
+          content: '# Demo',
+        },
+        label: 'Write',
+        detail: 'demo.md',
+      },
+      {
+        id: 'tool-glob',
+        name: 'glob',
+        input: { pattern: '*.md' },
+        label: 'Glob',
+        detail: '*.md',
+      },
+      {
+        id: 'tool-grep',
+        name: 'grep',
+        input: { pattern: 'version', include: ['package.json'] },
+        label: 'Grep',
+        detail: '"version"',
+      },
+      {
+        id: 'tool-list',
+        name: 'read_directory',
+        input: { path: '/Users/example/project/.ai' },
+        label: 'List',
+        detail: '/Users/example/project/.ai',
+      },
+      {
+        id: 'tool-multi-read',
+        name: 'read_multiple_files',
+        input: {
+          targetDirectory: '/Users/example/project/.ai',
+          include: ['*.md'],
+        },
+        label: 'Read Multiple Files',
+        detail: '*.md in /Users/example/project/.ai',
+      },
+    ]
+
+    for (const tool of tools) {
+      const { unmount } = render(
+        <ToolCallInline
+          toolCall={{
+            id: tool.id,
+            name: tool.name,
+            input: tool.input,
+          }}
+        />
+      )
+
+      expect(screen.getByText(tool.label)).toBeInTheDocument()
+      expect(screen.getByText(tool.detail)).toBeInTheDocument()
+      expect(screen.queryByText(/unhandled tool/i)).not.toBeInTheDocument()
+      unmount()
+    }
+  })
+
+  it('renders FileChange diffs without duplicate raw output', () => {
+    const { container } = render(
       <ToolCallInline
         toolCall={{
           id: 'tool-file-change-1',
@@ -94,13 +225,19 @@ describe('ToolCallInline', () => {
     fireEvent.click(screen.getByRole('button'))
 
     expect(screen.getByText('chat-store.ts')).toBeInTheDocument()
-    expect(screen.getByText('@@ -1 +1 @@')).toBeInTheDocument()
-    expect(screen.getByText('+new')).toBeInTheDocument()
+    expect(screen.getByText('update')).toBeInTheDocument()
+    expect(inlineFileDiffProps.at(-1)).toMatchObject({
+      patch: '@@ -1 +1 @@\n-old\n+new',
+      filePath: '/tmp/chat-store.ts',
+    })
+    expect(inlineFileDiffProps.at(-1)).not.toHaveProperty('neutral')
+    // <FileDiff> renders its diff inside a <diffs-container> custom element
+    expect(container.querySelector('diffs-container')).not.toBeNull()
     expect(screen.queryByText('Output:')).not.toBeInTheDocument()
   })
 
   it('falls back to parsing legacy FileChange output when input is empty', () => {
-    render(
+    const { container } = render(
       <ToolCallInline
         toolCall={{
           id: 'tool-file-change-2',
@@ -115,7 +252,7 @@ describe('ToolCallInline', () => {
     fireEvent.click(screen.getByRole('button'))
 
     expect(screen.getAllByText('legacy.ts')).toHaveLength(2)
-    expect(screen.getByText('+after')).toBeInTheDocument()
+    expect(container.querySelector('diffs-container')).not.toBeNull()
     expect(screen.queryByText('Output:')).not.toBeInTheDocument()
   })
 })
