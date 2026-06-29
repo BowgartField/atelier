@@ -62,7 +62,6 @@ import {
   useAddRemoteServer,
   useConnectRemoteServer,
   useDisconnectRemoteServer,
-  useProvisionRemoteServer,
   useRemoteServers,
   useRemoveRemoteServer,
   useTestRemoteServer,
@@ -74,8 +73,9 @@ import type {
   RemoteServerStatus,
 } from '@/types/remote'
 import { SettingsSection } from '../SettingsSection'
+import { RemoteServerProvisionModal } from './RemoteServerProvisionModal'
 
-type BusyAction = 'test' | 'provision' | 'connect' | 'disconnect' | 'delete'
+type BusyAction = 'test' | 'connect' | 'disconnect' | 'delete'
 
 interface ServerFormState {
   name: string
@@ -477,7 +477,6 @@ export function RemoteServersPane() {
   const updateServer = useUpdateRemoteServer()
   const removeServer = useRemoveRemoteServer()
   const testServer = useTestRemoteServer()
-  const provisionServer = useProvisionRemoteServer()
   const connectServer = useConnectRemoteServer()
   const disconnectServer = useDisconnectRemoteServer()
   const [formOpen, setFormOpen] = useState(false)
@@ -548,21 +547,6 @@ export function RemoteServersPane() {
         )
       } catch (error) {
         toast.error(`SSH test failed: ${errorMessage(error)}`, { id: toastId })
-      }
-    })
-
-  const handleProvision = (server: RemoteServerConfig) =>
-    runAction(server, 'provision', async () => {
-      const toastId = toast.loading(
-        `Installing Jean on ${server.name}. This can take a few minutes…`
-      )
-      try {
-        const result = await provisionServer.mutateAsync(server.id)
-        toast.success(`Jean ${result.version} is running`, { id: toastId })
-      } catch (error) {
-        toast.error(`Provisioning failed: ${errorMessage(error)}`, {
-          id: toastId,
-        })
       }
     })
 
@@ -773,11 +757,7 @@ export function RemoteServersPane() {
                         onClick={() => setProvisionTarget(server)}
                         disabled={globallyBusy || connected}
                       >
-                        {isBusy(server, 'provision') ? (
-                          <Loader2 className="animate-spin" />
-                        ) : (
-                          <ShieldCheck />
-                        )}
+                        <ShieldCheck />
                         {server.installed_version ? 'Reprovision' : 'Provision'}
                       </Button>
                       {connected ? (
@@ -862,6 +842,12 @@ export function RemoteServersPane() {
         />
       )}
 
+      <RemoteServerProvisionModal
+        open={provisionTarget != null}
+        server={provisionTarget}
+        onOpenChange={open => !open && setProvisionTarget(null)}
+      />
+
       <AlertDialog
         open={deleteTarget != null}
         onOpenChange={open => !open && setDeleteTarget(null)}
@@ -881,37 +867,6 @@ export function RemoteServersPane() {
               onClick={handleDelete}
             >
               Remove server
-            </AlertDialogAction>
-          </AlertDialogFooter>
-        </AlertDialogContent>
-      </AlertDialog>
-
-      <AlertDialog
-        open={provisionTarget != null}
-        onOpenChange={open => !open && setProvisionTarget(null)}
-      >
-        <AlertDialogContent>
-          <AlertDialogHeader>
-            <AlertDialogTitle>
-              Provision Jean on {provisionTarget?.name}?
-            </AlertDialogTitle>
-            <AlertDialogDescription>
-              Jean will use passwordless sudo to install Xvfb and runtime
-              packages, upload the signed AppImage, and replace the
-              jean-remote.service systemd unit.
-            </AlertDialogDescription>
-          </AlertDialogHeader>
-          <AlertDialogFooter>
-            <AlertDialogCancel>Cancel</AlertDialogCancel>
-            <AlertDialogAction
-              onClick={() => {
-                const target = provisionTarget
-                setProvisionTarget(null)
-                if (target) void handleProvision(target)
-              }}
-            >
-              <ShieldCheck />
-              Provision server
             </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>

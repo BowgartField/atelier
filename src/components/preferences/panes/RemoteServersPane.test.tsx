@@ -40,6 +40,10 @@ vi.mock('@/services/remote-servers', () => ({
   useDisconnectRemoteServer: () => ({ mutateAsync: mocks.disconnect }),
 }))
 
+vi.mock('@/lib/transport', () => ({
+  listen: vi.fn(async () => vi.fn()),
+}))
+
 vi.mock('@/lib/platform', () => ({
   isMacOS: true,
 }))
@@ -134,7 +138,7 @@ describe('RemoteServersPane', () => {
     })
   })
 
-  it('requires confirmation before provisioning', async () => {
+  it('opens the provisioning modal and starts provisioning', async () => {
     mocks.servers = [{ ...server, http_token: null, installed_version: null }]
     mocks.provision.mockResolvedValue({
       success: true,
@@ -148,7 +152,7 @@ describe('RemoteServersPane', () => {
     await user.click(screen.getByRole('button', { name: 'Provision' }))
     expect(
       screen.getByRole('heading', {
-        name: 'Provision Jean on Test server?',
+        name: 'Provision Test server',
       })
     ).toBeInTheDocument()
 

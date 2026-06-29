@@ -54,7 +54,13 @@ The flow installs Xvfb and WebKitGTK/GTK runtime packages, downloads the Linux
 artifact from the release manifest matching the desktop's exact version,
 verifies its updater minisign signature with the same public key as the desktop
 updater, uploads the extracted AppImage with `scp`, and installs
-`jean-remote.service`.
+`jean-remote.service`. The Preferences UI uses a dedicated provisioning modal
+with step status at the top and a live log pane at the bottom.
+
+The backend emits `remote-server:provision-progress` and
+`remote-server:provision-log` events during provisioning so the modal can render
+the current step and command output without waiting for the final mutation
+result.
 
 `provision::jean_launch_command()` is the single Xvfb compatibility boundary:
 

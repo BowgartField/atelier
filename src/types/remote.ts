@@ -43,6 +43,19 @@ export interface ProvisionResult {
   service_name: string
 }
 
+export interface RemoteProvisionProgress {
+  server_id: string
+  stage: string
+  message: string
+  percent: number
+}
+
+export interface RemoteProvisionLogLine {
+  server_id: string
+  stream: 'stdout' | 'stderr' | 'system'
+  line: string
+}
+
 export interface RemoteConnection {
   server_id: string
   local_port: number
