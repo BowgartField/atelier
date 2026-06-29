@@ -118,6 +118,16 @@ impl Default for WebBuildInfo {
     }
 }
 
+fn server_platform_name() -> &'static str {
+    if cfg!(target_os = "windows") {
+        "windows"
+    } else if cfg!(target_os = "macos") {
+        "mac"
+    } else {
+        "linux"
+    }
+}
+
 async fn read_web_build_info(dist_path: &std::path::Path) -> WebBuildInfo {
     let path = dist_path.join("jean-build.json");
     match tokio::fs::read_to_string(&path).await {
@@ -597,6 +607,7 @@ async fn init_handler(Query(params): Query<WsAuth>, State(state): State<AppState
     let build_info = read_web_build_info(&state.dist_path).await;
     response["webBuildId"] = Value::String(build_info.web_build_id.clone());
     response["appVersion"] = Value::String(build_info.app_version.clone());
+    response["serverPlatform"] = Value::String(server_platform_name().to_string());
 
     let projects = match projects_result {
         Ok(projects) => projects,
@@ -1575,6 +1586,14 @@ mod tests {
             super::selected_project_id_for_init(Some(""), Some(&ui_state)),
             None
         );
+    }
+
+    #[test]
+    fn server_platform_name_matches_supported_frontend_values() {
+        assert!(matches!(
+            super::server_platform_name(),
+            "mac" | "windows" | "linux"
+        ));
     }
 
     #[test]
