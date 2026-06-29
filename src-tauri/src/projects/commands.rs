@@ -6719,7 +6719,7 @@ pub struct MergePrResponse {
 ///
 /// Returns `--squash`, `--merge`, or `--rebase`, preferring squash. Repositories
 /// often disable merge commits, so a hardcoded `--merge` would fail with exit
-/// code 1; this queries the repo settings and falls back to `--squash` when they
+/// code 1; this queries the repo settings and falls back to `--merge` when they
 /// can't be read.
 fn resolve_repo_merge_flag(gh: &std::path::Path, worktree_path: &str) -> &'static str {
     let output = silent_command(gh)
@@ -6735,20 +6735,74 @@ fn resolve_repo_merge_flag(gh: &std::path::Path, worktree_path: &str) -> &'stati
     if let Ok(output) = output {
         if output.status.success() {
             if let Ok(settings) = serde_json::from_slice::<serde_json::Value>(&output.stdout) {
-                if settings["squashMergeAllowed"].as_bool().unwrap_or(false) {
-                    return "--squash";
-                }
-                if settings["mergeCommitAllowed"].as_bool().unwrap_or(false) {
-                    return "--merge";
-                }
-                if settings["rebaseMergeAllowed"].as_bool().unwrap_or(false) {
-                    return "--rebase";
-                }
+                return resolve_merge_flag_from_repo_settings(&settings);
             }
         }
     }
 
-    "--squash"
+    "--merge"
+}
+
+fn resolve_merge_flag_from_repo_settings(settings: &serde_json::Value) -> &'static str {
+    if settings["squashMergeAllowed"].as_bool().unwrap_or(false) {
+        return "--squash";
+    }
+    if settings["mergeCommitAllowed"].as_bool().unwrap_or(false) {
+        return "--merge";
+    }
+    if settings["rebaseMergeAllowed"].as_bool().unwrap_or(false) {
+        return "--rebase";
+    }
+
+    "--merge"
+}
+
+#[cfg(test)]
+mod merge_pr_tests {
+    use super::*;
+
+    #[test]
+    fn selects_squash_when_allowed() {
+        let settings = serde_json::json!({
+            "squashMergeAllowed": true,
+            "mergeCommitAllowed": true,
+            "rebaseMergeAllowed": true
+        });
+
+        assert_eq!(resolve_merge_flag_from_repo_settings(&settings), "--squash");
+    }
+
+    #[test]
+    fn selects_merge_when_squash_is_disabled() {
+        let settings = serde_json::json!({
+            "squashMergeAllowed": false,
+            "mergeCommitAllowed": true,
+            "rebaseMergeAllowed": true
+        });
+
+        assert_eq!(resolve_merge_flag_from_repo_settings(&settings), "--merge");
+    }
+
+    #[test]
+    fn selects_rebase_when_only_rebase_is_allowed() {
+        let settings = serde_json::json!({
+            "squashMergeAllowed": false,
+            "mergeCommitAllowed": false,
+            "rebaseMergeAllowed": true
+        });
+
+        assert_eq!(resolve_merge_flag_from_repo_settings(&settings), "--rebase");
+    }
+
+    #[test]
+    fn falls_back_to_merge_for_missing_or_malformed_settings() {
+        let settings = serde_json::json!({
+            "squashMergeAllowed": "yes",
+            "rebaseMergeAllowed": null
+        });
+
+        assert_eq!(resolve_merge_flag_from_repo_settings(&settings), "--merge");
+    }
 }
 
 /// Merge the open GitHub PR for the current branch using `gh pr merge`.
