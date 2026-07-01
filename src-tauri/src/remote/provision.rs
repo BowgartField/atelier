@@ -9,11 +9,12 @@ use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager};
 
 use super::ssh;
-use super::types::{ProvisionResult, RemoteServerConfig};
+use super::types::{ProvisionResult, RemoteJeanVersionInfo, RemoteServerConfig};
 use crate::http_server::EmitExt;
 
 const JEAN_UPDATER_PUBLIC_KEY: &str =
     "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDYyNzkyNTI0QUFENzA3MUYKUldRZkI5ZXFKQ1Y1WWdod05PSjhkcUVBUnNyOWJTcEpVazBRN01SUndya2JQcTdNeUxrS0pFY3QK";
+const JEAN_REPO: &str = "coollabsio/jean";
 const SERVICE_NAME: &str = "jean-remote.service";
 const REMOTE_INSTALL_DIR: &str = "/opt/jean-remote";
 const REMOTE_BINARY_PATH: &str = "/opt/jean-remote/jean.AppImage";
@@ -45,6 +46,45 @@ struct ReleaseManifest {
 struct ReleasePlatform {
     url: String,
     signature: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct GithubRelease {
+    tag_name: String,
+    published_at: String,
+    draft: bool,
+    prerelease: bool,
+}
+
+pub async fn list_available_versions() -> Result<Vec<RemoteJeanVersionInfo>, String> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .user_agent(format!("Jean/{}", env!("CARGO_PKG_VERSION")))
+        .build()
+        .map_err(|e| format!("Failed to create release list client: {e}"))?;
+    let releases = client
+        .get(format!(
+            "https://api.github.com/repos/{JEAN_REPO}/releases?per_page=30"
+        ))
+        .header("Accept", "application/vnd.github+json")
+        .send()
+        .await
+        .map_err(|e| format!("Failed to list Jean releases: {e}"))?
+        .error_for_status()
+        .map_err(|e| format!("Jean release list request failed: {e}"))?
+        .json::<Vec<GithubRelease>>()
+        .await
+        .map_err(|e| format!("Failed to parse Jean release list: {e}"))?;
+
+    Ok(releases
+        .into_iter()
+        .filter(|release| !release.draft)
+        .map(|release| RemoteJeanVersionInfo {
+            version: release.tag_name.trim_start_matches('v').to_string(),
+            published_at: release.published_at,
+            prerelease: release.prerelease,
+        })
+        .collect())
 }
 
 pub fn jean_launch_command(remote_port: u16, token: &str) -> String {
@@ -199,10 +239,12 @@ fn artifact_dir(app: &AppHandle, server_id: &str) -> Result<PathBuf, String> {
     Ok(dir)
 }
 
-async fn download_release(architecture: &str) -> Result<(String, Vec<u8>), String> {
-    let expected_version = env!("CARGO_PKG_VERSION");
+async fn download_release(
+    architecture: &str,
+    requested_version: &str,
+) -> Result<(String, Vec<u8>), String> {
     let manifest_url = format!(
-        "https://github.com/coollabsio/jean/releases/download/v{expected_version}/latest.json"
+        "https://github.com/{JEAN_REPO}/releases/download/v{requested_version}/latest.json"
     );
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(180))
@@ -219,9 +261,9 @@ async fn download_release(architecture: &str) -> Result<(String, Vec<u8>), Strin
         .json::<ReleaseManifest>()
         .await
         .map_err(|e| format!("Failed to parse Jean release manifest: {e}"))?;
-    if manifest.version.trim_start_matches('v') != expected_version {
+    if manifest.version.trim_start_matches('v') != requested_version {
         return Err(format!(
-            "Jean release manifest version mismatch: expected {expected_version}, got {}",
+            "Jean release manifest version mismatch: requested {requested_version}, got {}",
             manifest.version
         ));
     }
@@ -353,7 +395,9 @@ pub async fn provision(
     app: &AppHandle,
     server: &RemoteServerConfig,
     token: &str,
+    version: Option<&str>,
 ) -> Result<ProvisionResult, String> {
+    let requested_version = version.unwrap_or(env!("CARGO_PKG_VERSION"));
     emit_progress(app, &server.id, "preparing", "Preparing remote server", 3);
     emit_log(
         app,
@@ -431,7 +475,7 @@ pub async fn provision(
         "system",
         &format!("Selecting release artifact for {architecture}"),
     );
-    let (version, archive_bytes) = download_release(&architecture).await?;
+    let (version, archive_bytes) = download_release(&architecture, requested_version).await?;
     emit_log(
         app,
         &server.id,

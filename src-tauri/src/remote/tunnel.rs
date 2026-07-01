@@ -138,9 +138,19 @@ async fn wait_for_health(server_id: &str, local_port: u16, token: &str) -> Resul
                 if let Some(remote_version) = auth.app_version {
                     let local_version = env!("CARGO_PKG_VERSION");
                     if remote_version != local_version {
-                        return Err(format!(
-                            "Jean version mismatch: local {local_version}, remote {remote_version}"
-                        ));
+                        // Debug builds run ahead of the next published release, so
+                        // requiring an exact match would make every dev build
+                        // unable to connect to any provisioned server. Release
+                        // builds keep the strict check.
+                        if cfg!(debug_assertions) {
+                            log::warn!(
+                                "Jean version mismatch ignored in debug build: local {local_version}, remote {remote_version}"
+                            );
+                        } else {
+                            return Err(format!(
+                                "Jean version mismatch: local {local_version}, remote {remote_version}"
+                            ));
+                        }
                     }
                 }
                 return Ok(());

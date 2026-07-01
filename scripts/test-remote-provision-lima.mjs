@@ -10,6 +10,9 @@ import process from 'node:process'
 import { fileURLToPath, URL } from 'node:url'
 
 const root = resolve(fileURLToPath(new URL('..', import.meta.url)))
+const spinupOnly =
+  process.argv.includes('--spinup-only') ||
+  process.env.JEAN_REMOTE_TEST_SPINUP_ONLY === '1'
 const instanceName =
   process.env.JEAN_REMOTE_TEST_VM ?? 'jean-remote-provision-test'
 const jeanBinary = resolve(
@@ -277,6 +280,11 @@ async function cleanup() {
   await stopChild(jeanProcess)
   rmSync(temporaryHome, { recursive: true, force: true })
 
+  if (spinupOnly) {
+    // Leave the VM running so it can be provisioned from the Jean UI.
+    return
+  }
+
   if (createdInstance) {
     run('limactl', ['delete', '--force', instanceName], { inherit: true })
   } else if (startedExistingInstance) {
@@ -293,6 +301,18 @@ async function main() {
   }
 
   const instance = ensureInstance()
+
+  if (spinupOnly) {
+    console.log(`Lima VM ${instanceName} is up.`)
+    console.log('Add it as a remote server in the Jean UI and provision from there:')
+    console.log(`  Host:          ${instance.sshAddress}`)
+    console.log(`  Port:          ${instance.sshLocalPort}`)
+    console.log(`  User:          ${instance.config.user.name}`)
+    console.log(`  Identity file: ${instance.IdentityFile}`)
+    console.log(`When done, delete it with: limactl delete --force ${instanceName}`)
+    return
+  }
+
   const localPort = await reservePort()
   jeanProcess = startLocalJean(localPort)
   const localUrl = `http://127.0.0.1:${localPort}`

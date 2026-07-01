@@ -9,6 +9,7 @@ import type {
   ProvisionResult,
   RemoteConnection,
   RemoteConnectionTest,
+  RemoteJeanVersionInfo,
   RemoteServerConfig,
   RemoteServerInput,
 } from '@/types/remote'
@@ -17,6 +18,7 @@ import { preferencesQueryKeys } from './preferences'
 export const remoteServersQueryKeys = {
   all: ['remote-servers'] as const,
   list: () => [...remoteServersQueryKeys.all, 'list'] as const,
+  versions: () => [...remoteServersQueryKeys.all, 'versions'] as const,
 }
 
 export function useRemoteServers() {
@@ -29,6 +31,18 @@ export function useRemoteServers() {
     enabled: hasBackend(),
     refetchInterval: 3000,
     refetchIntervalInBackground: false,
+  })
+}
+
+export function useRemoteJeanVersions(enabled: boolean) {
+  return useQuery({
+    queryKey: remoteServersQueryKeys.versions(),
+    queryFn: () =>
+      invoke<RemoteJeanVersionInfo[]>('list_remote_jean_versions').then(
+        versions => versions ?? []
+      ),
+    enabled: enabled && hasBackend(),
+    staleTime: 5 * 60_000,
   })
 }
 
@@ -86,8 +100,11 @@ export function useTestRemoteServer() {
 }
 
 export function useProvisionRemoteServer() {
-  return useRemoteServerMutation<string, ProvisionResult>(serverId =>
-    invoke('provision_remote_server', { serverId })
+  return useRemoteServerMutation<
+    { serverId: string; version?: string },
+    ProvisionResult
+  >(({ serverId, version }) =>
+    invoke('provision_remote_server', { serverId, version })
   )
 }
 

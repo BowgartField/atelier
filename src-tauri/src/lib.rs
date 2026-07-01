@@ -4574,6 +4574,7 @@ pub fn run() {
             remote::remove_remote_server,
             remote::list_remote_servers,
             remote::test_remote_server,
+            remote::list_remote_jean_versions,
             remote::provision_remote_server,
             remote::connect_remote_server,
             remote::disconnect_remote_server,

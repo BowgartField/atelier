@@ -170,11 +170,16 @@ pub async fn clone_project_to_remote(
         .cloned()
         .ok_or_else(|| format!("Remote server not found: {server_id}"))?;
 
-    // 3. Idempotency check: if already cloned to this server, return existing entry
+    // 3. Idempotency check: if already cloned to this server with a resolved
+    //    absolute path, return the existing entry. Clones saved before the
+    //    remote_path resolution fix may still hold an unexpanded `~/...`
+    //    path that the remote's own project registry can't read — repair
+    //    those by falling through and re-running the clone below (which is
+    //    itself idempotent: it fetches instead of re-cloning).
     if let Some(existing) = project
         .remote_clones
         .iter()
-        .find(|c| c.server_id == server_id)
+        .find(|c| c.server_id == server_id && !c.remote_path.starts_with('~'))
     {
         return Ok(existing.clone());
     }
@@ -196,11 +201,14 @@ pub async fn clone_project_to_remote(
     // 5. Determine remote_path
     let resolved_remote_path = remote_path.unwrap_or_else(|| format!("~/jean/{}", project.name));
 
-    // 6. Run SSH exec to clone or fetch.
+    // 6. Run SSH exec to clone or fetch. Print the shell-resolved absolute
+    //    path afterward — `resolved_remote_path` may contain `~/`, which the
+    //    remote Jean process (a plain Rust binary, not a shell) cannot expand
+    //    when this path is later passed to `add_project`.
     // GIT_SSH_COMMAND accepts new host keys so github.com (and others) don't
     // need to be pre-populated in the remote's known_hosts.
     let clone_command = format!(
-        "set -eu\nexport GIT_SSH_COMMAND='ssh -o StrictHostKeyChecking=accept-new'\nif [ -d {path}/.git ]; then\n  git -C {path} fetch --all --prune\nelse\n  mkdir -p \"$(dirname {path})\"\n  git clone {url} {path}\nfi",
+        "set -eu\nexport GIT_SSH_COMMAND='ssh -o StrictHostKeyChecking=accept-new'\nif [ -d {path}/.git ]; then\n  git -C {path} fetch --all --prune\nelse\n  mkdir -p \"$(dirname {path})\"\n  git clone {url} {path}\nfi\necho \"JEAN_REMOTE_PATH:$(cd {path} && pwd)\"",
         path = shell_path(&resolved_remote_path),
         url = shell_quote(&remote_url),
     );
@@ -222,10 +230,19 @@ pub async fn clone_project_to_remote(
         });
     }
 
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let absolute_remote_path = stdout
+        .lines()
+        .rev()
+        .find_map(|line| line.strip_prefix("JEAN_REMOTE_PATH:"))
+        .map(|p| p.trim().to_string())
+        .filter(|p| !p.is_empty())
+        .unwrap_or(resolved_remote_path);
+
     // 8. Save RemoteClone to project
     let clone = RemoteClone {
         server_id: server_id.clone(),
-        remote_path: resolved_remote_path,
+        remote_path: absolute_remote_path,
     };
 
     let mut data = load_projects_data(&app)?;
@@ -234,6 +251,9 @@ pub async fn clone_project_to_remote(
         .iter_mut()
         .find(|p| p.id == project_id)
         .ok_or_else(|| format!("Project not found when saving clone: {project_id}"))?;
+    project_entry
+        .remote_clones
+        .retain(|c| c.server_id != server_id);
     project_entry.remote_clones.push(clone.clone());
     save_projects_data(&app, &data)?;
 

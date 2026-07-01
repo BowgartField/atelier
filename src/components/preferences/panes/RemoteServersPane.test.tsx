@@ -56,6 +56,7 @@ vi.mock('@/services/remote-servers', () => ({
   useRemoveRemoteServer: () => ({ mutateAsync: mocks.remove }),
   useTestRemoteServer: () => ({ mutateAsync: mocks.test }),
   useProvisionRemoteServer: () => ({ mutateAsync: mocks.provision }),
+  useRemoteJeanVersions: () => ({ data: [], isLoading: false }),
   useConnectRemoteServer: () => ({ mutateAsync: mocks.connect }),
   useDisconnectRemoteServer: () => ({ mutateAsync: mocks.disconnect }),
 }))
@@ -186,7 +187,9 @@ describe('RemoteServersPane', () => {
     await user.click(screen.getByRole('button', { name: 'Provision server' }))
 
     await waitFor(() => {
-      expect(mocks.provision).toHaveBeenCalledWith('server-1')
+      expect(mocks.provision).toHaveBeenCalledWith(
+        expect.objectContaining({ serverId: 'server-1' })
+      )
     })
   })
 

@@ -136,9 +136,15 @@ pub async fn dispatch_command(
             emit_cache_invalidation(app, &["remote-servers"]);
             to_value(result)
         }
+        "list_remote_jean_versions" => {
+            let result = crate::remote::list_remote_jean_versions().await?;
+            to_value(result)
+        }
         "provision_remote_server" => {
             let server_id: String = field(&args, "serverId", "server_id")?;
-            let result = crate::remote::provision_remote_server(app.clone(), server_id).await?;
+            let version: Option<String> = from_field_opt(&args, "version")?;
+            let result =
+                crate::remote::provision_remote_server(app.clone(), server_id, version).await?;
             emit_cache_invalidation(app, &["remote-servers", "preferences"]);
             to_value(result)
         }

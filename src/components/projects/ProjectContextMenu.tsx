@@ -26,6 +26,7 @@ import {
 } from '@/components/ui/context-menu'
 import { isBaseSession, type Project } from '@/types/projects'
 import {
+  cloneProjectToServer,
   useCreateBaseSession,
   useMoveItem,
   useOpenProjectOnGitHub,
@@ -44,8 +45,6 @@ import { getEditorLabel, getTerminalLabel } from '@/types/preferences'
 import { getFileManagerName } from '@/lib/platform'
 import { isNativeApp } from '@/lib/environment'
 import { useRemoteServers } from '@/services/remote-servers'
-import { invoke } from '@/lib/transport'
-import type { RemoteClone } from '@/types/projects'
 import { RunWhereModal } from '@/components/remote/RunWhereModal'
 
 interface ProjectContextMenuProps {
@@ -147,21 +146,8 @@ export function ProjectContextMenu({
 
   const handleCloneToServer = (serverId: string, serverName: string) => {
     const toastId = toast.loading(`Cloning to ${serverName}...`)
-    invoke<RemoteClone>('clone_project_to_remote', {
-      projectId: project.id,
-      serverId,
-    })
-      .then(async clone => {
-        // Register the project on the remote jean-server so it appears in
-        // Remote view and sessions can be created there.
-        try {
-          await invoke('add_project', {
-            path: clone.remote_path,
-            _backendHandle: serverId,
-          })
-        } catch {
-          // Project might already be registered — not fatal
-        }
+    cloneProjectToServer(project.id, serverId)
+      .then(() => {
         queryClient.invalidateQueries({ queryKey: projectsQueryKeys.list() })
         toast.success(`Cloned to ${serverName}`, { id: toastId })
       })

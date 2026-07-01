@@ -31,9 +31,12 @@ export function RunWhereModal({
 }: RunWhereModalProps) {
   const { data: remoteServers = [] } = useRemoteServers()
 
+  const isReady = (s: RemoteServerConfig) =>
+    !!s.http_token && s.status === 'connected'
+
   const availableServers: RemoteServerConfig[] = clonedServerIds?.length
-    ? remoteServers.filter(s => s.http_token && clonedServerIds.includes(s.id))
-    : remoteServers.filter(s => s.http_token)
+    ? remoteServers.filter(s => isReady(s) && clonedServerIds.includes(s.id))
+    : remoteServers.filter(isReady)
 
   const handleSelect = useCallback(
     (serverId: string | null) => {

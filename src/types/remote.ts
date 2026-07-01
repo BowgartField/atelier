@@ -43,6 +43,12 @@ export interface ProvisionResult {
   service_name: string
 }
 
+export interface RemoteJeanVersionInfo {
+  version: string
+  published_at: string
+  prerelease: boolean
+}
+
 export interface RemoteProvisionProgress {
   server_id: string
   stage: string

@@ -168,6 +168,13 @@ pub struct ProvisionResult {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RemoteJeanVersionInfo {
+    pub version: String,
+    pub published_at: String,
+    pub prerelease: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct RemoteConnection {
     pub server_id: String,
     pub local_port: u16,

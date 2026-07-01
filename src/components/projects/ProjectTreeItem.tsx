@@ -10,17 +10,22 @@ import {
 } from 'lucide-react'
 import { useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
-import { convertFileSrc, convertProjectFileSrc, invoke } from '@/lib/transport'
+import { convertFileSrc, convertProjectFileSrc } from '@/lib/transport'
 import { cn } from '@/lib/utils'
 import { dismissibleToast } from '@/lib/dismissible-toast'
-import type { Project, RemoteClone } from '@/types/projects'
+import type { Project } from '@/types/projects'
 import { isBaseSession } from '@/types/projects'
 import { useProjectsStore } from '@/store/projects-store'
 import { useChatStore } from '@/store/chat-store'
 import { useUIStore } from '@/store/ui-store'
 import { useIsMobile } from '@/hooks/use-mobile'
 import { useRemotePicker } from '@/hooks/useRemotePicker'
-import { useWorktrees, useAppDataDir, projectsQueryKeys } from '@/services/projects'
+import {
+  cloneProjectToServer,
+  useWorktrees,
+  useAppDataDir,
+  projectsQueryKeys,
+} from '@/services/projects'
 import { useRemoteServers } from '@/services/remote-servers'
 import {
   DropdownMenu,
@@ -75,19 +80,8 @@ export function ProjectTreeItem({ project }: ProjectTreeItemProps) {
   const handleCloneToServer = useCallback(
     (serverId: string, serverName: string) => {
       const toastId = toast.loading(`Cloning to ${serverName}...`)
-      invoke<RemoteClone>('clone_project_to_remote', {
-        projectId: project.id,
-        serverId,
-      })
-        .then(async clone => {
-          try {
-            await invoke('add_project', {
-              path: clone.remote_path,
-              _backendHandle: serverId,
-            })
-          } catch {
-            // Project might already be registered
-          }
+      cloneProjectToServer(project.id, serverId)
+        .then(() => {
           queryClient.invalidateQueries({ queryKey: projectsQueryKeys.list() })
           toast.success(`Cloned to ${serverName}`, { id: toastId })
         })

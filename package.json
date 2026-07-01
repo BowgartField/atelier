@@ -43,6 +43,7 @@
     "test:e2e": "playwright test --config e2e/playwright.config.ts",
     "test:remote-tunnel": "node scripts/test-remote-tunnel-recovery.mjs",
     "test:remote-provision": "node scripts/test-remote-provision-lima.mjs",
+    "test:remote-provision:spinup": "node scripts/test-remote-provision-lima.mjs --spinup-only",
     "test:all": "bun run test:run && bun run rust:test",
     "check:all": "bun run typecheck && bun run lint && bun run rust:fmt:check && bun run rust:clippy && bun run test:run && bun run rust:test",
     "fix:all": "bun run lint:fix && bun run format && bun run rust:fmt && bun run rust:clippy:fix",

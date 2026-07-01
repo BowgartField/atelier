@@ -12,6 +12,7 @@ import type {
   Worktree,
   DetectPrResponse,
   LinkWorktreePrResponse,
+  RemoteClone,
   WorktreeCreatingEvent,
   WorktreeCreatedEvent,
   WorktreeCreateErrorEvent,
@@ -195,6 +196,40 @@ export function useWorktree(worktreeId: string | null) {
     staleTime: 1000 * 30, // 30 seconds - PR info may change
     gcTime: 1000 * 60 * 5,
   })
+}
+
+/**
+ * Clone a project to a remote server, then register it in that server's own
+ * project list so `list_projects`/`create_worktree` over `_backendHandle`
+ * can find it by name (each Jean instance has its own project database).
+ *
+ * Only "already registered" is swallowed as non-fatal — any other
+ * registration failure (e.g. the remote transport not being connected yet)
+ * must surface, otherwise the clone reports success while the remote stays
+ * unusable for worktrees/sessions with no indication why.
+ */
+export async function cloneProjectToServer(
+  projectId: string,
+  serverId: string
+): Promise<RemoteClone> {
+  const clone = await invoke<RemoteClone>('clone_project_to_remote', {
+    projectId,
+    serverId,
+  })
+  try {
+    await invoke('add_project', {
+      path: clone.remote_path,
+      _backendHandle: serverId,
+    })
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error)
+    if (!message.includes('already exists')) {
+      throw new Error(
+        `Cloned, but failed to register the project on the remote: ${message}`
+      )
+    }
+  }
+  return clone
 }
 
 // ============================================================================

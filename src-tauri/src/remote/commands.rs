@@ -6,8 +6,9 @@ use super::provision;
 use super::ssh;
 use super::tunnel;
 use super::types::{
-    ProvisionResult, RemoteConnection, RemoteConnectionTest, RemoteServerAuth, RemoteServerConfig,
-    RemoteServerInput, RemoteServerStatus, RemoteServerStatusInfo,
+    ProvisionResult, RemoteConnection, RemoteConnectionTest, RemoteJeanVersionInfo,
+    RemoteServerAuth, RemoteServerConfig, RemoteServerInput, RemoteServerStatus,
+    RemoteServerStatusInfo,
 };
 
 fn find_server(
@@ -242,15 +243,21 @@ pub async fn test_remote_server(
 }
 
 #[tauri::command]
+pub async fn list_remote_jean_versions() -> Result<Vec<RemoteJeanVersionInfo>, String> {
+    provision::list_available_versions().await
+}
+
+#[tauri::command]
 pub async fn provision_remote_server(
     app: AppHandle,
     server_id: String,
+    version: Option<String>,
 ) -> Result<ProvisionResult, String> {
     let server = load_server(&app, &server_id).await?;
     tunnel::set_runtime_status(&server_id, RemoteServerStatus::Provisioning, None);
     let token = crate::http_server::auth::generate_token();
 
-    let result = match provision::provision(&app, &server, &token).await {
+    let result = match provision::provision(&app, &server, &token, version.as_deref()).await {
         Ok(result) => result,
         Err(error) => {
             tunnel::set_runtime_status(&server_id, RemoteServerStatus::Error, Some(error.clone()));

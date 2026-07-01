@@ -56,7 +56,9 @@ import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { NativeSelect, NativeSelectOption } from '@/components/ui/native-select'
 import { Switch } from '@/components/ui/switch'
+import { FALLBACK_APP_VERSION } from '@/lib/app-version'
 import { isMacOS } from '@/lib/platform'
+import { resolveDefaultProvisionVersion } from '@/lib/remote-versions'
 import { cn } from '@/lib/utils'
 import {
   useClaudeCliAuth,
@@ -66,6 +68,7 @@ import {
   useAddRemoteServer,
   useConnectRemoteServer,
   useDisconnectRemoteServer,
+  useRemoteJeanVersions,
   useRemoteServers,
   useRemoveRemoteServer,
   useTestRemoteServer,
@@ -534,6 +537,7 @@ function RemoteServerFormDialog({
 
 export function RemoteServersPane() {
   const serversQuery = useRemoteServers()
+  const { data: availableVersions } = useRemoteJeanVersions(true)
   const addServer = useAddRemoteServer()
   const updateServer = useUpdateRemoteServer()
   const removeServer = useRemoveRemoteServer()
@@ -556,6 +560,10 @@ export function RemoteServersPane() {
 
   const servers = serversQuery.data ?? []
   const isSubmitting = addServer.isPending || updateServer.isPending
+  const desktopVersionPublished = (availableVersions ?? []).some(
+    entry => entry.version === FALLBACK_APP_VERSION
+  )
+  const updateTarget = resolveDefaultProvisionVersion(availableVersions)
 
   const openAdd = () => {
     setEditingServer(null)
@@ -739,6 +747,9 @@ export function RemoteServersPane() {
               const status = server.status ?? 'disconnected'
               const connected = status === 'connected'
               const globallyBusy = isBusy(server)
+              const versionMismatch =
+                !!server.installed_version &&
+                server.installed_version !== FALLBACK_APP_VERSION
               return (
                 <Card
                   key={server.id}
@@ -784,7 +795,12 @@ export function RemoteServersPane() {
                         <p className="text-xs text-muted-foreground">
                           Installed version
                         </p>
-                        <p className="mt-1 font-mono text-xs">
+                        <p
+                          className={cn(
+                            'mt-1 font-mono text-xs',
+                            versionMismatch && 'text-amber-600 dark:text-amber-400'
+                          )}
+                        >
                           {server.installed_version ?? 'Not provisioned'}
                         </p>
                       </div>
@@ -795,12 +811,33 @@ export function RemoteServersPane() {
                       connected={connected}
                     />
 
-                    {status === 'error' && (
-                      <div className="flex items-start gap-2 rounded-lg border border-destructive/20 bg-destructive/5 px-3 py-2 text-xs text-destructive">
+                    {versionMismatch ? (
+                      <div className="flex items-start gap-2 rounded-lg border border-amber-500/25 bg-amber-500/10 px-3 py-2 text-xs text-amber-700 dark:text-amber-400">
                         <CircleAlert className="mt-0.5 size-3.5 shrink-0" />
-                        Check SSH access or retry provisioning to restore this
-                        server.
+                        <span>
+                          Remote Jean {server.installed_version} does not
+                          match this app ({FALLBACK_APP_VERSION}). Update the
+                          remote to connect.
+                          {!desktopVersionPublished && (
+                            <>
+                              {' '}
+                              This build has no published release yet, so
+                              updating installs the latest release (
+                              {updateTarget}) instead. Packaged release builds
+                              still require an exact version match to connect;
+                              dev builds skip that check.
+                            </>
+                          )}
+                        </span>
                       </div>
+                    ) : (
+                      status === 'error' && (
+                        <div className="flex items-start gap-2 rounded-lg border border-destructive/20 bg-destructive/5 px-3 py-2 text-xs text-destructive">
+                          <CircleAlert className="mt-0.5 size-3.5 shrink-0" />
+                          Check SSH access or retry provisioning to restore this
+                          server.
+                        </div>
+                      )
                     )}
 
                     <div className="flex flex-wrap items-center gap-2">
@@ -818,13 +855,17 @@ export function RemoteServersPane() {
                         Test SSH
                       </Button>
                       <Button
-                        variant="outline"
+                        variant={versionMismatch ? 'default' : 'outline'}
                         size="sm"
                         onClick={() => setProvisionTarget(server)}
                         disabled={globallyBusy || connected}
                       >
                         <ShieldCheck />
-                        {server.installed_version ? 'Reprovision' : 'Provision'}
+                        {versionMismatch
+                          ? `Update to ${updateTarget}`
+                          : server.installed_version
+                            ? 'Reprovision'
+                            : 'Provision'}
                       </Button>
                       {connected ? (
                         <Button

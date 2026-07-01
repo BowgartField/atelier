@@ -52,11 +52,20 @@ Provisioning currently requires:
 - x86_64 or aarch64.
 
 The flow installs Xvfb and WebKitGTK/GTK runtime packages, downloads the Linux
-artifact from the release manifest matching the desktop's exact version,
-verifies its updater minisign signature with the same public key as the desktop
-updater, uploads the extracted AppImage with `scp`, and installs
-`jean-remote.service`. The Preferences UI uses a dedicated provisioning modal
-with step status at the top and a live log pane at the bottom.
+artifact from the release manifest for the selected Jean version, verifies its
+updater minisign signature with the same public key as the desktop updater,
+uploads the extracted AppImage with `scp`, and installs `jean-remote.service`.
+The Preferences UI uses a dedicated provisioning modal with a version picker,
+step status at the top, and a live log pane at the bottom.
+
+`provision_remote_server` takes an optional `version`; when omitted it falls
+back to the desktop's own `CARGO_PKG_VERSION`. `list_remote_jean_versions`
+fetches published releases from the GitHub API so the modal can offer a
+dropdown. Picking a version other than the desktop's own is only useful for
+staging a server ahead of time — `connect_remote_server` still requires the
+remote version to exactly match the desktop version (see below), so the
+tunnel will refuse to connect until the desktop is upgraded or downgraded to
+match.
 
 The backend emits `remote-server:provision-progress` and
 `remote-server:provision-log` events during provisioning so the modal can render
@@ -152,6 +161,7 @@ present; otherwise it creates an ephemeral VM and deletes it afterward.
 - `remove_remote_server`
 - `list_remote_servers`
 - `test_remote_server`
+- `list_remote_jean_versions`
 - `provision_remote_server`
 - `connect_remote_server`
 - `disconnect_remote_server`

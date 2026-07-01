@@ -29,8 +29,21 @@ import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import { Checkbox } from '@/components/ui/checkbox'
 import { ScrollArea } from '@/components/ui/scroll-area'
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from '@/components/ui/select'
 import { cn } from '@/lib/utils'
-import { useProvisionRemoteServer } from '@/services/remote-servers'
+import { FALLBACK_APP_VERSION } from '@/lib/app-version'
+import { resolveDefaultProvisionVersion } from '@/lib/remote-versions'
+import {
+  useConnectRemoteServer,
+  useProvisionRemoteServer,
+  useRemoteJeanVersions,
+} from '@/services/remote-servers'
 import type {
   LocalToolStatus,
   RemoteProvisionLogLine,
@@ -73,6 +86,12 @@ const BASE_PROVISION_STEPS: ProvisionStep[] = [
   },
 ]
 
+const CONNECTING_STEP: ProvisionStep = {
+  stage: 'connecting',
+  label: 'Connect',
+  description: 'Open the SSH tunnel and register the remote backend.',
+}
+
 const CLAUDE_CLI_STEP: ProvisionStep = {
   stage: 'installing_claude_cli',
   label: 'Install Claude CLI',
@@ -94,6 +113,7 @@ const COMPLETE_STEP: ProvisionStep = {
 function buildSteps(tools: ToolsToInstall): ProvisionStep[] {
   return [
     ...BASE_PROVISION_STEPS,
+    CONNECTING_STEP,
     ...(tools.claudeCli ? [CLAUDE_CLI_STEP] : []),
     ...(tools.ghCli ? [GH_CLI_STEP] : []),
     COMPLETE_STEP,
@@ -158,23 +178,29 @@ function ProvisionLogPanel({
 function StepRail({
   progress,
   steps,
+  running,
+  isError,
 }: {
   progress: RemoteProvisionProgress | null
   steps: ProvisionStep[]
+  running: boolean
+  isError: boolean
 }) {
   const activeIndex = stageIndex(steps, progress?.stage)
   return (
     <div className="grid gap-3 sm:grid-cols-2">
       {steps.map((step, index) => {
         const completed = activeIndex > index || progress?.stage === 'complete'
-        const active = activeIndex === index && progress?.stage !== 'complete'
+        const errored = isError && activeIndex === index
+        const active = running && activeIndex === index && !errored
         return (
           <div
             key={step.stage}
             className={cn(
               'rounded-xl border p-3 transition-colors',
               completed && 'border-emerald-500/25 bg-emerald-500/5',
-              active && 'border-sky-500/25 bg-sky-500/5'
+              active && 'border-sky-500/25 bg-sky-500/5',
+              errored && 'border-destructive/25 bg-destructive/5'
             )}
           >
             <div className="flex items-start gap-3">
@@ -185,12 +211,17 @@ function StepRail({
                     'border-emerald-500/30 bg-emerald-500/10 text-emerald-500',
                   active &&
                     'border-sky-500/30 bg-sky-500/10 text-sky-500',
+                  errored &&
+                    'border-destructive/30 bg-destructive/10 text-destructive',
                   !completed &&
                     !active &&
+                    !errored &&
                     'border-border bg-background text-muted-foreground'
                 )}
               >
-                {completed ? (
+                {errored ? (
+                  <CircleAlert className="size-3.5" />
+                ) : completed ? (
                   <CheckCircle2 className="size-3.5" />
                 ) : active ? (
                   <Loader2 className="size-3.5 animate-spin" />
@@ -204,6 +235,11 @@ function StepRail({
                   {active && (
                     <Badge variant="outline" className="h-5 border-sky-500/25 px-1.5 text-[10px] text-sky-600 dark:text-sky-400">
                       Running
+                    </Badge>
+                  )}
+                  {errored && (
+                    <Badge variant="outline" className="h-5 border-destructive/25 px-1.5 text-[10px] text-destructive">
+                      Failed
                     </Badge>
                   )}
                 </div>
@@ -225,16 +261,43 @@ export function RemoteServerProvisionModal({
   onOpenChange,
 }: RemoteServerProvisionModalProps) {
   const provisionServer = useProvisionRemoteServer()
+  const connectServer = useConnectRemoteServer()
+  const { data: availableVersions } = useRemoteJeanVersions(open)
   const [progress, setProgress] = useState<RemoteProvisionProgress | null>(null)
   const [logs, setLogs] = useState<RemoteProvisionLogLine[]>([])
   const [error, setError] = useState<string | null>(null)
   const [completedVersion, setCompletedVersion] = useState<string | null>(null)
   const [running, setRunning] = useState(false)
   const [tools, setTools] = useState<ToolsToInstall>({ claudeCli: false, ghCli: false })
+  const [selectedVersion, setSelectedVersion] = useState(FALLBACK_APP_VERSION)
   const initializedRef = useRef(false)
+  const versionTouchedRef = useRef(false)
   const logsViewportRef = useRef<HTMLDivElement | null>(null)
 
   const serverId = server?.id ?? null
+
+  const versionOptions = useMemo(() => {
+    const versions = (availableVersions ?? []).map(entry => entry.version)
+    return versions.includes(FALLBACK_APP_VERSION)
+      ? versions
+      : [FALLBACK_APP_VERSION, ...versions]
+  }, [availableVersions])
+
+  const desktopVersionPublished = (availableVersions ?? []).some(
+    entry => entry.version === FALLBACK_APP_VERSION
+  )
+  const defaultVersion = useMemo(
+    () => resolveDefaultProvisionVersion(availableVersions),
+    [availableVersions]
+  )
+
+  // Once releases load, default to an installable version: the desktop's own
+  // version if it's published, otherwise the latest release (dev builds run
+  // ahead of the next tag, which has no release artifact yet).
+  useEffect(() => {
+    if (!open || versionTouchedRef.current) return
+    setSelectedVersion(defaultVersion)
+  }, [open, defaultVersion])
 
   const resetState = useCallback(() => {
     setProgress(null)
@@ -242,6 +305,8 @@ export function RemoteServerProvisionModal({
     setError(null)
     setCompletedVersion(null)
     setRunning(false)
+    setSelectedVersion(FALLBACK_APP_VERSION)
+    versionTouchedRef.current = false
     initializedRef.current = false
   }, [])
 
@@ -332,7 +397,21 @@ export function RemoteServerProvisionModal({
     setCompletedVersion(null)
 
     try {
-      const result = await provisionServer.mutateAsync(server.id)
+      const result = await provisionServer.mutateAsync({
+        serverId: server.id,
+        version: selectedVersion,
+      })
+
+      // Open the SSH tunnel and register the remote WebSocket transport so
+      // subsequent _backendHandle calls (CLI installs, session creation)
+      // have somewhere to route to. Provisioning alone does not connect.
+      setProgress({
+        server_id: server.id,
+        stage: 'connecting',
+        message: 'Connecting to remote backend…',
+        percent: 88,
+      })
+      await connectServer.mutateAsync(server.id)
 
       // Install selected CLIs after jean-server is running
       const installErrors: string[] = []
@@ -383,7 +462,7 @@ export function RemoteServerProvisionModal({
       setRunning(false)
       toast.error(`Provisioning failed: ${message}`)
     }
-  }, [provisionServer, running, server, tools])
+  }, [connectServer, provisionServer, running, selectedVersion, server, tools])
 
   const isComplete = progress?.stage === 'complete' && !running && !error
   const isError = error != null
@@ -473,6 +552,58 @@ export function RemoteServerProvisionModal({
                 </div>
               </div>
 
+              {/* Version selection — compact row, shown before provisioning starts */}
+              {!running && !isComplete && !isError && (
+                <div className="flex flex-wrap items-center gap-x-6 gap-y-2 rounded-xl border bg-muted/10 px-4 py-3">
+                  <p className="shrink-0 text-xs font-medium text-muted-foreground">
+                    Jean version:
+                  </p>
+                  <Select
+                    value={selectedVersion}
+                    onValueChange={v => {
+                      versionTouchedRef.current = true
+                      setSelectedVersion(v)
+                    }}
+                  >
+                    <SelectTrigger className="h-8 w-48 text-sm">
+                      <SelectValue placeholder="Select version" />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {versionOptions.map(version => {
+                        const isDesktop = version === FALLBACK_APP_VERSION
+                        const suffix = isDesktop
+                          ? desktopVersionPublished
+                            ? ' (current)'
+                            : ' (this build, unreleased)'
+                          : version === defaultVersion
+                            ? ' (latest release)'
+                            : ''
+                        return (
+                          <SelectItem key={version} value={version}>
+                            {version}
+                            {suffix}
+                          </SelectItem>
+                        )
+                      })}
+                    </SelectContent>
+                  </Select>
+                  {selectedVersion !== FALLBACK_APP_VERSION && (
+                    <p className="text-xs text-muted-foreground">
+                      Packaged release builds require this to match the
+                      desktop version ({FALLBACK_APP_VERSION}) to connect; dev
+                      builds skip that check.
+                    </p>
+                  )}
+                  {selectedVersion === FALLBACK_APP_VERSION &&
+                    !desktopVersionPublished && (
+                      <p className="text-xs text-amber-600 dark:text-amber-400">
+                        This build has no published release yet — provisioning
+                        will fail until v{FALLBACK_APP_VERSION} ships.
+                      </p>
+                    )}
+                </div>
+              )}
+
               {/* Tool selection — compact row, shown before provisioning starts */}
               {!running && !isComplete && !isError && (
                 <div className="flex flex-wrap items-center gap-x-6 gap-y-2 rounded-xl border bg-muted/10 px-4 py-3">
@@ -496,7 +627,12 @@ export function RemoteServerProvisionModal({
                 </div>
               )}
 
-              <StepRail progress={progress} steps={provisionSteps} />
+              <StepRail
+                progress={progress}
+                steps={provisionSteps}
+                running={running}
+                isError={isError}
+              />
 
               <div className="min-h-0 flex-1 flex flex-col">
                 <ProvisionLogPanel logs={logs} viewportRef={logsViewportRef} />
