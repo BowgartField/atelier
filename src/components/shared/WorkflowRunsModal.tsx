@@ -46,8 +46,8 @@ import {
 } from '@/services/chat'
 import type { WorktreeSessions } from '@/types/chat'
 import { usePreferences } from '@/services/preferences'
-import { openExternal } from '@/lib/platform'
 import { ScrollArea } from '@/components/ui/scroll-area'
+import { WorkflowRunDetailsModal } from './WorkflowRunDetailsModal'
 import { resolveBackend } from '@/lib/model-utils'
 import {
   DEFAULT_INVESTIGATE_WORKFLOW_RUN_PROMPT,
@@ -75,6 +75,40 @@ function isFailedRun(run: WorkflowRun): boolean {
   return run.conclusion === 'failure' || run.conclusion === 'startup_failure'
 }
 
+type WorkflowStateKind =
+  | 'running'
+  | 'success'
+  | 'failure'
+  | 'skipped'
+  | 'pending'
+
+function getWorkflowStateKind(
+  status: string,
+  conclusion?: string | null
+): WorkflowStateKind {
+  if (status === 'in_progress' || status === 'queued') return 'running'
+  if (conclusion === 'success') return 'success'
+  if (conclusion === 'failure' || conclusion === 'startup_failure')
+    return 'failure'
+  if (conclusion === 'cancelled' || conclusion === 'skipped') return 'skipped'
+  return 'pending'
+}
+
+function getWorkflowStateIcon(kind: WorkflowStateKind) {
+  switch (kind) {
+    case 'running':
+      return <Clock className="h-4 w-4 shrink-0 text-yellow-500" />
+    case 'success':
+      return <CheckCircle2 className="h-4 w-4 shrink-0 text-green-500" />
+    case 'failure':
+      return <XCircle className="h-4 w-4 shrink-0 text-red-500" />
+    case 'skipped':
+      return <MinusCircle className="h-4 w-4 shrink-0 text-muted-foreground" />
+    default:
+      return <MinusCircle className="h-4 w-4 shrink-0 text-muted-foreground" />
+  }
+}
+
 /** Extract the numeric run ID from a GitHub Actions URL */
 function extractRunId(url: string): string {
   const match = url.match(/\/runs\/(\d+)/)
@@ -82,21 +116,7 @@ function extractRunId(url: string): string {
 }
 
 function RunStatusIcon({ run }: { run: WorkflowRun }) {
-  if (run.status === 'in_progress' || run.status === 'queued') {
-    return <Clock className="h-4 w-4 shrink-0 text-yellow-500" />
-  }
-  switch (run.conclusion) {
-    case 'success':
-      return <CheckCircle2 className="h-4 w-4 shrink-0 text-green-500" />
-    case 'failure':
-    case 'startup_failure':
-      return <XCircle className="h-4 w-4 shrink-0 text-red-500" />
-    case 'cancelled':
-    case 'skipped':
-      return <MinusCircle className="h-4 w-4 shrink-0 text-muted-foreground" />
-    default:
-      return <MinusCircle className="h-4 w-4 shrink-0 text-muted-foreground" />
-  }
+  return getWorkflowStateIcon(getWorkflowStateKind(run.status, run.conclusion))
 }
 
 interface WorkflowGroup {
@@ -161,6 +181,9 @@ export function WorkflowRunsModal() {
   const workflowRunsModalBranch = useUIStore(
     state => state.workflowRunsModalBranch
   )
+  const workflowRunsModalWorkflowName = useUIStore(
+    state => state.workflowRunsModalWorkflowName
+  )
   const setWorkflowRunsModalOpen = useUIStore(
     state => state.setWorkflowRunsModalOpen
   )
@@ -174,6 +197,9 @@ export function WorkflowRunsModal() {
     workflowRunsModalBranch ?? undefined
   )
 
+  const [selectedWorkflow, setSelectedWorkflow] = useState<string | null>(null)
+  const [selectedRunId, setSelectedRunId] = useState<number | null>(null)
+
   const handleRefresh = useCallback(() => {
     if (workflowRunsModalProjectPath) {
       queryClient.invalidateQueries({
@@ -186,7 +212,6 @@ export function WorkflowRunsModal() {
   }, [queryClient, workflowRunsModalProjectPath, workflowRunsModalBranch])
 
   const runs = useMemo(() => result?.runs ?? [], [result?.runs])
-  const [selectedWorkflow, setSelectedWorkflow] = useState<string | null>(null)
   const [focusedIndex, setFocusedIndex] = useState(0)
   const [focusedPane, setFocusedPane] = useState<'sidebar' | 'list'>('sidebar')
   const [sidebarFocusedIndex, setSidebarFocusedIndex] = useState(0)
@@ -230,11 +255,18 @@ export function WorkflowRunsModal() {
     return runs.filter(run => run.workflowName === selectedWorkflow)
   }, [runs, selectedWorkflow])
 
+  const selectedRun = useMemo(() => {
+    if (selectedRunId == null) return null
+    return runs.find(run => run.databaseId === selectedRunId) ?? null
+  }, [runs, selectedRunId])
+
   // Reset focus when modal opens or runs change
   useEffect(() => {
     if (workflowRunsModalOpen) {
       // eslint-disable-next-line react-hooks/set-state-in-effect
-      setSelectedWorkflow(null)
+      setSelectedWorkflow(workflowRunsModalWorkflowName ?? null)
+      // eslint-disable-next-line react-hooks/set-state-in-effect
+      setSelectedRunId(null)
 
       setFocusedIndex(0)
 
@@ -243,7 +275,7 @@ export function WorkflowRunsModal() {
       setSidebarFocusedIndex(0)
       requestAnimationFrame(() => sidebarRef.current?.focus())
     }
-  }, [workflowRunsModalOpen, runs.length])
+  }, [workflowRunsModalOpen, workflowRunsModalWorkflowName])
 
   // Reset focus when filter changes
   useEffect(() => {
@@ -263,11 +295,14 @@ export function WorkflowRunsModal() {
   }, [sidebarFocusedIndex])
 
   const title = useMemo(() => {
-    if (workflowRunsModalBranch) {
-      return `Workflow Runs — ${workflowRunsModalBranch}`
+    const suffixParts: string[] = []
+    if (selectedWorkflow) suffixParts.push(selectedWorkflow)
+    if (workflowRunsModalBranch) suffixParts.push(workflowRunsModalBranch)
+    if (suffixParts.length > 0) {
+      return `Workflow Runs — ${suffixParts.join(' • ')}`
     }
     return 'Workflow Runs'
-  }, [workflowRunsModalBranch])
+  }, [selectedWorkflow, workflowRunsModalBranch])
 
   const handleOpenChange = useCallback(
     (open: boolean) => {
@@ -276,8 +311,9 @@ export function WorkflowRunsModal() {
     [setWorkflowRunsModalOpen]
   )
 
-  const handleRunClick = useCallback((url: string) => {
-    openExternal(url)
+  const handleRunClick = useCallback((runId: number) => {
+    setSelectedRunId(runId)
+    setFocusedPane('list')
   }, [])
 
   const handleInvestigate = useCallback(
@@ -620,7 +656,7 @@ export function WorkflowRunsModal() {
           case 'Enter': {
             e.preventDefault()
             const run = displayedRuns[focusedIndex]
-            if (run) handleRunClick(run.url)
+            if (run) handleRunClick(run.databaseId)
             break
           }
           case 'm': {
@@ -741,8 +777,8 @@ export function WorkflowRunsModal() {
                     ref={el => {
                       itemRefs.current[index] = el
                     }}
-                    className={`group relative flex cursor-pointer items-center rounded-md px-2 py-2 transition-colors hover:bg-accent ${focusedPane === 'list' && index === focusedIndex ? 'bg-accent' : ''}`}
-                    onClick={() => handleRunClick(run.url)}
+                    className={`group relative flex cursor-pointer items-center rounded-md px-2 py-2 transition-colors hover:bg-accent ${selectedRunId === run.databaseId || (focusedPane === 'list' && index === focusedIndex) ? 'bg-accent' : ''}`}
+                    onClick={() => handleRunClick(run.databaseId)}
                     onMouseEnter={() => {
                       setFocusedIndex(index)
                       setFocusedPane('list')
@@ -795,6 +831,14 @@ export function WorkflowRunsModal() {
             </div>
           </div>
         )}
+        <WorkflowRunDetailsModal
+          open={selectedRun != null}
+          projectPath={workflowRunsModalProjectPath}
+          run={selectedRun}
+          onOpenChange={open => {
+            if (!open) setSelectedRunId(null)
+          }}
+        />
       </DialogContent>
     </Dialog>
   )

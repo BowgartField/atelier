@@ -90,6 +90,7 @@ export function useUIStatePersistence() {
       selectedProjectId,
       projectAccessTimestamps,
       dashboardWorktreeCollapseOverrides,
+      githubDashboardProjectCollapseOverrides,
       projectCanvasSettings,
     } = useProjectsStore.getState()
     const {
@@ -182,6 +183,9 @@ export function useUIStatePersistence() {
       project_access_timestamps: projectAccessTimestamps,
       // Dashboard worktree collapse overrides
       dashboard_worktree_collapse_overrides: dashboardWorktreeCollapseOverrides,
+      // GitHub dashboard project collapse overrides
+      github_dashboard_project_collapse_overrides:
+        githubDashboardProjectCollapseOverrides,
       // Project canvas settings per project
       project_canvas_settings: Object.fromEntries(
         Object.entries(projectCanvasSettings).map(([projectId, settings]) => [
@@ -649,6 +653,29 @@ export function useUIStatePersistence() {
       })
     }
 
+    const githubDashboardCollapseOverrides =
+      uiState.github_dashboard_project_collapse_overrides ?? {}
+    if (Object.keys(githubDashboardCollapseOverrides).length > 0) {
+      const validProjectIds = Object.entries(githubDashboardCollapseOverrides)
+        .filter(([projectId]) => projects.some(p => p.id === projectId))
+        .reduce(
+          (acc, [projectId, collapsed]) => {
+            acc[projectId] = collapsed
+            return acc
+          },
+          {} as Record<string, boolean>
+        )
+
+      if (Object.keys(validProjectIds).length > 0) {
+        logger.debug('Restoring GitHub dashboard project collapse overrides', {
+          count: Object.keys(validProjectIds).length,
+        })
+        useProjectsStore.setState({
+          githubDashboardProjectCollapseOverrides: validProjectIds,
+        })
+      }
+    }
+
     const projectCanvasSettings = uiState.project_canvas_settings ?? {}
     if (Object.keys(projectCanvasSettings).length > 0) {
       logger.debug('Restoring project canvas settings', {
@@ -822,6 +849,8 @@ export function useUIStatePersistence() {
       useProjectsStore.getState().projectAccessTimestamps
     let prevDashboardCollapseOverrides =
       useProjectsStore.getState().dashboardWorktreeCollapseOverrides
+    let prevGitHubDashboardCollapseOverrides =
+      useProjectsStore.getState().githubDashboardProjectCollapseOverrides
     let prevProjectCanvasSettings =
       useProjectsStore.getState().projectCanvasSettings
     let prevLeftSidebarSize = useUIStore.getState().leftSidebarSize
@@ -870,6 +899,9 @@ export function useUIStatePersistence() {
       const collapseOverridesChanged =
         state.dashboardWorktreeCollapseOverrides !==
         prevDashboardCollapseOverrides
+      const githubDashboardCollapseOverridesChanged =
+        state.githubDashboardProjectCollapseOverrides !==
+        prevGitHubDashboardCollapseOverrides
       const projectCanvasSettingsChanged =
         state.projectCanvasSettings !== prevProjectCanvasSettings
 
@@ -879,6 +911,7 @@ export function useUIStatePersistence() {
         selectedProjectChanged ||
         accessTimestampsChanged ||
         collapseOverridesChanged ||
+        githubDashboardCollapseOverridesChanged ||
         projectCanvasSettingsChanged
       ) {
         prevExpandedProjectIds = state.expandedProjectIds
@@ -887,6 +920,8 @@ export function useUIStatePersistence() {
         prevProjectAccessTimestamps = state.projectAccessTimestamps
         prevDashboardCollapseOverrides =
           state.dashboardWorktreeCollapseOverrides
+        prevGitHubDashboardCollapseOverrides =
+          state.githubDashboardProjectCollapseOverrides
         prevProjectCanvasSettings = state.projectCanvasSettings
         const currentState = getCurrentUIState()
         debouncedSaveRef.current?.(currentState)

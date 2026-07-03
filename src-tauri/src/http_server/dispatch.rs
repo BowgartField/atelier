@@ -2908,6 +2908,22 @@ pub async fn dispatch_command(
                 crate::projects::list_workflow_runs(app.clone(), project_path, branch).await?;
             to_value(result)
         }
+        "get_workflow_run" => {
+            let project_path: String = field(&args, "projectPath", "project_path")?;
+            let run_id: u64 = field(&args, "runId", "run_id")?;
+            let result =
+                crate::projects::get_workflow_run(app.clone(), project_path, run_id).await?;
+            to_value(result)
+        }
+        "get_workflow_job_logs" => {
+            let project_path: String = field(&args, "projectPath", "project_path")?;
+            let run_id: u64 = field(&args, "runId", "run_id")?;
+            let job_id: u64 = field(&args, "jobId", "job_id")?;
+            let result =
+                crate::projects::get_workflow_job_logs(app.clone(), project_path, run_id, job_id)
+                    .await?;
+            to_value(result)
+        }
 
         // =====================================================================
         // Linear Issues

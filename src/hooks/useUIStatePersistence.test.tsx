@@ -5,6 +5,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { useTerminalStore } from '@/store/terminal-store'
 import { useUIStore } from '@/store/ui-store'
 import { useChatStore } from '@/store/chat-store'
+import { useProjectsStore } from '@/store/projects-store'
 import type { UIState } from '@/types/ui-state'
 
 let nativeApp = false
@@ -18,9 +19,11 @@ const { mockInvoke, mockUseUIState, mockUseSaveUIState, mockUseProjects } =
   vi.hoisted(() => ({
     mockInvoke: vi.fn(),
     mockUseUIState: vi.fn(),
-    mockUseSaveUIState: vi.fn(() => ({ mutate: vi.fn() })),
+    mockUseSaveUIState: vi.fn(),
     mockUseProjects: vi.fn(),
   }))
+
+const mockSaveUIStateMutate = vi.fn()
 
 vi.mock('@/lib/transport', () => ({
   invoke: mockInvoke,
@@ -63,6 +66,7 @@ function buildUiState(overrides: Partial<UIState> = {}): UIState {
 describe('useUIStatePersistence — terminal restore on web refresh', () => {
   beforeEach(() => {
     vi.clearAllMocks()
+    mockSaveUIStateMutate.mockReset()
     nativeApp = false
     // Defaults: no live PTYs, empty persisted state.
     mockInvoke.mockImplementation(async (command: string) => {
@@ -74,6 +78,7 @@ describe('useUIStatePersistence — terminal restore on web refresh', () => {
       data: buildUiState(),
       isSuccess: true,
     })
+    mockUseSaveUIState.mockReturnValue({ mutate: mockSaveUIStateMutate })
     mockUseProjects.mockReturnValue({ data: [], isSuccess: true })
 
     useTerminalStore.setState({
@@ -95,6 +100,28 @@ describe('useUIStatePersistence — terminal restore on web refresh', () => {
       activeWorktreePath: null,
       activeSessionIds: {},
       sessionWorktreeMap: {},
+    })
+    useProjectsStore.setState({
+      selectedProjectId: null,
+      selectedWorktreeId: null,
+      expandedProjectIds: new Set<string>(),
+      expandedWorktreeIds: new Set<string>(),
+      dashboardWorktreeCollapseOverrides: {},
+      githubDashboardProjectCollapseOverrides: {},
+      expandedFolderIds: new Set<string>(),
+      projectAccessTimestamps: {},
+      projectCanvasSettings: {},
+      addProjectDialogOpen: false,
+      addProjectParentFolderId: null,
+      projectSettingsDialogOpen: false,
+      projectSettingsProjectId: null,
+      projectSettingsInitialPane: null,
+      gitInitModalOpen: false,
+      gitInitModalPath: null,
+      cloneModalOpen: false,
+      jeanConfigWizardOpen: false,
+      jeanConfigWizardProjectId: null,
+      editingFolderId: null,
     })
   })
 
@@ -197,6 +224,77 @@ describe('useUIStatePersistence — terminal restore on web refresh', () => {
       expect(uiState.sessionTerminalIds['session-1']).toBeUndefined()
       expect(uiState.sessionPrimarySurface['session-1']).toBeUndefined()
     })
+  })
+
+  it('restores GitHub dashboard project collapse overrides from persisted UI state', async () => {
+    mockUseProjects.mockReturnValue({
+      data: [
+        {
+          id: 'project-1',
+          name: 'Project 1',
+          path: '/tmp/project-1',
+        },
+      ],
+      isSuccess: true,
+    })
+    mockUseUIState.mockReturnValue({
+      data: buildUiState({
+        github_dashboard_project_collapse_overrides: {
+          'project-1': true,
+        },
+      }),
+      isSuccess: true,
+    })
+
+    const queryClient = new QueryClient({
+      defaultOptions: {
+        queries: { retry: false },
+        mutations: { retry: false },
+      },
+    })
+    renderHook(() => useUIStatePersistence(), {
+      wrapper: createWrapper(queryClient),
+    })
+
+    await waitFor(() => {
+      expect(
+        useProjectsStore.getState().githubDashboardProjectCollapseOverrides[
+          'project-1'
+        ]
+      ).toBe(true)
+    })
+  })
+
+  it('saves GitHub dashboard project collapse overrides when the store changes', async () => {
+    mockUseProjects.mockReturnValue({ data: [], isSuccess: true })
+
+    const queryClient = new QueryClient({
+      defaultOptions: {
+        queries: { retry: false },
+        mutations: { retry: false },
+      },
+    })
+    renderHook(() => useUIStatePersistence(), {
+      wrapper: createWrapper(queryClient),
+    })
+
+    await waitFor(() => {
+      expect(useUIStore.getState().uiStateInitialized).toBe(true)
+    })
+
+    useProjectsStore.setState({
+      githubDashboardProjectCollapseOverrides: { 'project-1': true },
+    })
+
+    await waitFor(() => {
+      expect(mockSaveUIStateMutate).toHaveBeenCalled()
+    })
+
+    expect(mockSaveUIStateMutate).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        github_dashboard_project_collapse_overrides: { 'project-1': true },
+      })
+    )
   })
 
   it('restores only persisted terminals whose IDs are still live on the backend', async () => {

@@ -9,6 +9,8 @@ import { useQueries } from '@tanstack/react-query'
 import {
   Activity,
   CheckCircle2,
+  ChevronDown,
+  ChevronRight,
   CircleDot,
   Clock,
   GitPullRequest,
@@ -22,13 +24,18 @@ import {
   Wand2,
 } from 'lucide-react'
 import { toast } from 'sonner'
-import { getModifierSymbol, openExternal } from '@/lib/platform'
+import { getModifierSymbol } from '@/lib/platform'
 import {
   Dialog,
   DialogContent,
   DialogHeader,
   DialogTitle,
 } from '@/components/ui/dialog'
+import {
+  Collapsible,
+  CollapsibleContent,
+  CollapsibleTrigger,
+} from '@/components/ui/collapsible'
 import { Button } from '@/components/ui/button'
 import { ScrollArea } from '@/components/ui/scroll-area'
 import { Input } from '@/components/ui/input'
@@ -46,6 +53,7 @@ import {
 } from '@/components/ui/tooltip'
 import { cn } from '@/lib/utils'
 import { useUIStore } from '@/store/ui-store'
+import { useProjectsStore } from '@/store/projects-store'
 import { useProjects, isTauri, useCreateWorktree } from '@/services/projects'
 import { isFolder } from '@/types/projects'
 import {
@@ -682,28 +690,59 @@ function ProjectSection({
   project,
   count,
   actions,
+  isCollapsible = false,
+  isCollapsed,
+  onCollapsedChange,
   children,
 }: {
   project: Project
   count: number
   actions?: React.ReactNode
+  isCollapsible?: boolean
+  isCollapsed?: boolean
+  onCollapsedChange?: (collapsed: boolean) => void
   children: React.ReactNode
 }) {
-  return (
-    <div>
-      <div className="sticky top-0 z-10 flex flex-wrap items-center gap-2 px-3 py-1.5 bg-muted/80 border-b border-border">
+  const header = (
+    <div className="sticky top-0 z-10 flex flex-wrap items-center gap-2 px-3 py-1.5 bg-muted/80 border-b border-border">
+      {isCollapsible ? (
+        <CollapsibleTrigger className="inline-flex min-w-0 items-center gap-1 text-left text-xs font-semibold text-muted-foreground uppercase tracking-wide hover:text-foreground">
+          {isCollapsed ? (
+            <ChevronRight className="h-3.5 w-3.5 shrink-0" />
+          ) : (
+            <ChevronDown className="h-3.5 w-3.5 shrink-0" />
+          )}
+          <span className="truncate">{project.name}</span>
+        </CollapsibleTrigger>
+      ) : (
         <span className="text-xs font-semibold text-muted-foreground uppercase tracking-wide">
           {project.name}
         </span>
-        <span className="text-xs text-muted-foreground bg-background border border-border rounded-full px-1.5 py-0.5 leading-none">
-          {count}
-        </span>
-        {actions && (
-          <div className="ml-auto flex items-center gap-2">{actions}</div>
-        )}
-      </div>
-      {children}
+      )}
+      <span className="text-xs text-muted-foreground bg-background border border-border rounded-full px-1.5 py-0.5 leading-none">
+        {count}
+      </span>
+      {actions && <div className="ml-auto flex items-center gap-2">{actions}</div>}
     </div>
+  )
+
+  if (!isCollapsible) {
+    return (
+      <div>
+        {header}
+        {children}
+      </div>
+    )
+  }
+
+  return (
+    <Collapsible
+      open={!isCollapsed}
+      onOpenChange={open => onCollapsedChange?.(!open)}
+    >
+      {header}
+      <CollapsibleContent>{children}</CollapsibleContent>
+    </Collapsible>
   )
 }
 
@@ -736,6 +775,13 @@ export function GitHubDashboardModal() {
     },
     [setGitHubDashboardOpen, setWorkflowRunsModalOpen]
   )
+  const handleOpenWorkflowRunsForWorkflow = useCallback(
+    (projectPath: string, workflowName: string) => {
+      setGitHubDashboardOpen(false)
+      setWorkflowRunsModalOpen(true, projectPath, null, workflowName)
+    },
+    [setGitHubDashboardOpen, setWorkflowRunsModalOpen]
+  )
   const [preview, setPreview] = useState<PreviewState | null>(null)
   // Track which item is being created (number for issues/prs/alerts, ghsaId for advisories)
   const [creatingId, setCreatingId] = useState<string | null>(null)
@@ -753,6 +799,12 @@ export function GitHubDashboardModal() {
   const { data: allProjects = [] } = useProjects()
   const { triggerLogin, isGhInstalled } = useGhLogin()
   const createWorktree = useCreateWorktree()
+  const githubDashboardProjectCollapseOverrides = useProjectsStore(
+    state => state.githubDashboardProjectCollapseOverrides
+  )
+  const setGitHubDashboardProjectCollapsed = useProjectsStore(
+    state => state.setGitHubDashboardProjectCollapsed
+  )
 
   // Only query projects with a valid path (exclude folders)
   const projects = useMemo(
@@ -1337,6 +1389,22 @@ export function GitHubDashboardModal() {
                     key={project.id}
                     project={project}
                     count={items.length}
+                    isCollapsible={activeTab === 'workflows'}
+                    isCollapsed={
+                      activeTab === 'workflows'
+                        ? githubDashboardProjectCollapseOverrides[project.id] ??
+                          false
+                        : false
+                    }
+                    onCollapsedChange={
+                      activeTab === 'workflows'
+                        ? collapsed =>
+                            setGitHubDashboardProjectCollapsed(
+                              project.id,
+                              collapsed
+                            )
+                        : undefined
+                    }
                     actions={
                       activeTab === 'workflows'
                         ? (() => {
@@ -1473,7 +1541,10 @@ export function GitHubDashboardModal() {
                           key={workflow.workflowName}
                           workflow={workflow}
                           onClick={() =>
-                            void openExternal(workflow.latestRun.url)
+                            handleOpenWorkflowRunsForWorkflow(
+                              project.path,
+                              workflow.workflowName
+                            )
                           }
                         />
                       ))}

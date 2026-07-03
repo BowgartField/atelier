@@ -8,6 +8,7 @@ describe('ProjectsStore', () => {
       selectedWorktreeId: null,
       expandedProjectIds: new Set<string>(),
       expandedFolderIds: new Set<string>(),
+      githubDashboardProjectCollapseOverrides: {},
       projectCanvasSettings: {},
       addProjectDialogOpen: false,
       projectSettingsDialogOpen: false,
@@ -159,6 +160,41 @@ describe('ProjectsStore', () => {
       expect(
         useProjectsStore.getState().expandedFolderIds.has('folder-1')
       ).toBe(false)
+    })
+  })
+
+  describe('GitHub dashboard project collapse', () => {
+    it('sets project collapsed state explicitly', () => {
+      const { setGitHubDashboardProjectCollapsed } =
+        useProjectsStore.getState()
+
+      setGitHubDashboardProjectCollapsed('project-1', true)
+      expect(
+        useProjectsStore.getState().githubDashboardProjectCollapseOverrides[
+          'project-1'
+        ]
+      ).toBe(true)
+
+      setGitHubDashboardProjectCollapsed('project-1', false)
+      expect(
+        useProjectsStore.getState().githubDashboardProjectCollapseOverrides[
+          'project-1'
+        ]
+      ).toBe(false)
+    })
+
+    it('is idempotent when setting the same collapsed state twice', () => {
+      const { setGitHubDashboardProjectCollapsed } =
+        useProjectsStore.getState()
+
+      setGitHubDashboardProjectCollapsed('project-1', true)
+      const firstRef =
+        useProjectsStore.getState().githubDashboardProjectCollapseOverrides
+      setGitHubDashboardProjectCollapsed('project-1', true)
+      const secondRef =
+        useProjectsStore.getState().githubDashboardProjectCollapseOverrides
+
+      expect(secondRef).toBe(firstRef)
     })
   })
 

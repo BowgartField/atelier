@@ -252,6 +252,43 @@ export interface WorkflowRunsResult {
   failedCount: number
 }
 
+export interface WorkflowRunStep {
+  name: string
+  number: number
+  status: string
+  conclusion: string | null
+  startedAt?: string | null
+  completedAt?: string | null
+}
+
+export interface WorkflowRunJob {
+  databaseId: number
+  name: string
+  status: string
+  conclusion: string | null
+  startedAt?: string | null
+  completedAt?: string | null
+  steps: WorkflowRunStep[]
+  url: string
+}
+
+export interface WorkflowJobDefinition {
+  id: string
+  name: string
+  needs: string[]
+}
+
+export interface WorkflowRunDetailsResult {
+  jobs: WorkflowRunJob[]
+  jobDefinitions: WorkflowJobDefinition[]
+}
+
+export interface WorkflowJobLogLine {
+  stepName: string
+  timestamp: string | null
+  message: string
+}
+
 // =============================================================================
 // Attached Saved Context Types
 // =============================================================================

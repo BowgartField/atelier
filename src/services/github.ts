@@ -16,6 +16,8 @@ import type {
   LoadedAdvisoryContext,
   AttachedSavedContext,
   WorkflowRunsResult,
+  WorkflowRunDetailsResult,
+  WorkflowJobLogLine,
 } from '@/types/github'
 import { isTauri } from './projects'
 
@@ -114,6 +116,16 @@ export const githubQueryKeys = {
       'workflow-runs',
       projectPath,
       branch ?? '',
+    ] as const,
+  workflowRun: (projectPath: string, runId: number) =>
+    [...githubQueryKeys.all, 'workflow-run', projectPath, runId] as const,
+  workflowJobLogs: (projectPath: string, runId: number, jobId: number) =>
+    [
+      ...githubQueryKeys.all,
+      'workflow-job-logs',
+      projectPath,
+      runId,
+      jobId,
     ] as const,
   securityAlerts: (projectPath: string, state: string) =>
     [...githubQueryKeys.all, 'security-alerts', projectPath, state] as const,
@@ -1323,6 +1335,71 @@ export function useWorkflowRuns(
     enabled: (options?.enabled ?? true) && !!projectPath,
     staleTime: options?.staleTime ?? 1000 * 60 * 3, // 3 minutes
     gcTime: 1000 * 60 * 10, // 10 minutes
+    retry: 1,
+  })
+}
+
+/**
+ * Hook to load a single workflow run with jobs and steps.
+ */
+export function useWorkflowRun(
+  projectPath: string | null,
+  runId: number | null,
+  options?: { enabled?: boolean; staleTime?: number }
+) {
+  return useQuery({
+    queryKey: githubQueryKeys.workflowRun(projectPath ?? '', runId ?? 0),
+    queryFn: async (): Promise<WorkflowRunDetailsResult> => {
+      if (!isTauri() || !projectPath || !runId) {
+        return { jobs: [], jobDefinitions: [] }
+      }
+
+      try {
+        logger.debug('Fetching workflow run details', { projectPath, runId })
+        return await invoke<WorkflowRunDetailsResult>('get_workflow_run', {
+          projectPath,
+          runId,
+        })
+      } catch (error) {
+        logger.error('Failed to load workflow run details', {
+          error,
+          projectPath,
+          runId,
+        })
+        throw error
+      }
+    },
+    enabled: (options?.enabled ?? true) && !!projectPath && !!runId,
+    staleTime: options?.staleTime ?? 1000 * 60 * 3,
+    gcTime: 1000 * 60 * 10,
+    retry: 1,
+  })
+}
+
+export function useWorkflowJobLogs(
+  projectPath: string | null,
+  runId: number | null,
+  jobId: number | null,
+  options?: { enabled?: boolean; staleTime?: number }
+) {
+  return useQuery({
+    queryKey: githubQueryKeys.workflowJobLogs(
+      projectPath ?? '',
+      runId ?? 0,
+      jobId ?? 0
+    ),
+    queryFn: async (): Promise<WorkflowJobLogLine[]> => {
+      if (!isTauri() || !projectPath || !runId || !jobId) return []
+
+      return await invoke<WorkflowJobLogLine[]>('get_workflow_job_logs', {
+        projectPath,
+        runId,
+        jobId,
+      })
+    },
+    enabled: (options?.enabled ?? true) && !!projectPath && !!runId && !!jobId,
+    staleTime: options?.staleTime ?? 1000 * 60 * 10,
+    gcTime: 1000 * 60 * 30,
     retry: 1,
   })
 }

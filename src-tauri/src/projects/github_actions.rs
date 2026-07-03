@@ -28,6 +28,69 @@ pub struct WorkflowRun {
     pub workflow_name: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkflowRunStep {
+    pub name: String,
+    pub number: u32,
+    pub status: String,
+    #[serde(default)]
+    pub conclusion: Option<String>,
+    #[serde(default)]
+    pub started_at: Option<String>,
+    #[serde(default)]
+    pub completed_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkflowRunJob {
+    pub database_id: u64,
+    pub name: String,
+    pub status: String,
+    #[serde(default)]
+    pub conclusion: Option<String>,
+    #[serde(default)]
+    pub started_at: Option<String>,
+    #[serde(default)]
+    pub completed_at: Option<String>,
+    #[serde(default)]
+    pub steps: Vec<WorkflowRunStep>,
+    pub url: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkflowJobDefinition {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub needs: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkflowRunDetailsResult {
+    pub jobs: Vec<WorkflowRunJob>,
+    #[serde(default)]
+    pub job_definitions: Vec<WorkflowJobDefinition>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkflowJobLogLine {
+    pub step_name: String,
+    pub timestamp: Option<String>,
+    pub message: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WorkflowRunView {
+    jobs: Vec<WorkflowRunJob>,
+    workflow_database_id: Option<u64>,
+}
+
 /// Result of listing workflow runs, includes failed count for badge display
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -108,6 +171,178 @@ pub async fn list_workflow_runs(
     log::trace!("Found {} workflow runs ({failed_count} failed)", runs.len());
 
     Ok(WorkflowRunsResult { runs, failed_count })
+}
+
+#[tauri::command]
+pub async fn get_workflow_run(
+    app: AppHandle,
+    project_path: String,
+    run_id: u64,
+) -> Result<WorkflowRunDetailsResult, String> {
+    log::trace!("Loading workflow run details for {project_path} run {run_id}");
+
+    let gh = resolve_gh_binary(&app);
+    let args = vec![
+        "run".to_string(),
+        "view".to_string(),
+        run_id.to_string(),
+        "--json".to_string(),
+        "jobs,workflowDatabaseId".to_string(),
+    ];
+
+    let output = gh_command(&gh, &project_path)
+        .args(&args)
+        .output()
+        .map_err(|e| format!("Failed to run gh run view: {e}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if stderr.contains("gh auth login") || stderr.contains("authentication") {
+            return Err("GitHub CLI not authenticated. Run 'gh auth login' first.".to_string());
+        }
+        if stderr.contains("not a git repository") {
+            return Err("Not a git repository".to_string());
+        }
+        if stderr.contains("Could not resolve") {
+            return Err("Could not resolve repository. Is this a GitHub repository?".to_string());
+        }
+        return Err(format!("gh run view failed: {stderr}"));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let run_view: WorkflowRunView =
+        serde_json::from_str(&stdout).map_err(|e| format!("Failed to parse gh response: {e}"))?;
+
+    let job_definitions = match run_view.workflow_database_id {
+        Some(workflow_id) => load_workflow_job_definitions(&gh, &project_path, workflow_id),
+        None => Vec::new(),
+    };
+    let result = WorkflowRunDetailsResult {
+        jobs: run_view.jobs,
+        job_definitions,
+    };
+
+    log::trace!(
+        "Loaded workflow run details for {run_id} with {} jobs",
+        result.jobs.len()
+    );
+
+    Ok(result)
+}
+
+#[tauri::command]
+pub async fn get_workflow_job_logs(
+    app: AppHandle,
+    project_path: String,
+    run_id: u64,
+    job_id: u64,
+) -> Result<Vec<WorkflowJobLogLine>, String> {
+    log::trace!("Loading logs for workflow run {run_id} job {job_id}");
+
+    let gh = resolve_gh_binary(&app);
+    let output = gh_command(&gh, &project_path)
+        .args([
+            "run",
+            "view",
+            &run_id.to_string(),
+            "--job",
+            &job_id.to_string(),
+            "--log",
+        ])
+        .output()
+        .map_err(|e| format!("Failed to load workflow job logs: {e}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("Failed to load workflow job logs: {stderr}"));
+    }
+
+    Ok(parse_workflow_job_logs(&String::from_utf8_lossy(
+        &output.stdout,
+    )))
+}
+
+fn parse_workflow_job_logs(output: &str) -> Vec<WorkflowJobLogLine> {
+    output
+        .lines()
+        .filter_map(|line| {
+            let mut parts = line.splitn(3, '\t');
+            let _job_name = parts.next()?;
+            let step_name = parts.next()?.to_string();
+            let content = parts.next()?.trim_start_matches('\u{feff}');
+            let (timestamp, message) = match content.split_once(' ') {
+                Some((timestamp, message))
+                    if timestamp.contains('T') && timestamp.ends_with('Z') =>
+                {
+                    (Some(timestamp.to_string()), message.to_string())
+                }
+                _ => (None, content.to_string()),
+            };
+
+            Some(WorkflowJobLogLine {
+                step_name,
+                timestamp,
+                message,
+            })
+        })
+        .collect()
+}
+
+fn load_workflow_job_definitions(
+    gh: &Path,
+    project_path: &str,
+    workflow_id: u64,
+) -> Vec<WorkflowJobDefinition> {
+    let output = match gh_command(gh, project_path)
+        .args(["workflow", "view", &workflow_id.to_string(), "--yaml"])
+        .output()
+    {
+        Ok(output) if output.status.success() => output,
+        Ok(output) => {
+            log::warn!(
+                "Failed to load workflow graph for {workflow_id}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return Vec::new();
+        }
+        Err(error) => {
+            log::warn!("Failed to load workflow graph for {workflow_id}: {error}");
+            return Vec::new();
+        }
+    };
+
+    parse_workflow_job_definitions(&String::from_utf8_lossy(&output.stdout))
+}
+
+fn parse_workflow_job_definitions(yaml: &str) -> Vec<WorkflowJobDefinition> {
+    let Ok(document) = serde_yaml::from_str::<serde_yaml::Value>(yaml) else {
+        return Vec::new();
+    };
+    let Some(jobs) = document.get("jobs").and_then(serde_yaml::Value::as_mapping) else {
+        return Vec::new();
+    };
+
+    jobs.iter()
+        .filter_map(|(id, value)| {
+            let id = id.as_str()?.to_string();
+            let name = value
+                .get("name")
+                .and_then(serde_yaml::Value::as_str)
+                .unwrap_or(&id)
+                .to_string();
+            let needs = match value.get("needs") {
+                Some(serde_yaml::Value::String(need)) => vec![need.clone()],
+                Some(serde_yaml::Value::Sequence(needs)) => needs
+                    .iter()
+                    .filter_map(serde_yaml::Value::as_str)
+                    .map(String::from)
+                    .collect(),
+                _ => Vec::new(),
+            };
+
+            Some(WorkflowJobDefinition { id, name, needs })
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -217,5 +452,79 @@ mod tests {
         let json = serde_json::to_string(&result).unwrap();
         assert!(json.contains("\"failedCount\":3"));
         assert!(json.contains("\"runs\":[]"));
+    }
+
+    #[test]
+    fn test_workflow_run_details_deserialization() {
+        let json = r#"{
+            "jobs": [{
+                "databaseId": 42,
+                "name": "build",
+                "status": "completed",
+                "conclusion": "success",
+                "startedAt": "2026-07-03T07:16:52Z",
+                "completedAt": "2026-07-03T07:17:00Z",
+                "steps": [{
+                    "name": "Set up job",
+                    "number": 1,
+                    "status": "completed",
+                    "conclusion": "success",
+                    "startedAt": "2026-07-03T07:16:53Z",
+                    "completedAt": "2026-07-03T07:16:54Z"
+                }],
+                "url": "https://github.com/cli/cli/actions/runs/1/job/42"
+            }],
+            "jobDefinitions": [{
+                "id": "build",
+                "name": "Build",
+                "needs": []
+            }]
+        }"#;
+
+        let result: WorkflowRunDetailsResult = serde_json::from_str(json).unwrap();
+        assert_eq!(result.jobs.len(), 1);
+        assert_eq!(result.jobs[0].database_id, 42);
+        assert_eq!(result.jobs[0].steps.len(), 1);
+        assert_eq!(result.jobs[0].steps[0].name, "Set up job");
+        assert_eq!(result.job_definitions[0].id, "build");
+    }
+
+    #[test]
+    fn test_parse_workflow_job_definitions() {
+        let yaml = r#"
+name: Build and deploy
+on: push
+jobs:
+  build:
+    name: Build app
+    runs-on: ubuntu-latest
+  deploy:
+    name: Deploy
+    needs: [build]
+    runs-on: ubuntu-latest
+"#;
+
+        let definitions = parse_workflow_job_definitions(yaml);
+        assert_eq!(definitions.len(), 2);
+        assert_eq!(definitions[0].id, "build");
+        assert_eq!(definitions[0].name, "Build app");
+        assert_eq!(definitions[1].needs, vec!["build"]);
+    }
+
+    #[test]
+    fn test_parse_workflow_job_logs() {
+        let output = "\
+build\tCheckout\t2026-07-03T09:00:00.123Z Fetching repository\n\
+build\tTests\t2026-07-03T09:01:00Z Running tests\n";
+
+        let logs = parse_workflow_job_logs(output);
+        assert_eq!(logs.len(), 2);
+        assert_eq!(logs[0].step_name, "Checkout");
+        assert_eq!(
+            logs[0].timestamp.as_deref(),
+            Some("2026-07-03T09:00:00.123Z")
+        );
+        assert_eq!(logs[0].message, "Fetching repository");
+        assert_eq!(logs[1].step_name, "Tests");
     }
 }

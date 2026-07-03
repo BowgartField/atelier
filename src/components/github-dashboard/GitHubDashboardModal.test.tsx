@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 import userEvent from '@testing-library/user-event'
 import { screen, waitFor, render } from '@/test/test-utils'
 import { useUIStore } from '@/store/ui-store'
+import { useProjectsStore } from '@/store/projects-store'
 import { GitHubDashboardModal } from './GitHubDashboardModal'
 
 const mockInvoke = vi.hoisted(() => vi.fn())
@@ -87,6 +88,9 @@ describe('GitHubDashboardModal auth error handling', () => {
       data: undefined,
       isLoading: false,
       isFetching: false,
+    })
+    useProjectsStore.setState({
+      githubDashboardProjectCollapseOverrides: {},
     })
   })
 
@@ -223,5 +227,50 @@ describe('GitHubDashboardModal auth error handling', () => {
     expect(screen.getByText('1 failed')).toBeInTheDocument()
     expect(screen.getByText('1 success')).toBeInTheDocument()
     expect(screen.getByText('Open runs')).toBeInTheDocument()
+
+    await user.click(screen.getByRole('button', { name: /Deploy/ }))
+    expect(useUIStore.getState().workflowRunsModalWorkflowName).toBe('Deploy')
+    expect(useUIStore.getState().workflowRunsModalProjectPath).toBe(
+      '/tmp/project-1'
+    )
+  })
+
+  it('collapses and expands a project in the workflows tab', async () => {
+    mockInvoke.mockImplementation((command: string) => {
+      if (command === 'list_workflow_runs') {
+        return Promise.resolve({
+          runs: [
+            {
+              databaseId: 1,
+              name: 'build',
+              displayTitle: 'Build app',
+              status: 'completed',
+              conclusion: 'success',
+              event: 'push',
+              headBranch: 'main',
+              createdAt: '2026-07-03T08:30:00Z',
+              url: 'https://github.com/acme/project/actions/runs/1',
+              workflowName: 'Build',
+            },
+          ],
+          failedCount: 0,
+        })
+      }
+      return resolveEmptyDashboardCommand(command)
+    })
+
+    const user = userEvent.setup()
+    renderDashboard()
+
+    await user.click(screen.getByRole('button', { name: /Workflows/i }))
+    expect(await screen.findByText('Build')).toBeInTheDocument()
+
+    await user.click(screen.getByRole('button', { name: /Project 1/i }))
+    await waitFor(() => {
+      expect(screen.queryByText('Build')).not.toBeInTheDocument()
+    })
+
+    await user.click(screen.getByRole('button', { name: /Project 1/i }))
+    expect(await screen.findByText('Build')).toBeInTheDocument()
   })
 })

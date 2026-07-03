@@ -856,9 +856,12 @@ mod tests {
 
         let bind_host = resolve_headless_bind_host(&prefs, &overrides.host);
         let token_required = resolve_headless_token_required(&prefs, &overrides);
-        let err =
-            validate_headless_security(&bind_host, !token_required, overrides.allow_unsafe_no_token)
-                .unwrap_err();
+        let err = validate_headless_security(
+            &bind_host,
+            !token_required,
+            overrides.allow_unsafe_no_token,
+        )
+        .unwrap_err();
 
         assert!(err.contains("Refusing to disable token authentication"));
     }
@@ -2266,6 +2269,10 @@ pub struct UIState {
     #[serde(default)]
     pub dashboard_worktree_collapse_overrides: std::collections::HashMap<String, bool>,
 
+    /// GitHub dashboard project collapse overrides: projectId → collapsed (true/false)
+    #[serde(default)]
+    pub github_dashboard_project_collapse_overrides: std::collections::HashMap<String, bool>,
+
     /// Project canvas settings per project
     #[serde(default)]
     pub project_canvas_settings: std::collections::HashMap<String, ProjectCanvasSettings>,
@@ -2354,6 +2361,7 @@ impl Default for UIState {
             browser_bottom_panel_height: None,
             project_access_timestamps: std::collections::HashMap::new(),
             dashboard_worktree_collapse_overrides: std::collections::HashMap::new(),
+            github_dashboard_project_collapse_overrides: std::collections::HashMap::new(),
             project_canvas_settings: std::collections::HashMap::new(),
             last_opened_per_project: std::collections::HashMap::new(),
             version: default_ui_state_version(),
@@ -3082,11 +3090,7 @@ async fn start_http_server_headless(
 
     let token_required = resolve_headless_token_required(&prefs, overrides);
 
-    validate_headless_security(
-        &bind_host,
-        !token_required,
-        overrides.allow_unsafe_no_token,
-    )?;
+    validate_headless_security(&bind_host, !token_required, overrides.allow_unsafe_no_token)?;
 
     // Token: CLI --token used directly (not persisted), otherwise load/generate
     let token = if let Some(ref t) = overrides.token {
@@ -4599,6 +4603,8 @@ pub fn run() {
             projects::get_advisory_context_content,
             // GitHub Actions commands
             projects::list_workflow_runs,
+            projects::get_workflow_run,
+            projects::get_workflow_job_logs,
             // Saved context commands
             projects::attach_saved_context,
             projects::remove_saved_context,
