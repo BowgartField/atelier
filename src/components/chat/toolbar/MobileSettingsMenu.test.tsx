@@ -1,7 +1,7 @@
 import { describe, expect, it, vi, beforeEach } from 'vitest'
 import userEvent from '@testing-library/user-event'
 import { Zap } from 'lucide-react'
-import { fireEvent, render, screen } from '@/test/test-utils'
+import { fireEvent, render, screen, within } from '@/test/test-utils'
 import { MobileSettingsMenu } from './MobileSettingsMenu'
 import * as platform from '@/lib/platform'
 
@@ -206,6 +206,12 @@ describe('MobileSettingsMenu', () => {
 
     expect(screen.getByText('Linked')).toBeInTheDocument()
     expect(screen.getByText('PR #9999')).toBeInTheDocument()
+    const prRow = screen.getByText('PR #9999').closest('[role="menuitem"]')
+    expect(prRow).not.toBeNull()
+    expect(
+      within(prRow as HTMLElement).queryByText('Open')
+    ).not.toBeInTheDocument()
+    expect(prRow?.querySelector('svg.lucide-external-link')).toBeInTheDocument()
 
     await user.click(screen.getByText('PR #9999'))
     expect(openSpy).toHaveBeenCalledWith(

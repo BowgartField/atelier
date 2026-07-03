@@ -641,11 +641,7 @@ export function MobileSettingsMenu({
                   />
                 )}
                 <span className="truncate">PR #{prNumber}</span>
-                {prDisplayStatus && (
-                  <span className="ml-auto text-xs text-muted-foreground">
-                    {getPrStatusDisplay(prDisplayStatus).label}
-                  </span>
-                )}
+                <ExternalLink className="ml-auto h-3.5 w-3.5 shrink-0 opacity-60" />
               </DropdownMenuItem>
             )}
             {stackedOnPR && (
