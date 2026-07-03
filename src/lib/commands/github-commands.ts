@@ -80,7 +80,8 @@ export const githubCommands: AppCommand[] = [
   {
     id: 'open-github-dashboard',
     label: 'GitHub Dashboard',
-    description: 'View issues, PRs, and security across all projects',
+    description:
+      'View issues, PRs, workflows, and security across all projects',
     icon: LayoutDashboard,
     group: 'github',
     keywords: [
@@ -91,6 +92,8 @@ export const githubCommands: AppCommand[] = [
       'projects',
       'issues',
       'prs',
+      'workflows',
+      'actions',
       'security',
     ],
 

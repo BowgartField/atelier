@@ -7,23 +7,29 @@ import {
 } from 'react'
 import { useQueries } from '@tanstack/react-query'
 import {
+  Activity,
+  CheckCircle2,
   CircleDot,
+  Clock,
   GitPullRequest,
+  Loader2,
+  MinusCircle,
   Shield,
   ShieldAlert,
   Search,
-  Loader2,
   AlertCircle,
+  XCircle,
   Wand2,
 } from 'lucide-react'
 import { toast } from 'sonner'
-import { getModifierSymbol } from '@/lib/platform'
+import { getModifierSymbol, openExternal } from '@/lib/platform'
 import {
   Dialog,
   DialogContent,
   DialogHeader,
   DialogTitle,
 } from '@/components/ui/dialog'
+import { Button } from '@/components/ui/button'
 import { ScrollArea } from '@/components/ui/scroll-area'
 import { Input } from '@/components/ui/input'
 import {
@@ -62,6 +68,8 @@ import type {
   PullRequestContext,
   SecurityAlertContext,
   AdvisoryContext,
+  WorkflowRun,
+  WorkflowRunsResult,
 } from '@/types/github'
 import type { Project } from '@/types/projects'
 
@@ -69,7 +77,9 @@ import type { Project } from '@/types/projects'
 // Types
 // =============================================================================
 
-type DashboardTab = 'issues' | 'prs' | 'security' | 'advisories'
+type DashboardTab = 'issues' | 'prs' | 'security' | 'advisories' | 'workflows'
+
+type WorkflowStatus = 'running' | 'success' | 'failure' | 'pending'
 
 interface PreviewState {
   projectPath: string
@@ -78,9 +88,30 @@ interface PreviewState {
   ghsaId?: string
 }
 
+interface WorkflowGroup {
+  workflowName: string
+  latestRun: WorkflowRun
+  latestStatus: WorkflowStatus
+  totalCount: number
+  failedCount: number
+}
+
 function getDashboardErrorMessage(error: unknown): string {
   if (!error) return 'Failed to load GitHub dashboard data'
   return error instanceof Error ? error.message : String(error)
+}
+
+function timeAgo(dateString: string): string {
+  const seconds = Math.floor(
+    (Date.now() - new Date(dateString).getTime()) / 1000
+  )
+  if (seconds < 60) return 'just now'
+  const minutes = Math.floor(seconds / 60)
+  if (minutes < 60) return `${minutes}m ago`
+  const hours = Math.floor(minutes / 60)
+  if (hours < 24) return `${hours}h ago`
+  const days = Math.floor(hours / 24)
+  return `${days}d ago`
 }
 
 // =============================================================================
@@ -92,6 +123,7 @@ const TABS: { id: DashboardTab; label: string; icon: ElementType }[] = [
   { id: 'prs', label: 'Pull Requests', icon: GitPullRequest },
   { id: 'security', label: 'Security', icon: Shield },
   { id: 'advisories', label: 'Advisories', icon: ShieldAlert },
+  { id: 'workflows', label: 'Workflows', icon: Activity },
 ]
 
 function DashboardTabBar({
@@ -172,6 +204,157 @@ const SEVERITY_COLORS: Record<string, string> = {
   high: 'bg-orange-500/10 text-orange-600 border-orange-500/20',
   medium: 'bg-yellow-500/10 text-yellow-600 border-yellow-500/20',
   low: 'bg-blue-500/10 text-blue-600 border-blue-500/20',
+}
+
+function getWorkflowStatus(run: WorkflowRun): WorkflowStatus {
+  if (run.status === 'in_progress' || run.status === 'queued') {
+    return 'running'
+  }
+
+  if (run.conclusion === 'failure' || run.conclusion === 'startup_failure') {
+    return 'failure'
+  }
+
+  if (run.conclusion === 'success') {
+    return 'success'
+  }
+
+  return 'pending'
+}
+
+function getWorkflowStatusIcon(status: WorkflowStatus) {
+  switch (status) {
+    case 'running':
+      return <Clock className="h-4 w-4 shrink-0 text-yellow-500" />
+    case 'success':
+      return <CheckCircle2 className="h-4 w-4 shrink-0 text-green-500" />
+    case 'failure':
+      return <XCircle className="h-4 w-4 shrink-0 text-red-500" />
+    default:
+      return <MinusCircle className="h-4 w-4 shrink-0 text-muted-foreground" />
+  }
+}
+
+function getWorkflowStatusLabel(status: WorkflowStatus) {
+  switch (status) {
+    case 'running':
+      return 'Running'
+    case 'success':
+      return 'Success'
+    case 'failure':
+      return 'Failed'
+    default:
+      return 'Queued'
+  }
+}
+
+function getWorkflowStatusClass(status: WorkflowStatus) {
+  switch (status) {
+    case 'running':
+      return 'bg-yellow-500/10 text-yellow-600 border-yellow-500/20'
+    case 'success':
+      return 'bg-green-500/10 text-green-600 border-green-500/20'
+    case 'failure':
+      return 'bg-red-500/10 text-red-600 border-red-500/20'
+    default:
+      return 'bg-muted text-muted-foreground border-border'
+  }
+}
+
+function groupWorkflowRuns(runs: WorkflowRun[]): WorkflowGroup[] {
+  const groupMap = new Map<string, WorkflowGroup>()
+
+  for (const run of runs) {
+    const existing = groupMap.get(run.workflowName)
+    if (existing) {
+      existing.totalCount++
+      continue
+    }
+
+    groupMap.set(run.workflowName, {
+      workflowName: run.workflowName,
+      latestRun: run,
+      latestStatus: getWorkflowStatus(run),
+      totalCount: 1,
+      failedCount:
+        getWorkflowStatus(run) === 'failure' && run.conclusion !== null ? 1 : 0,
+    })
+  }
+
+  return Array.from(groupMap.values()).sort((a, b) => {
+    const statusRank: Record<WorkflowStatus, number> = {
+      running: 0,
+      failure: 1,
+      success: 2,
+      pending: 3,
+    }
+
+    const statusDiff = statusRank[a.latestStatus] - statusRank[b.latestStatus]
+    if (statusDiff !== 0) return statusDiff
+
+    return a.workflowName.localeCompare(b.workflowName)
+  })
+}
+
+function summarizeWorkflowGroups(groups: WorkflowGroup[]) {
+  return groups.reduce(
+    (summary, workflow) => {
+      summary[workflow.latestStatus]++
+      return summary
+    },
+    {
+      running: 0,
+      success: 0,
+      failure: 0,
+      pending: 0,
+    } as Record<WorkflowStatus, number>
+  )
+}
+
+function WorkflowRow({
+  workflow,
+  onClick,
+}: {
+  workflow: WorkflowGroup
+  onClick: () => void
+}) {
+  return (
+    <button
+      onClick={onClick}
+      className="group w-full border-b border-border px-3 py-2 text-left transition-colors hover:bg-accent last:border-b-0"
+    >
+      <div className="flex items-start gap-3">
+        {getWorkflowStatusIcon(workflow.latestStatus)}
+        <div className="min-w-0 flex-1">
+          <div className="flex flex-wrap items-center gap-2">
+            <span className="truncate text-sm font-medium">
+              {workflow.workflowName}
+            </span>
+            <span
+              className={cn(
+                'inline-flex rounded-full border px-1.5 py-0.5 text-[10px] font-medium',
+                getWorkflowStatusClass(workflow.latestStatus)
+              )}
+            >
+              {getWorkflowStatusLabel(workflow.latestStatus)}
+            </span>
+            {workflow.totalCount > 1 && (
+              <span className="text-[11px] text-muted-foreground">
+                {workflow.totalCount} runs
+              </span>
+            )}
+          </div>
+          <div className="mt-0.5 flex flex-wrap items-center gap-x-2 gap-y-1 text-xs text-muted-foreground">
+            <span className="truncate">{workflow.latestRun.displayTitle}</span>
+            <span>•</span>
+            <span className="truncate">{workflow.latestRun.headBranch}</span>
+            <span>•</span>
+            <span>{timeAgo(workflow.latestRun.createdAt)}</span>
+          </div>
+        </div>
+      </div>
+    </button>
+  )
 }
 
 function IssueRow({
@@ -498,21 +681,26 @@ function AdvisoryRow({
 function ProjectSection({
   project,
   count,
+  actions,
   children,
 }: {
   project: Project
   count: number
+  actions?: React.ReactNode
   children: React.ReactNode
 }) {
   return (
     <div>
-      <div className="sticky top-0 z-10 flex items-center gap-2 px-3 py-1.5 bg-muted/80 border-b border-border">
+      <div className="sticky top-0 z-10 flex flex-wrap items-center gap-2 px-3 py-1.5 bg-muted/80 border-b border-border">
         <span className="text-xs font-semibold text-muted-foreground uppercase tracking-wide">
           {project.name}
         </span>
         <span className="text-xs text-muted-foreground bg-background border border-border rounded-full px-1.5 py-0.5 leading-none">
           {count}
         </span>
+        {actions && (
+          <div className="ml-auto flex items-center gap-2">{actions}</div>
+        )}
       </div>
       {children}
     </div>
@@ -528,6 +716,9 @@ export function GitHubDashboardModal() {
   const setGitHubDashboardOpen = useUIStore(
     state => state.setGitHubDashboardOpen
   )
+  const setWorkflowRunsModalOpen = useUIStore(
+    state => state.setWorkflowRunsModalOpen
+  )
   const [activeTab, setActiveTab] = useState<DashboardTab>('issues')
   const [searchQuery, setSearchQuery] = useState('')
   const [projectFilter, setProjectFilter] = useState<string>('all')
@@ -538,6 +729,13 @@ export function GitHubDashboardModal() {
       prev.includes(token) ? prev : prev ? `${prev} ${token}` : token
     )
   }, [])
+  const handleOpenWorkflowRuns = useCallback(
+    (projectPath: string) => {
+      setGitHubDashboardOpen(false)
+      setWorkflowRunsModalOpen(true, projectPath)
+    },
+    [setGitHubDashboardOpen, setWorkflowRunsModalOpen]
+  )
   const [preview, setPreview] = useState<PreviewState | null>(null)
   // Track which item is being created (number for issues/prs/alerts, ghsaId for advisories)
   const [creatingId, setCreatingId] = useState<string | null>(null)
@@ -581,6 +779,9 @@ export function GitHubDashboardModal() {
       enabled: projects.length > 0,
       staleTime: 5 * 60 * 1000,
       gcTime: 10 * 60 * 1000,
+      refetchInterval:
+        githubDashboardOpen && activeTab === 'workflows' ? 30 * 1000 : false,
+      refetchIntervalInBackground: true,
       retry: 1,
     })),
   })
@@ -648,6 +849,29 @@ export function GitHubDashboardModal() {
         } catch (error) {
           if (isGhAuthError(error)) throw error
           return []
+        }
+      },
+      enabled: projects.length > 0,
+      staleTime: 5 * 60 * 1000,
+      gcTime: 10 * 60 * 1000,
+      retry: 1,
+    })),
+  })
+
+  // Fetch workflow runs for all projects in parallel
+  const workflowResults = useQueries({
+    queries: projects.map(p => ({
+      queryKey: githubQueryKeys.workflowRuns(p.path, undefined),
+      queryFn: async (): Promise<WorkflowRunsResult> => {
+        if (!isTauri()) return { runs: [], failedCount: 0 }
+        try {
+          return await invoke<WorkflowRunsResult>('list_workflow_runs', {
+            projectPath: p.path,
+            branch: null,
+          })
+        } catch (error) {
+          if (isGhAuthError(error)) throw error
+          return { runs: [], failedCount: 0 }
         }
       },
       enabled: projects.length > 0,
@@ -878,7 +1102,9 @@ export function GitHubDashboardModal() {
         ? prResults
         : activeTab === 'security'
           ? securityResults
-          : advisoryResults
+          : activeTab === 'advisories'
+            ? advisoryResults
+            : workflowResults
 
   const commandAuthError = activeResults.find(r => isGhAuthError(r.error))
   const {
@@ -977,6 +1203,25 @@ export function GitHubDashboardModal() {
         return { project, items: filtered }
       }
 
+      if (activeTab === 'workflows') {
+        const workflowData = (workflowResults[projectIdx]?.data ?? {
+          runs: [],
+          failedCount: 0,
+        }) as WorkflowRunsResult
+        const workflows = groupWorkflowRuns(workflowData.runs)
+        const filtered = workflows.filter(workflow => {
+          if (!q) return true
+          return (
+            workflow.workflowName.toLowerCase().includes(q) ||
+            workflow.latestRun.displayTitle.toLowerCase().includes(q) ||
+            workflow.latestRun.headBranch.toLowerCase().includes(q) ||
+            workflow.latestRun.status.toLowerCase().includes(q) ||
+            (workflow.latestRun.conclusion?.toLowerCase().includes(q) ?? false)
+          )
+        })
+        return { project, items: filtered }
+      }
+
       const advisories = (advisoryResults[projectIdx]?.data ??
         []) as RepositoryAdvisory[]
       const filtered = q
@@ -996,6 +1241,7 @@ export function GitHubDashboardModal() {
     prResults,
     securityResults,
     advisoryResults,
+    workflowResults,
     q,
     labelFilters,
   ])
@@ -1004,6 +1250,19 @@ export function GitHubDashboardModal() {
     (sum, { items }) => sum + items.length,
     0
   )
+
+  const emptyStateLabel =
+    activeTab === 'issues'
+      ? 'open issues'
+      : activeTab === 'prs'
+        ? 'open pull requests'
+        : activeTab === 'security'
+          ? 'security alerts'
+          : activeTab === 'advisories'
+            ? 'advisories'
+            : 'workflow groups'
+  const searchPlaceholder =
+    activeTab === 'workflows' ? 'Search workflows...' : 'Search...'
 
   return (
     <Dialog open={githubDashboardOpen} onOpenChange={setGitHubDashboardOpen}>
@@ -1032,7 +1291,7 @@ export function GitHubDashboardModal() {
               <Input
                 value={searchQuery}
                 onChange={e => setSearchQuery(e.target.value)}
-                placeholder="Search..."
+                placeholder={searchPlaceholder}
                 className="pl-8 !h-7 py-0 text-base md:text-xs"
               />
             </div>
@@ -1066,7 +1325,7 @@ export function GitHubDashboardModal() {
               <p className="text-sm">
                 {q || labelFilters.length > 0
                   ? 'No results match your search'
-                  : `No ${activeTab === 'issues' ? 'open issues' : activeTab === 'prs' ? 'open pull requests' : activeTab === 'security' ? 'security alerts' : 'advisories'} found`}
+                  : `No ${emptyStateLabel} found`}
               </p>
             </div>
           ) : (
@@ -1078,6 +1337,38 @@ export function GitHubDashboardModal() {
                     key={project.id}
                     project={project}
                     count={items.length}
+                    actions={
+                      activeTab === 'workflows'
+                        ? (() => {
+                            const workflowItems = items as WorkflowGroup[]
+                            const summary =
+                              summarizeWorkflowGroups(workflowItems)
+                            return (
+                              <>
+                                <span className="rounded-full border border-yellow-500/20 bg-yellow-500/10 px-1.5 py-0.5 text-[10px] font-medium text-yellow-600">
+                                  {summary.running} running
+                                </span>
+                                <span className="rounded-full border border-red-500/20 bg-red-500/10 px-1.5 py-0.5 text-[10px] font-medium text-red-600">
+                                  {summary.failure} failed
+                                </span>
+                                <span className="rounded-full border border-green-500/20 bg-green-500/10 px-1.5 py-0.5 text-[10px] font-medium text-green-600">
+                                  {summary.success} success
+                                </span>
+                                <Button
+                                  variant="ghost"
+                                  size="sm"
+                                  className="h-6 px-2 text-xs"
+                                  onClick={() =>
+                                    handleOpenWorkflowRuns(project.path)
+                                  }
+                                >
+                                  Open runs
+                                </Button>
+                              </>
+                            )
+                          })()
+                        : undefined
+                    }
                   >
                     {activeTab === 'issues' &&
                       (items as GitHubIssue[]).map(issue => (
@@ -1173,6 +1464,16 @@ export function GitHubDashboardModal() {
                               project.path,
                               bg
                             )
+                          }
+                        />
+                      ))}
+                    {activeTab === 'workflows' &&
+                      (items as WorkflowGroup[]).map(workflow => (
+                        <WorkflowRow
+                          key={workflow.workflowName}
+                          workflow={workflow}
+                          onClick={() =>
+                            void openExternal(workflow.latestRun.url)
                           }
                         />
                       ))}

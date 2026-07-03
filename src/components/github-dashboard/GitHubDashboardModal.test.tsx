@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
+import userEvent from '@testing-library/user-event'
 import { screen, waitFor, render } from '@/test/test-utils'
 import { useUIStore } from '@/store/ui-store'
 import { GitHubDashboardModal } from './GitHubDashboardModal'
@@ -64,6 +65,8 @@ function resolveEmptyDashboardCommand(command: string) {
   if (command === 'list_github_prs') return Promise.resolve([])
   if (command === 'list_dependabot_alerts') return Promise.resolve([])
   if (command === 'list_repository_advisories') return Promise.resolve([])
+  if (command === 'list_workflow_runs')
+    return Promise.resolve({ runs: [], failedCount: 0 })
   return Promise.resolve(null)
 }
 
@@ -158,5 +161,67 @@ describe('GitHubDashboardModal auth error handling', () => {
     expect(
       await screen.findByTestId('gh-auth-error', {}, { timeout: 3000 })
     ).toBeInTheDocument()
+  })
+
+  it('shows the workflows dashboard with per-project summaries', async () => {
+    mockInvoke.mockImplementation((command: string) => {
+      if (command === 'list_workflow_runs') {
+        return Promise.resolve({
+          runs: [
+            {
+              databaseId: 3,
+              name: 'deploy',
+              displayTitle: 'Deploy production',
+              status: 'in_progress',
+              conclusion: null,
+              event: 'push',
+              headBranch: 'main',
+              createdAt: '2026-07-03T09:30:00Z',
+              url: 'https://github.com/acme/project/actions/runs/3',
+              workflowName: 'Deploy',
+            },
+            {
+              databaseId: 2,
+              name: 'test',
+              displayTitle: 'Test suite',
+              status: 'completed',
+              conclusion: 'failure',
+              event: 'push',
+              headBranch: 'main',
+              createdAt: '2026-07-03T09:00:00Z',
+              url: 'https://github.com/acme/project/actions/runs/2',
+              workflowName: 'CI',
+            },
+            {
+              databaseId: 1,
+              name: 'build',
+              displayTitle: 'Build app',
+              status: 'completed',
+              conclusion: 'success',
+              event: 'push',
+              headBranch: 'main',
+              createdAt: '2026-07-03T08:30:00Z',
+              url: 'https://github.com/acme/project/actions/runs/1',
+              workflowName: 'Build',
+            },
+          ],
+          failedCount: 1,
+        })
+      }
+      return resolveEmptyDashboardCommand(command)
+    })
+
+    const user = userEvent.setup()
+    renderDashboard()
+
+    await user.click(screen.getByRole('button', { name: /Workflows/i }))
+
+    expect(
+      await screen.findByText('Deploy', {}, { timeout: 3000 })
+    ).toBeInTheDocument()
+    expect(screen.getByText('1 running')).toBeInTheDocument()
+    expect(screen.getByText('1 failed')).toBeInTheDocument()
+    expect(screen.getByText('1 success')).toBeInTheDocument()
+    expect(screen.getByText('Open runs')).toBeInTheDocument()
   })
 })
