@@ -3447,8 +3447,6 @@ export function ChatWindow({
                                   handleOpenProjectSettings
                                 }
                                 onRunCommand={handleRunCommand}
-                                remoteServerId={remoteServerId}
-                                onRemoteServerChange={setRemoteServerId}
                               />
                             </div>
                           </form>

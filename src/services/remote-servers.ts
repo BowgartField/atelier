@@ -63,9 +63,13 @@ async function connectAndRegister(
       connection.token
     )
   } catch (error) {
-    await invoke('disconnect_remote_server', { serverId }).catch(
-      () => undefined
-    )
+    // Tunnel opened but the webview transport failed to register. Tear the
+    // tunnel down and mark the server errored so status polling doesn't keep
+    // repainting the card as connected.
+    await invoke('report_remote_connection_failure', {
+      serverId,
+      error: error instanceof Error ? error.message : String(error),
+    }).catch(() => undefined)
     throw error
   }
   queryClient.setQueriesData<RemoteServerConfig[]>(

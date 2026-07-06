@@ -288,6 +288,15 @@ pub fn disconnect(server_id: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Tear down the tunnel and mark the server as errored. Used when the SSH tunnel
+/// came up but the desktop webview could not establish its data channel — the
+/// tunnel is healthy from Rust's view, so a plain disconnect would report
+/// `Disconnected` and status polling would repaint the card as connected.
+pub fn mark_connection_failed(server_id: &str, error: String) {
+    let _ = remove_tunnel(server_id, true);
+    set_runtime_status(server_id, RemoteServerStatus::Error, Some(error));
+}
+
 pub fn forget(server_id: &str) {
     let _ = remove_tunnel(server_id, true);
     RUNTIME_STATES.lock().unwrap().remove(server_id);

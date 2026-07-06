@@ -240,14 +240,18 @@ fn artifact_dir(app: &AppHandle, server_id: &str) -> Result<PathBuf, String> {
 }
 
 async fn download_release(
+    app: &AppHandle,
+    server_id: &str,
     architecture: &str,
     requested_version: &str,
 ) -> Result<(String, Vec<u8>), String> {
     let manifest_url = format!(
         "https://github.com/{JEAN_REPO}/releases/download/v{requested_version}/latest.json"
     );
+    // No overall timeout: large artifacts on slow links would otherwise abort
+    // mid-download. A read timeout guards against a genuinely stalled socket.
     let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(180))
+        .read_timeout(Duration::from_secs(60))
         .user_agent(format!("Jean/{}", env!("CARGO_PKG_VERSION")))
         .build()
         .map_err(|e| format!("Failed to create download client: {e}"))?;
@@ -273,17 +277,52 @@ async fn download_release(
         .platforms
         .get(key)
         .ok_or_else(|| format!("Jean release has no artifact for {key}"))?;
-    let bytes = client
+    let mut response = client
         .get(&platform.url)
         .send()
         .await
         .map_err(|e| format!("Failed to download Jean artifact: {e}"))?
         .error_for_status()
-        .map_err(|e| format!("Jean artifact request failed: {e}"))?
-        .bytes()
+        .map_err(|e| format!("Jean artifact request failed: {e}"))?;
+
+    // Stream the artifact so the UI shows real progress instead of freezing on
+    // "Downloading Jean release" for the whole (100+ MB) transfer. Map bytes to
+    // the 35..=58% slice of the overall provisioning bar.
+    let total = response.content_length().filter(|len| *len > 0);
+    let mut bytes = Vec::with_capacity(total.unwrap_or(0) as usize);
+    let mut last_percent = 35u8;
+    let mut last_logged_mb = 0u64;
+    while let Some(chunk) = response
+        .chunk()
         .await
         .map_err(|e| format!("Failed to read Jean artifact: {e}"))?
-        .to_vec();
+    {
+        bytes.extend_from_slice(&chunk);
+        let downloaded = bytes.len() as u64;
+        let downloaded_mb = downloaded / 1_048_576;
+        if let Some(total) = total {
+            let percent = (35 + downloaded.saturating_mul(23) / total).min(58) as u8;
+            if percent != last_percent {
+                last_percent = percent;
+                emit_progress(
+                    app,
+                    server_id,
+                    "downloading_release",
+                    &format!("Downloading Jean release ({downloaded_mb}/{} MB)", total / 1_048_576),
+                    percent,
+                );
+            }
+        }
+        if downloaded_mb >= last_logged_mb + 10 {
+            last_logged_mb = downloaded_mb;
+            emit_log(
+                app,
+                server_id,
+                "system",
+                &format!("Downloaded {downloaded_mb} MB"),
+            );
+        }
+    }
     verify_artifact(&bytes, &platform.signature)?;
 
     Ok((manifest.version, bytes))
@@ -300,6 +339,11 @@ Wants=network-online.target
 Type=simple
 User={username}
 Environment=APPIMAGE_EXTRACT_AND_RUN=1
+# The desktop webview (origin tauri://localhost / https://tauri.localhost)
+# reaches this backend cross-origin through the loopback SSH tunnel. Allow any
+# origin so its fetch/WebSocket handshake is not blocked by CORS — the server
+# still binds 127.0.0.1 only and requires the token on every request.
+Environment=JEAN_ALLOWED_ORIGINS=*
 ExecStart={launch_command}
 Restart=on-failure
 RestartSec=3
@@ -475,7 +519,8 @@ pub async fn provision(
         "system",
         &format!("Selecting release artifact for {architecture}"),
     );
-    let (version, archive_bytes) = download_release(&architecture, requested_version).await?;
+    let (version, archive_bytes) =
+        download_release(app, &server.id, &architecture, requested_version).await?;
     emit_log(
         app,
         &server.id,
@@ -617,5 +662,7 @@ mod tests {
         assert!(unit.contains("User=jean"));
         assert!(unit.contains("--host 127.0.0.1 --port 3456 --token secret"));
         assert!(unit.contains("APPIMAGE_EXTRACT_AND_RUN=1"));
+        // Cross-origin CORS must be allowed for the desktop webview tunnel.
+        assert!(unit.contains("Environment=JEAN_ALLOWED_ORIGINS=*"));
     }
 }

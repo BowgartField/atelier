@@ -339,6 +339,21 @@ pub async fn provision_remote_server(
         }
     };
 
+    // Read the token back from the remote service file so we persist the value
+    // the service is actually running with, not just the one we generated. Falls
+    // back to the generated token if the read-back fails.
+    let app_for_readback = app.clone();
+    let server_for_readback = server.clone();
+    let readback_token = tokio::task::spawn_blocking(move || {
+        inspect_remote_installation(&app_for_readback, &server_for_readback)
+    })
+    .await
+    .ok()
+    .and_then(Result::ok)
+    .flatten()
+    .map(|(_, token)| token);
+    let token = readback_token.unwrap_or(token);
+
     let persist_result = async {
         let mut preferences = crate::load_preferences(app.clone()).await?;
         let stored = preferences
@@ -348,7 +363,9 @@ pub async fn provision_remote_server(
             .ok_or_else(|| format!("Remote server was removed during provisioning: {server_id}"))?;
         stored.http_token = Some(token);
         stored.installed_version = Some(result.version.clone());
-        stored.status = RemoteServerStatus::Disconnected;
+        // Provisioning verified SSH end to end; the server is reachable (and now
+        // provisioned) even though no tunnel is open yet.
+        stored.status = RemoteServerStatus::Reachable;
         crate::save_preferences(app, preferences).await
     }
     .await;
@@ -359,7 +376,7 @@ pub async fn provision_remote_server(
         tunnel::set_runtime_status(&server_id, RemoteServerStatus::Error, Some(error.clone()));
         return Err(error);
     }
-    tunnel::set_runtime_status(&server_id, RemoteServerStatus::Disconnected, None);
+    tunnel::set_runtime_status(&server_id, RemoteServerStatus::Reachable, None);
     Ok(result)
 }
 
@@ -384,7 +401,7 @@ async fn resync_remote_token(
         return Ok(None);
     };
     if server.http_token.as_deref() == Some(token.as_str()) {
-        // Token already matches — the 401 is not caused by a stale local token.
+        // Stored token already matches the remote — nothing to persist.
         return Ok(None);
     }
 
@@ -414,10 +431,17 @@ pub async fn connect_remote_server(
     let server = load_server(&app, &server_id).await?;
     // The remote service file is the source of truth for the token. Re-sync it
     // before connecting so a re-provisioned/rotated token (or a server that was
-    // provisioned outside this install) can't leave us with a stale one.
-    let server = resync_remote_token(&app, &server)
-        .await?
-        .unwrap_or(server);
+    // provisioned outside this install) can't leave us with a stale one. A failed
+    // inspection is non-fatal — fall back to the stored token and let the tunnel
+    // health check surface any real mismatch.
+    let server = match resync_remote_token(&app, &server).await {
+        Ok(Some(updated)) => updated,
+        Ok(None) => server,
+        Err(error) => {
+            log::warn!("Remote token re-sync failed before connect: {error}");
+            server
+        }
+    };
     tunnel::connect(&app, &server).await.map_err(|error| {
         if error.contains("401") {
             format!(
@@ -434,6 +458,18 @@ pub async fn connect_remote_server(
 #[tauri::command]
 pub async fn disconnect_remote_server(server_id: String) -> Result<(), String> {
     tunnel::disconnect(&server_id)
+}
+
+/// Called by the frontend when it opened the tunnel but failed to register the
+/// remote WebSocket transport. Tears the tunnel down and marks the server
+/// errored so status polling stops reporting it as connected.
+#[tauri::command]
+pub async fn report_remote_connection_failure(
+    server_id: String,
+    error: String,
+) -> Result<(), String> {
+    tunnel::mark_connection_failed(&server_id, error);
+    Ok(())
 }
 
 #[tauri::command]

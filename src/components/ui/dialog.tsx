@@ -100,10 +100,21 @@ const DialogContent = React.forwardRef<
           }
           onEscapeKeyDownProp?.(e)
         }}
-        onInteractOutside={preventClose ? e => e.preventDefault() : undefined}
+        onInteractOutside={e => {
+          const target = e.target as HTMLElement | null
+          // Interacting with a toast (dismiss gesture or its close button)
+          // must not close the dialog — the toaster is a body-level portal, so
+          // Radix treats it as "outside".
+          if (preventClose || target?.closest?.('[data-sonner-toaster]')) {
+            e.preventDefault()
+          }
+        }}
         onPointerDownOutside={e => {
-          const target = e.target as HTMLElement
-          if (target?.closest?.('[data-tauri-drag-region]')) {
+          const target = e.target as HTMLElement | null
+          if (
+            target?.closest?.('[data-tauri-drag-region]') ||
+            target?.closest?.('[data-sonner-toaster]')
+          ) {
             e.preventDefault()
           }
         }}

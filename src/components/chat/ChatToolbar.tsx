@@ -133,8 +133,6 @@ export const ChatToolbar = memo(function ChatToolbar({
   onToggleMcpServer,
   onOpenProjectSettings,
   onRunCommand,
-  remoteServerId,
-  onRemoteServerChange,
 }: ChatToolbarProps) {
   const {
     statuses: mcpStatuses,

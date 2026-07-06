@@ -4578,6 +4578,7 @@ pub fn run() {
             remote::provision_remote_server,
             remote::connect_remote_server,
             remote::disconnect_remote_server,
+            remote::report_remote_connection_failure,
             remote::get_remote_server_status,
             remote::check_remote_server_health,
             remote::clone_project_to_remote,

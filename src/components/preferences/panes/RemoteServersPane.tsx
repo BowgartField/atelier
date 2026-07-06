@@ -695,6 +695,8 @@ export function RemoteServersPane() {
                   ? 'connecting'
                   : (server.status ?? 'disconnected')
               const connected = status === 'connected'
+              // SSH verified (reachable or a live tunnel) — enough to provision.
+              const sshReady = status === 'reachable' || connected
               const backendConnected = connected && !!server.http_token
               const globallyBusy = isBusy(server)
               const versionMismatch =
@@ -810,7 +812,7 @@ export function RemoteServersPane() {
                         size="sm"
                         onClick={() => setProvisionTarget(server)}
                         disabled={
-                          globallyBusy || !connected || backendConnected
+                          globallyBusy || !sshReady || backendConnected
                         }
                       >
                         <ShieldCheck />

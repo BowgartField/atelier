@@ -689,6 +689,7 @@ export function MainWindow() {
         expand={true}
         swipeDirections={['left', 'right', 'top', 'bottom']}
         style={{ '--width': '400px' } as CSSProperties}
+        closeButton
         toastOptions={{
           classNames: {
             toast:

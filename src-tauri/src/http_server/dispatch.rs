@@ -160,6 +160,13 @@ pub async fn dispatch_command(
             emit_cache_invalidation(app, &["remote-servers"]);
             Ok(Value::Null)
         }
+        "report_remote_connection_failure" => {
+            let server_id: String = field(&args, "serverId", "server_id")?;
+            let error: String = from_field(&args, "error")?;
+            crate::remote::report_remote_connection_failure(server_id, error).await?;
+            emit_cache_invalidation(app, &["remote-servers"]);
+            Ok(Value::Null)
+        }
         "get_remote_server_status" => {
             let server_id: String = field(&args, "serverId", "server_id")?;
             let result = crate::remote::get_remote_server_status(app.clone(), server_id).await?;
