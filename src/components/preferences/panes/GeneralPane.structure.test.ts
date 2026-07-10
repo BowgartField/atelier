@@ -29,4 +29,19 @@ describe('GeneralPane settings structure', () => {
     expect(grokSection).not.toContain('Check auth')
     expect(grokSection).not.toContain('grokCliQueryKeys.auth()')
   })
+
+  it('renders build and yolo reasoning overrides from model capabilities', () => {
+    const source = readFileSync(
+      'src/components/preferences/panes/GeneralPane.tsx',
+      'utf8'
+    )
+    const executionOverrides = source.slice(
+      source.indexOf('Build execution'),
+      source.indexOf('AI Language')
+    )
+
+    expect(executionOverrides).toContain('buildReasoning.levels.map')
+    expect(executionOverrides).toContain('yoloReasoning.levels.map')
+    expect(executionOverrides).not.toContain('? codexReasoningOptions')
+  })
 })
