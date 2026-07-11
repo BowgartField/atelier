@@ -1107,7 +1107,7 @@ fn fail_connection(
 
     // Notify all active sessions
     let sessions = active_sessions.lock().unwrap();
-    for (_tid, ctx) in sessions.iter() {
+    for ctx in sessions.values() {
         let _ = ctx.event_tx.send(ServerEvent::ServerDied);
     }
     drop(sessions);
@@ -1173,7 +1173,7 @@ fn route_notification(active_sessions: &ActiveSessions, method: String, params: 
         // Broadcast to all sessions (global notifications)
         log::trace!("Broadcasting notification without threadId: {method}");
         let sessions = active_sessions.lock().unwrap();
-        for (_tid, ctx) in sessions.iter() {
+        for ctx in sessions.values() {
             let _ = ctx.event_tx.send(ServerEvent::Notification {
                 method: method.clone(),
                 params: params.clone(),
