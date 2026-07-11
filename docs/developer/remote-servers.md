@@ -174,6 +174,63 @@ dispatch. Install Lima with `brew install lima` first and build the local debug
 Jean binary. The test reuses an existing `jean-remote-provision-test` VM when
 present; otherwise it creates an ephemeral VM and deletes it afterward.
 
+## Testing the PR manually with Lima
+
+The automated `test:remote-provision` script drives the whole flow headlessly.
+To exercise the real UI end to end against a local Linux VM, use the Lima VM but
+provision and connect from the running app instead.
+
+Prerequisites (macOS):
+
+- `brew install lima`
+- A running Jean dev app (`bun run tauri:dev`), or the built debug binary.
+
+Steps:
+
+1. **Boot the VM.** Run `bun run test:remote-provision:spinup`. It creates (or
+   reuses) the `jean-remote-provision-test` Lima VM and prints the SSH
+   coordinates it leaves running:
+
+   ```text
+   Host:          127.0.0.1
+   Port:          <sshLocalPort>
+   User:          <your lima user>
+   Identity file: <path to lima id_ed25519>
+   ```
+
+2. **Add the server.** In the app open Preferences → Remote Servers → Add
+   Server. Enter the printed host, port, and user, choose SSH key auth, and
+   point it at the printed identity file. Adding it runs an SSH test; the card
+   should move to `connecting`/`connected` and report the detected OS and
+   architecture.
+
+3. **Provision.** Use the server card's provision action and pick a Jean
+   version matching your desktop build (omit to use the desktop version). The
+   provisioning modal shows the step timeline and live logs: package install,
+   signed AppImage download, `scp` upload, and `jean-remote.service` install.
+   It reports success only after `/api/auth` responds.
+
+4. **Connect.** Once provisioned the app opens the SSH tunnel, registers the
+   remote WebSocket transport, and discovers projects registered on that
+   backend. The server card shows `connected` and its installed AI CLIs.
+
+5. **Clone a repo.** Clone a project onto the connected server. Use an
+   SSH-style git URL that resolves through your local SSH config — agent
+   forwarding lets the remote git authenticate without copying your key. The
+   cloned project appears tagged with the server ID.
+
+6. **Create a remote worktree + session.** Add a new worktree targeting the
+   connected server, open a session, and send a message. Verify the session
+   runs on the remote backend (send, cancel, close, archive, resume all route
+   to the server) and that streaming output arrives over the tunnel.
+
+7. **Recovery (optional).** Kill the SSH child (`pkill -f "ssh -N -L"`) or
+   restart the app; the tunnel should be recreated on a new local port and the
+   remote worktrees should reappear without being recreated.
+
+8. **Clean up.** Remove the server in the UI, then delete the VM:
+   `limactl delete --force jean-remote-provision-test`.
+
 ## Commands
 
 - `add_remote_server`
