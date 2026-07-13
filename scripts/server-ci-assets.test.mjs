@@ -7,15 +7,20 @@ const read = path => readFileSync(path, 'utf8')
 test('server release workflow builds binaries and publishes docker image', () => {
   const workflow = read('.github/workflows/server-release.yml')
 
-  assert.match(workflow, /name: Verify CI build/)
-  assert.match(workflow, /workflow_id: 'ci-build\.yml'/)
-  assert.match(workflow, /head_sha: commit\.sha/)
-  assert.match(workflow, /needs: \[metadata, verify-ci\]/)
+  assert.doesNotMatch(workflow, /workflow_id: 'ci-build\.yml'/)
+  assert.match(workflow, /needs: metadata/)
   assert.match(workflow, /cd src-server && cargo build --release/)
   assert.match(workflow, /jean-server-linux-amd64/)
   assert.match(workflow, /jean-server-linux-arm64/)
   assert.match(workflow, /docker\/build-push-action@v6/)
   assert.match(workflow, /ghcr\.io/)
+})
+
+test('native release workflow does not require a previous CI build', () => {
+  const workflow = read('.github/workflows/release.yml')
+
+  assert.doesNotMatch(workflow, /workflow_id: 'ci-build\.yml'/)
+  assert.match(workflow, /needs: prepare-release/)
 })
 
 test('Dockerfile builds and runs jean-server headlessly as non-root user', () => {
