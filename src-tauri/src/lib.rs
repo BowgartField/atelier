@@ -3592,11 +3592,38 @@ fn create_app_menu(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error
     Ok(())
 }
 
-/// Fix PATH environment for macOS GUI applications.
+/// Parse the shell environment values emitted by `fix_macos_path`.
+fn parse_macos_shell_environment(stdout: &[u8]) -> Option<(String, Option<String>)> {
+    let separator = stdout.iter().position(|byte| *byte == 0)?;
+    let path = String::from_utf8_lossy(&stdout[..separator])
+        .trim()
+        .to_string();
+    if path.is_empty() {
+        return None;
+    }
+
+    // Filter out /Volumes/ paths to avoid macOS TCC permission dialogs for
+    // removable volumes (mounted DMGs, USB drives, network shares).
+    let filtered_path = path
+        .split(':')
+        .filter(|entry| !entry.contains("/Volumes/"))
+        .collect::<Vec<_>>()
+        .join(":");
+    let ssh_auth_sock = String::from_utf8_lossy(&stdout[separator + 1..])
+        .trim()
+        .to_string();
+
+    Some((
+        filtered_path,
+        (!ssh_auth_sock.is_empty()).then_some(ssh_auth_sock),
+    ))
+}
+
+/// Fix subprocess environment for macOS GUI applications.
 ///
-/// macOS GUI apps launched from Finder/Spotlight don't inherit the user's shell PATH.
-/// This function spawns a login + interactive shell to capture PATH from all config
-/// files including .zshrc where tools like bun, nvm add their PATH entries.
+/// macOS GUI apps launched from Finder/Spotlight don't inherit the user's shell PATH
+/// or SSH agent socket. This function spawns a login + interactive shell to capture
+/// both values from config files including `.zshrc`.
 #[cfg(target_os = "macos")]
 pub fn fix_macos_path() {
     use std::process::Command;
@@ -3606,29 +3633,29 @@ pub fn fix_macos_path() {
 
     // Spawn a login (-l) + interactive (-i) shell to source all config files
     // including .zshrc where tools like bun, nvm add their PATH entries.
-    // Use `printenv PATH` instead of `echo $PATH` because fish shell prints
-    // $PATH as space-separated (it's a list in fish), while printenv always
-    // outputs the raw colon-separated environment variable.
+    // Use `printenv` instead of shell expansion because fish represents PATH as
+    // a list. A NUL separator keeps the optional SSH_AUTH_SOCK unambiguous.
     //
     // NOTE: Uses Command::new() directly instead of silent_command() to avoid
     // recursion — silent_command() calls ensure_macos_path() which calls this.
     let output = Command::new(&shell)
-        .args(["-l", "-i", "-c", "/usr/bin/printenv PATH"])
+        .args([
+            "-l",
+            "-i",
+            "-c",
+            "/usr/bin/printenv PATH; /usr/bin/printf '\\0'; /usr/bin/printenv SSH_AUTH_SOCK; exit 0",
+        ])
         .output();
 
     if let Ok(output) = output {
         if output.status.success() {
-            let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if !path.is_empty() {
-                // Filter out /Volumes/ paths to avoid macOS TCC permission dialogs
-                // for removable volumes (mounted DMGs, USB drives, network shares)
-                // when Claude CLI or other subprocesses inherit this PATH
-                let filtered_path: String = path
-                    .split(':')
-                    .filter(|p| !p.contains("/Volumes/"))
-                    .collect::<Vec<_>>()
-                    .join(":");
+            if let Some((filtered_path, ssh_auth_sock)) =
+                parse_macos_shell_environment(&output.stdout)
+            {
                 std::env::set_var("PATH", &filtered_path);
+                if let Some(ssh_auth_sock) = ssh_auth_sock {
+                    std::env::set_var("SSH_AUTH_SOCK", ssh_auth_sock);
+                }
             }
         }
     }
@@ -3851,6 +3878,28 @@ mod magic_prompt_tests {
     use super::*;
 
     #[test]
+    fn parses_macos_path_and_ssh_agent_socket() {
+        let parsed = parse_macos_shell_environment(
+            b"/usr/bin:/Volumes/Jean/bin:/opt/homebrew/bin\0/private/tmp/agent.sock\n",
+        );
+
+        assert_eq!(
+            parsed,
+            Some((
+                "/usr/bin:/opt/homebrew/bin".to_string(),
+                Some("/private/tmp/agent.sock".to_string()),
+            ))
+        );
+    }
+
+    #[test]
+    fn preserves_a_missing_optional_ssh_agent_socket() {
+        let parsed = parse_macos_shell_environment(b"/usr/bin:/bin\0\n");
+
+        assert_eq!(parsed, Some(("/usr/bin:/bin".to_string(), None)));
+    }
+
+    #[test]
     fn app_preferences_enables_compact_chat_view_by_default() {
         assert!(AppPreferences::default().compact_chat_view_enabled);
     }
@@ -3939,7 +3988,7 @@ pub fn run() {
     let cli_args = parse_cli_args();
     let headless = cli_args.headless;
 
-    // macOS PATH fix is handled lazily on first silent_command() call via
+    // macOS PATH and SSH agent setup is handled lazily on first silent_command() call via
     // platform::ensure_macos_path(). No background thread needed — the Once guard
     // ensures the shell is spawned exactly once, blocking only the first CLI invocation.
 

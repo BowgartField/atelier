@@ -9,7 +9,7 @@ pub fn shell_escape(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
-/// Ensures macOS PATH has been fixed from the user's login shell.
+/// Ensures macOS PATH and SSH agent socket have been imported from the user's login shell.
 /// Uses `std::sync::Once` so the shell is only spawned on the first call.
 /// This must NOT call `silent_command()` internally to avoid recursion.
 #[cfg(target_os = "macos")]
@@ -55,7 +55,7 @@ pub fn detect_package_manager(binary_path: &std::path::Path) -> Option<String> {
 /// Use for all background operations (git, gh, claude CLI, etc.).
 /// Do NOT use for commands that intentionally open UI (terminals, editors, file explorers).
 pub fn silent_command<S: AsRef<std::ffi::OsStr>>(program: S) -> Command {
-    // Ensure macOS GUI app has the user's full PATH before spawning any subprocess.
+    // Ensure macOS GUI apps use the user's PATH and SSH agent before spawning subprocesses.
     // Lazy + cached via Once — only the first call pays the shell-spawn cost (~100-500ms).
     #[cfg(target_os = "macos")]
     ensure_macos_path();
