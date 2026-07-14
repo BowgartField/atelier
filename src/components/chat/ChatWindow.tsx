@@ -1173,7 +1173,7 @@ export function ChatWindow({
   })
 
   // Drag and drop images into chat input
-  const { isDragging } = useDragAndDropImages(activeSessionId)
+  const { isDragging, droppedFilePaths, clearDroppedFilePaths } = useDragAndDropImages(activeSessionId)
 
   // State for file content modal (opened by clicking filenames in tool calls)
   const [viewingFilePath, setViewingFilePath] = useState<string | null>(null)
@@ -3376,6 +3376,8 @@ export function ChatWindow({
                                 inputRef={inputRef}
                                 installedBackends={installedBackends}
                                 selectedBackend={selectedBackend}
+                                droppedFilePaths={droppedFilePaths}
+                                onDroppedFilePathsConsumed={clearDroppedFilePaths}
                               />
                             </div>
 
