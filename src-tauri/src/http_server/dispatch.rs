@@ -1321,6 +1321,19 @@ pub async fn dispatch_command(
             emit_cache_invalidation(app, &["sessions"]);
             Ok(Value::Null)
         }
+        "revert_session_to_message" => {
+            let session_id: String = field(&args, "sessionId", "session_id")?;
+            let assistant_message_id: String =
+                field(&args, "assistantMessageId", "assistant_message_id")?;
+            let worktree_path: Option<String> =
+                field_opt(&args, "worktreePath", "worktree_path")?;
+            to_value(crate::chat::revert_session_to_message(
+                app.clone(),
+                session_id,
+                assistant_message_id,
+                worktree_path,
+            )?)
+        }
         "set_session_model" => {
             let worktree_id: String = field(&args, "worktreeId", "worktree_id")?;
             let worktree_path: String = field(&args, "worktreePath", "worktree_path")?;

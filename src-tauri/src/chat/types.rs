@@ -1419,6 +1419,9 @@ pub struct RunEntry {
     /// Grok headless session ID — persisted per-run for conversation continuity.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub grok_session_id: Option<String>,
+    /// Git patch (diff) of changes made during this run - for revert functionality
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_patch: Option<String>,
 }
 
 impl RunEntry {

@@ -2799,6 +2799,7 @@ pub async fn send_chat_message(
         &app,
         &session_id,
         &worktree_id,
+        &worktree_path,
         &session_name,
         session_order,
         &user_message_id,
@@ -4981,6 +4982,23 @@ pub async fn clear_session_history(
             Err(format!("Session not found: {session_id}"))
         }
     })
+}
+
+/// Revert a session to a specific assistant message, removing subsequent runs.
+/// When a worktree path is supplied, captured Git patches are applied in reverse.
+#[tauri::command]
+pub fn revert_session_to_message(
+    app: AppHandle,
+    session_id: String,
+    assistant_message_id: String,
+    worktree_path: Option<String>,
+) -> Result<u32, String> {
+    super::run_log::truncate_session_to_message(
+        &app,
+        &session_id,
+        &assistant_message_id,
+        worktree_path.as_deref(),
+    )
 }
 
 /// Set the selected model for a session
