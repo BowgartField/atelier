@@ -115,11 +115,14 @@ import { FilePreview } from './FilePreview'
 import { ContextPreview } from './ContextPreview'
 import { getLinkedPrContextPreviewExclusion } from './context-preview-utils'
 import { ChatInput } from './ChatInput'
+import { ScheduleForResetButton } from './ScheduleForResetButton'
+import { useScheduledPrompts } from '@/services/scheduled-prompts'
 import { SessionDebugPanel } from './SessionDebugPanel'
 import { ChatToolbar } from './ChatToolbar'
 import { ReviewResultsPanel } from './ReviewResultsPanel'
 import { ReviewMethodModal } from './ReviewMethodModal'
 import { QueuedPromptsPanel } from './QueuedPromptsPanel'
+import { ScheduledPromptsPanel } from './ScheduledPromptsPanel'
 import { useQueuedPromptActions } from './hooks/useQueuedPromptActions'
 import { FloatingButtons } from './FloatingButtons'
 import { PlanDialog } from './PlanDialog'
@@ -984,6 +987,10 @@ export function ChatWindow({
       ? (state.messageQueues[deferredSessionId] ?? EMPTY_QUEUED_MESSAGES)
       : EMPTY_QUEUED_MESSAGES
   )
+  const { data: scheduledPromptsData } = useScheduledPrompts()
+  const hasScheduledForSession =
+    !!activeSessionId &&
+    (scheduledPromptsData ?? []).some(p => p.sessionId === activeSessionId)
   // Per-session pending permission denials (uses deferredSessionId for content consistency)
   const pendingDenials = useChatStore(state =>
     deferredSessionId
@@ -3205,7 +3212,13 @@ export function ChatWindow({
                     <div className="bg-background">
                       <div className="mx-auto max-w-7xl">
                         <div className="relative sm:mx-auto sm:mb-3 sm:max-w-3xl xl:max-w-4xl">
-                          {/* Queued prompts - rendered as an extension above the chat input */}
+                          {/* Scheduled + queued prompts - rendered as an extension above the chat input */}
+                          {activeSessionId && (
+                            <ScheduledPromptsPanel
+                              key={`scheduled-${activeSessionId}`}
+                              sessionId={activeSessionId}
+                            />
+                          )}
                           {activeSessionId &&
                             currentQueuedMessages.length > 0 && (
                               <QueuedPromptsPanel
@@ -3225,7 +3238,8 @@ export function ChatWindow({
                             className={cn(
                               'relative overflow-hidden border-t border-border bg-card transition-[background-color,box-shadow] duration-150 sm:rounded-lg sm:border',
                               activeSessionId &&
-                                currentQueuedMessages.length > 0 &&
+                                (currentQueuedMessages.length > 0 ||
+                                  hasScheduledForSession) &&
                                 'sm:rounded-t-none',
                               isDragging &&
                                 'ring-2 ring-primary ring-inset bg-primary/5'
@@ -3379,6 +3393,21 @@ export function ChatWindow({
                                 droppedFilePaths={droppedFilePaths}
                                 onDroppedFilePathsConsumed={clearDroppedFilePaths}
                               />
+                              <div className="mt-1 flex justify-end">
+                                <ScheduleForResetButton
+                                  sessionId={activeSessionId}
+                                  worktreeId={activeWorktreeId ?? null}
+                                  worktreePath={activeWorktreePath}
+                                  backend={selectedBackend}
+                                  model={selectedModel}
+                                  getPromptText={() =>
+                                    inputRef.current?.value ?? ''
+                                  }
+                                  onScheduled={() =>
+                                    clearChatInputStateRef.current?.()
+                                  }
+                                />
+                              </div>
                             </div>
 
                             {/* Bottom toolbar */}
