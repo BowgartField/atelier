@@ -494,22 +494,9 @@ fn find_unique_branch_name(repo_path: &str, base_name: &str) -> Result<String, S
 
 /// Fetch a branch from remote without merging (safe, no conflict risk)
 pub fn git_fetch(repo_path: &str, branch: &str, remote: Option<&str>) -> Result<(), String> {
-    let remote = remote.unwrap_or("origin");
-    log::trace!("Fetching {remote}/{branch} in {repo_path}");
-
-    let output = wsl_aware_command("git", Some(Path::new(repo_path)))
-        .args(["fetch", remote, branch])
-        .output()
-        .map_err(|e| format!("Failed to run git fetch: {e}"))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-        log::error!("Failed to fetch {remote}/{branch}: {stderr}");
-        return Err(stderr);
-    }
-
-    log::trace!("Successfully fetched {remote}/{branch}");
-    Ok(())
+    crate::backend_runtime::git_service()
+        .fetch(repo_path, branch, remote)
+        .map_err(|error| error.to_string())
 }
 
 /// Result of a PR-aware push operation
@@ -900,33 +887,16 @@ pub fn fetch_pr_to_branch(
     pr_number: u32,
     local_branch: &str,
 ) -> Result<(), String> {
-    let refspec = format!("pull/{pr_number}/head:{local_branch}");
-    let output = wsl_aware_command("git", Some(Path::new(repo_path)))
-        .args(["fetch", "origin", &refspec])
-        .output()
-        .map_err(|e| format!("Failed to fetch PR #{pr_number}: {e}"))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!(
-            "Failed to fetch PR #{pr_number} into {local_branch}: {stderr}"
-        ));
-    }
-    Ok(())
+    crate::backend_runtime::git_service()
+        .fetch_pr_to_branch(repo_path, pr_number, local_branch)
+        .map_err(|error| error.to_string())
 }
 
 /// Checkout an existing branch in a worktree
 pub fn checkout_branch(worktree_path: &str, branch: &str) -> Result<(), String> {
-    let output = wsl_aware_command("git", Some(Path::new(worktree_path)))
-        .args(["checkout", branch])
-        .output()
-        .map_err(|e| format!("Failed to checkout branch {branch}: {e}"))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("Failed to checkout branch {branch}: {stderr}"));
-    }
-    Ok(())
+    crate::backend_runtime::git_service()
+        .checkout_branch(worktree_path, branch)
+        .map_err(|error| error.to_string())
 }
 
 /// # Arguments
@@ -996,55 +966,13 @@ pub fn delete_branch(repo_path: &str, branch_name: &str) -> Result<(), String> {
 /// Find which worktree (if any) has a given branch checked out.
 /// Parses `git worktree list --porcelain` output. Returns the worktree path or None.
 pub fn find_worktree_for_branch(repo_path: &str, branch: &str) -> Option<String> {
-    let output = wsl_aware_command("git", Some(Path::new(repo_path)))
-        .args(["worktree", "list", "--porcelain"])
-        .output()
-        .ok()?;
-
-    if !output.status.success() {
-        return None;
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let target_ref = format!("refs/heads/{branch}");
-    let mut current_path: Option<String> = None;
-
-    for line in stdout.lines() {
-        if let Some(path) = line.strip_prefix("worktree ") {
-            current_path = Some(path.to_string());
-        } else if let Some(branch_ref) = line.strip_prefix("branch ") {
-            if branch_ref == target_ref {
-                return current_path;
-            }
-        } else if line.is_empty() {
-            current_path = None;
-        }
-    }
-
-    None
+    crate::backend_runtime::git_service().find_worktree_for_branch(repo_path, branch)
 }
 
 /// Clean up a stale branch that may be checked out in a defunct worktree.
 /// Used before PR checkout to handle archived/deleted worktrees whose branch still exists.
 pub fn cleanup_stale_branch(repo_path: &str, branch: &str) {
-    log::trace!("Cleaning up stale branch '{branch}' in {repo_path}");
-
-    // Prune worktrees whose directories no longer exist
-    let _ = wsl_aware_command("git", Some(Path::new(repo_path)))
-        .args(["worktree", "prune"])
-        .output();
-
-    // If branch is checked out in a worktree, remove that worktree first
-    if let Some(wt_path) = find_worktree_for_branch(repo_path, branch) {
-        log::trace!("Branch '{branch}' is checked out at '{wt_path}', removing worktree");
-        let _ = remove_worktree(repo_path, &wt_path);
-    }
-
-    // Delete the branch
-    if branch_exists(repo_path, branch) {
-        log::trace!("Deleting stale branch '{branch}'");
-        let _ = delete_branch(repo_path, branch);
-    }
+    crate::backend_runtime::git_service().cleanup_stale_branch(repo_path, branch);
 }
 
 /// List existing worktrees for a repository

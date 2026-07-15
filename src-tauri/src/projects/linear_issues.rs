@@ -5,8 +5,7 @@ use std::path::{Path, PathBuf};
 use tauri::AppHandle;
 
 use super::github_issues::{
-    get_github_contexts_dir, load_context_references, save_context_references, slugify_issue_title,
-    IssueContext,
+    get_github_contexts_dir, load_context_references, save_context_references, IssueContext,
 };
 use super::storage::load_projects_data;
 
@@ -153,9 +152,7 @@ pub fn parse_linear_identifier_number(identifier: &str) -> u32 {
 
 /// Generate branch name from Linear issue identifier and title
 pub fn generate_branch_name_from_linear_issue(identifier: &str, title: &str) -> String {
-    let slug = slugify_issue_title(title);
-    let id = identifier.to_lowercase();
-    format!("linear-{id}-{slug}")
+    jean_core::generate_branch_name_from_linear_issue(identifier, title)
 }
 
 /// Convert a LinearIssueDetail to the shared IssueContext for create_worktree

@@ -8,6 +8,7 @@ pub mod error;
 pub mod events;
 pub mod git;
 pub mod git_status;
+pub mod names;
 pub mod paths;
 pub mod persistence;
 pub mod projects;
@@ -24,9 +25,12 @@ pub use config::{
 pub use contexts::{
     format_advisory_context_markdown, format_issue_context_markdown,
     format_linear_context_markdown, format_pr_context_markdown, format_security_context_markdown,
-    AdvisoryContext, AdvisoryVulnerability, ContextRef, ContextReferences, ContextService,
-    GitHubAuthor, GitHubComment, GitHubReview, IssueContext, LinearComment, LinearIssueContext,
-    LinearUser, PrDiffLoader, PullRequestContext, SecurityAlertContext, WorktreeContexts,
+    generate_branch_name_from_advisory, generate_branch_name_from_issue,
+    generate_branch_name_from_linear_issue, generate_branch_name_from_pr,
+    generate_branch_name_from_security_alert, slugify_issue_title, AdvisoryContext,
+    AdvisoryVulnerability, ContextRef, ContextReferences, ContextService, GitHubAuthor,
+    GitHubComment, GitHubReview, IssueContext, LinearComment, LinearIssueContext, LinearUser,
+    PrDiffLoader, PullRequestContext, SecurityAlertContext, WorktreeContexts,
 };
 pub use error::{BackendError, BackendErrorCode};
 pub use events::{EventSink, ServerEventSink, WsBroadcaster, WsEvent};

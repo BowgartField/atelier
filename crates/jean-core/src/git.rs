@@ -397,6 +397,72 @@ impl GitService {
         }
     }
 
+    pub fn fetch(
+        self,
+        repo_path: &str,
+        branch: &str,
+        remote: Option<&str>,
+    ) -> Result<(), BackendError> {
+        self.ok(
+            Path::new(repo_path),
+            &["fetch", remote.unwrap_or("origin"), branch],
+            "git fetch",
+        )
+    }
+
+    pub fn fetch_pr_to_branch(
+        self,
+        repo_path: &str,
+        pr_number: u32,
+        local_branch: &str,
+    ) -> Result<(), BackendError> {
+        let refspec = format!("pull/{pr_number}/head:{local_branch}");
+        self.ok(
+            Path::new(repo_path),
+            &["fetch", "origin", &refspec],
+            &format!("fetch PR #{pr_number} into {local_branch}"),
+        )
+    }
+
+    pub fn checkout_branch(self, worktree_path: &str, branch: &str) -> Result<(), BackendError> {
+        self.ok(
+            Path::new(worktree_path),
+            &["checkout", branch],
+            &format!("checkout branch {branch}"),
+        )
+    }
+
+    pub fn find_worktree_for_branch(self, repo_path: &str, branch: &str) -> Option<String> {
+        let output = self
+            .text_preserve(Path::new(repo_path), &["worktree", "list", "--porcelain"])
+            .ok()?;
+        let target_ref = format!("refs/heads/{branch}");
+        let mut current_path = None;
+        for line in output.lines() {
+            if let Some(path) = line.strip_prefix("worktree ") {
+                current_path = Some(path.to_string());
+            } else if let Some(branch_ref) = line.strip_prefix("branch ") {
+                if branch_ref == target_ref {
+                    return current_path;
+                }
+            } else if line.is_empty() {
+                current_path = None;
+            }
+        }
+        None
+    }
+
+    pub fn cleanup_stale_branch(self, repo_path: &str, branch: &str) {
+        let root = Path::new(repo_path);
+        let _ = self.run(root, &["worktree", "prune"]);
+        if let Some(worktree_path) = self.find_worktree_for_branch(repo_path, branch) {
+            let _ = self.remove_worktree(repo_path, &worktree_path);
+        }
+        if self.branch_exists(repo_path, branch) {
+            let _ = self.delete_branch(repo_path, branch);
+        }
+    }
+
     fn current_branch_with_fallback(self, path: &str) -> Result<String, BackendError> {
         self.current_branch(path)
             .or_else(|_| self.text(Path::new(path), &["rev-parse", "--abbrev-ref", "HEAD"]))

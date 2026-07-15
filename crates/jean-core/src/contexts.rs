@@ -139,6 +139,82 @@ pub struct WorktreeContexts {
     pub linear: Option<LinearIssueContext>,
 }
 
+pub fn slugify_issue_title(title: &str) -> String {
+    let slug = title
+        .to_lowercase()
+        .chars()
+        .map(|character| {
+            if character.is_alphanumeric() || character == ' ' {
+                character
+            } else {
+                ' '
+            }
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .take(5)
+        .collect::<Vec<_>>()
+        .join("-");
+    truncate_chars(&slug, 40).trim_end_matches('-').to_string()
+}
+
+pub fn generate_branch_name_from_issue(issue_number: u32, title: &str) -> String {
+    format!("issue-{issue_number}-{}", slugify_issue_title(title))
+}
+
+pub fn generate_branch_name_from_pr(pr_number: u32, title: &str) -> String {
+    format!("pr-{pr_number}-{}", slugify_issue_title(title))
+}
+
+pub fn generate_branch_name_from_security_alert(
+    alert_number: u32,
+    package_name: &str,
+    summary: &str,
+) -> String {
+    let package = package_name.replace('/', "-").replace('@', "");
+    let package = truncate_chars(&package, 20);
+    format!(
+        "security-{alert_number}-{package}-{}",
+        slugify_issue_title(summary)
+    )
+}
+
+pub fn generate_branch_name_from_advisory(ghsa_id: &str, summary: &str) -> String {
+    let slug = summary
+        .to_lowercase()
+        .chars()
+        .map(|character| {
+            if character.is_alphanumeric() {
+                character
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>()
+        .split('-')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("-");
+    let slug = truncate_chars(&slug, 40).trim_end_matches('-');
+    let ghsa = ghsa_id.strip_prefix("GHSA-").unwrap_or(ghsa_id);
+    format!("advisory-{ghsa}-{slug}")
+}
+
+pub fn generate_branch_name_from_linear_issue(identifier: &str, title: &str) -> String {
+    format!(
+        "linear-{}-{}",
+        identifier.to_lowercase(),
+        slugify_issue_title(title)
+    )
+}
+
+fn truncate_chars(value: &str, limit: usize) -> &str {
+    value
+        .char_indices()
+        .nth(limit)
+        .map_or(value, |(index, _)| &value[..index])
+}
+
 #[derive(Clone)]
 pub struct ContextService {
     persistence: Arc<PersistenceService>,

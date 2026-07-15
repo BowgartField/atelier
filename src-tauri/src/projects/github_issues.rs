@@ -362,35 +362,13 @@ pub async fn get_github_issue(
 /// Generate a slug from an issue title for branch naming
 /// e.g., "Fix the login bug" -> "fix-the-login-bug"
 pub fn slugify_issue_title(title: &str) -> String {
-    let slug: String = title
-        .to_lowercase()
-        .chars()
-        .map(|c| {
-            if c.is_alphanumeric() || c == ' ' {
-                c
-            } else {
-                ' '
-            }
-        })
-        .collect::<String>()
-        .split_whitespace()
-        .take(5) // Limit to first 5 words
-        .collect::<Vec<_>>()
-        .join("-");
-
-    // Limit total length
-    if slug.len() > 40 {
-        slug[..40].trim_end_matches('-').to_string()
-    } else {
-        slug
-    }
+    jean_core::slugify_issue_title(title)
 }
 
 /// Generate a branch name from an issue
 /// e.g., Issue #123 "Fix the login bug" -> "issue-123-fix-the-login-bug"
 pub fn generate_branch_name_from_issue(issue_number: u32, title: &str) -> String {
-    let slug = slugify_issue_title(title);
-    format!("issue-{issue_number}-{slug}")
+    jean_core::generate_branch_name_from_issue(issue_number, title)
 }
 
 /// Format issue context as markdown for the context file
@@ -1723,8 +1701,7 @@ query($owner: String!, $repo: String!, $prNumber: Int!) {
 /// Generate a branch name from a PR
 /// e.g., PR #123 "Fix the login bug" -> "pr-123-fix-the-login-bug"
 pub fn generate_branch_name_from_pr(pr_number: u32, title: &str) -> String {
-    let slug = slugify_issue_title(title);
-    format!("pr-{pr_number}-{slug}")
+    jean_core::generate_branch_name_from_pr(pr_number, title)
 }
 
 /// Format PR context as markdown for the context file
@@ -2229,17 +2206,7 @@ pub fn generate_branch_name_from_security_alert(
     package_name: &str,
     summary: &str,
 ) -> String {
-    let slug = slugify_issue_title(summary);
-    // Include package name in branch, truncated
-    let pkg = package_name.replace('/', "-").replace('@', "");
-    let pkg_truncated;
-    let pkg_short = if pkg.len() > 20 {
-        pkg_truncated = pkg.chars().take(20).collect::<String>();
-        &pkg_truncated
-    } else {
-        &pkg
-    };
-    format!("security-{alert_number}-{pkg_short}-{slug}")
+    jean_core::generate_branch_name_from_security_alert(alert_number, package_name, summary)
 }
 
 /// Format security alert context as markdown
@@ -2249,20 +2216,7 @@ pub fn format_security_context_markdown(ctx: &SecurityAlertContext) -> String {
 
 /// Generate branch name from advisory
 pub fn generate_branch_name_from_advisory(ghsa_id: &str, summary: &str) -> String {
-    let slug: String = summary
-        .to_lowercase()
-        .chars()
-        .map(|c| if c.is_alphanumeric() { c } else { '-' })
-        .collect::<String>()
-        .split('-')
-        .filter(|s| !s.is_empty())
-        .collect::<Vec<_>>()
-        .join("-");
-    let slug = if slug.len() > 40 { &slug[..40] } else { &slug };
-    let slug = slug.trim_end_matches('-');
-    // Use short GHSA ID (remove "GHSA-" prefix for branch name brevity)
-    let ghsa_short = ghsa_id.strip_prefix("GHSA-").unwrap_or(ghsa_id);
-    format!("advisory-{ghsa_short}-{slug}")
+    jean_core::generate_branch_name_from_advisory(ghsa_id, summary)
 }
 
 /// Format advisory context as markdown
