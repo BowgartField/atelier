@@ -15,7 +15,12 @@ import {
   TooltipContent,
   TooltipTrigger,
 } from '@/components/ui/tooltip'
+import { useCodexUsage } from '@/services/codex-cli'
 import { useCreateScheduledPrompt } from '@/services/scheduled-prompts'
+import type {
+  CodexUsageSnapshot,
+  CodexUsageWindowSnapshot,
+} from '@/types/codex-cli'
 import type { ScheduleTrigger } from '@/types/scheduled-prompts'
 
 interface ScheduleForResetButtonProps {
@@ -28,6 +33,47 @@ interface ScheduleForResetButtonProps {
   getPromptText: () => string
   /** Clears the composer after a prompt is scheduled. */
   onScheduled?: () => void
+}
+
+interface ScheduleTriggerAvailability {
+  session: boolean
+  weekly: boolean
+}
+
+function hasCodexResetWindow(
+  window: CodexUsageWindowSnapshot | null | undefined
+) {
+  return (
+    !!window && (window.resetsAt !== null || window.limitWindowSeconds !== null)
+  )
+}
+
+function isCodexWindowExhausted(
+  window: CodexUsageWindowSnapshot | null | undefined
+) {
+  return (window?.usedPercent ?? 0) >= 100
+}
+
+export function getScheduleTriggerAvailability(
+  backend: string,
+  codexUsage?: CodexUsageSnapshot
+): ScheduleTriggerAvailability {
+  if (backend === 'codex') {
+    const weeklyExhausted = isCodexWindowExhausted(codexUsage?.weekly)
+    const hasSessionReset = hasCodexResetWindow(codexUsage?.session)
+    const hasWeeklyReset = hasCodexResetWindow(codexUsage?.weekly)
+
+    return {
+      session: hasSessionReset && !weeklyExhausted,
+      weekly: hasWeeklyReset && (!hasSessionReset || weeklyExhausted),
+    }
+  }
+
+  if (backend === 'claude') {
+    return { session: true, weekly: true }
+  }
+
+  return { session: false, weekly: false }
 }
 
 /**
@@ -46,12 +92,25 @@ export const ScheduleForResetButton = memo(function ScheduleForResetButton({
 }: ScheduleForResetButtonProps) {
   const { mutateAsync: createScheduledPrompt, isPending } =
     useCreateScheduledPrompt()
+  const codexUsage = useCodexUsage({ enabled: backend === 'codex' })
 
-  // Only Claude and Codex expose a usage window with a reset timestamp.
-  const supportsReset = backend === 'claude' || backend === 'codex'
+  const availableTriggers = getScheduleTriggerAvailability(
+    backend,
+    codexUsage.data
+  )
+  const supportsReset = availableTriggers.session || availableTriggers.weekly
+  const onlyWeeklyReset = !availableTriggers.session && availableTriggers.weekly
 
   const schedule = useCallback(
     async (trigger: ScheduleTrigger) => {
+      if (
+        (trigger.kind === 'sessionReset' && !availableTriggers.session) ||
+        (trigger.kind === 'weeklyReset' && !availableTriggers.weekly)
+      ) {
+        toast.error('That reset window is not available right now.')
+        return
+      }
+
       const prompt = getPromptText().trim()
       if (!prompt) {
         toast.error('Type a prompt first, then schedule it.')
@@ -80,6 +139,8 @@ export const ScheduleForResetButton = memo(function ScheduleForResetButton({
       }
     },
     [
+      availableTriggers.session,
+      availableTriggers.weekly,
       backend,
       createScheduledPrompt,
       getPromptText,
@@ -107,7 +168,9 @@ export const ScheduleForResetButton = memo(function ScheduleForResetButton({
               aria-label="Schedule prompt for usage reset"
             >
               <AlarmClock className="h-3.5 w-3.5" />
-              Schedule for reset
+              {onlyWeeklyReset
+                ? 'Schedule for weekly reset'
+                : 'Schedule for reset'}
             </Button>
           </DropdownMenuTrigger>
         </TooltipTrigger>
@@ -116,12 +179,16 @@ export const ScheduleForResetButton = memo(function ScheduleForResetButton({
       <DropdownMenuContent align="end">
         <DropdownMenuLabel>Send this prompt when…</DropdownMenuLabel>
         <DropdownMenuSeparator />
-        <DropdownMenuItem onSelect={() => schedule({ kind: 'sessionReset' })}>
-          My session window resets
-        </DropdownMenuItem>
-        <DropdownMenuItem onSelect={() => schedule({ kind: 'weeklyReset' })}>
-          My weekly window resets
-        </DropdownMenuItem>
+        {availableTriggers.session && (
+          <DropdownMenuItem onSelect={() => schedule({ kind: 'sessionReset' })}>
+            My session window resets
+          </DropdownMenuItem>
+        )}
+        {availableTriggers.weekly && (
+          <DropdownMenuItem onSelect={() => schedule({ kind: 'weeklyReset' })}>
+            My weekly window resets
+          </DropdownMenuItem>
+        )}
       </DropdownMenuContent>
     </DropdownMenu>
   )

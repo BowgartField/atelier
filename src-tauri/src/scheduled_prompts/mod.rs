@@ -153,7 +153,18 @@ async fn resolve_reset_timestamp(
     match backend {
         "codex" => {
             let usage = crate::codex_cli::get_codex_usage(app.clone()).await?;
-            let window = if weekly { usage.weekly } else { usage.session };
+            let weekly_exhausted = usage
+                .weekly
+                .as_ref()
+                .map(|w| w.used_percent >= 100.0)
+                .unwrap_or(false);
+            let use_weekly = weekly || weekly_exhausted;
+            let window_label = if use_weekly { "weekly" } else { "session" };
+            let window = if use_weekly {
+                usage.weekly
+            } else {
+                usage.session
+            };
             let window = window
                 .ok_or_else(|| format!("Codex usage snapshot has no {window_label} window yet"))?;
             // Codex only reports an explicit reset timestamp once some quota is
