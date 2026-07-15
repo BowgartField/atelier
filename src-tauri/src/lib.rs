@@ -34,6 +34,29 @@ use tauri::{AppHandle, Emitter, Manager};
 #[cfg(target_os = "macos")]
 use tauri::menu::{MenuBuilder, MenuItemBuilder, PredefinedMenuItem, SubmenuBuilder};
 
+#[cfg(all(debug_assertions, target_os = "macos"))]
+fn apply_dev_dock_icon() {
+    use objc2::{AllocAnyThread, MainThreadMarker};
+    use objc2_app_kit::{NSApplication, NSImage};
+    use objc2_foundation::NSData;
+
+    const DEV_DOCK_ICON: &[u8] = include_bytes!("../../public/logo.png");
+
+    let mtm = unsafe { MainThreadMarker::new_unchecked() };
+    let app = NSApplication::sharedApplication(mtm);
+    let data = NSData::with_bytes(DEV_DOCK_ICON);
+
+    match NSImage::initWithData(NSImage::alloc(), &data) {
+        Some(icon) => unsafe {
+            app.setApplicationIconImage(Some(&icon));
+            log::info!("Applied dev-only macOS Dock icon override from public/logo.png");
+        },
+        None => {
+            log::warn!("Failed to decode dev-only macOS Dock icon override");
+        }
+    }
+}
+
 mod auto_fix;
 mod background_tasks;
 mod browser;
@@ -550,6 +573,8 @@ fn default_keybindings() -> std::collections::HashMap<String, String> {
     map.insert("open_pull_request".to_string(), "mod+shift+p".to_string());
     map.insert("open_git_diff".to_string(), "mod+g".to_string());
     map.insert("execute_run".to_string(), "mod+r".to_string());
+    map.insert("stash_prompt".to_string(), "mod+shift+s".to_string());
+    map.insert("queue_prompt".to_string(), "tab".to_string());
     map
 }
 
@@ -772,6 +797,20 @@ mod tests {
 
         assert!(prefs.parallel_execution_prompt_enabled);
         assert!(prefs.codex_multi_agent_enabled);
+    }
+
+    #[test]
+    fn app_preferences_include_composer_queue_keybindings_by_default() {
+        let prefs = AppPreferences::default();
+
+        assert_eq!(
+            prefs.keybindings.get("stash_prompt").map(String::as_str),
+            Some("mod+shift+s")
+        );
+        assert_eq!(
+            prefs.keybindings.get("queue_prompt").map(String::as_str),
+            Some("tab")
+        );
     }
 
     #[test]
@@ -4907,6 +4946,11 @@ pub fn run() {
             chat::update_queued_message,
             chat::clear_message_queue,
             chat::move_queued_message_front,
+            chat::get_stashed_prompts,
+            chat::stash_prompt,
+            chat::update_stashed_prompt,
+            chat::remove_stashed_prompt,
+            chat::restore_stashed_prompt,
             chat::steer_codex_turn,
             chat::steer_opencode_turn,
             chat::steer_pi_turn,
@@ -5076,6 +5120,12 @@ pub fn run() {
         })
         .expect("error building tauri application")
         .run(move |app_handle, event| match &event {
+            tauri::RunEvent::Ready => {
+                #[cfg(all(debug_assertions, target_os = "macos"))]
+                if !headless {
+                    apply_dev_dock_icon();
+                }
+            }
             tauri::RunEvent::Exit => {
                 let has_running_sessions = chat::has_running_sessions();
                 eprintln!("[TERMINAL CLEANUP] RunEvent::Exit received");
