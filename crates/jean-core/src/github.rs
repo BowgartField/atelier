@@ -1,5 +1,6 @@
 use crate::{
-    BackendError, BackendErrorCode, GitHubAuthor, GitHubComment, GitHubReview, PullRequestContext,
+    AdvisoryVulnerability, BackendError, BackendErrorCode, GitHubAuthor, GitHubComment,
+    GitHubRepository, GitHubReview, PullRequestContext,
 };
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -85,6 +86,153 @@ pub struct GitHubPullRequestDetail {
     pub comments: Vec<GitHubComment>,
     #[serde(default)]
     pub reviews: Vec<GitHubReview>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DependabotAlert {
+    pub number: u32,
+    pub state: String,
+    pub package_name: String,
+    pub package_ecosystem: String,
+    pub manifest_path: String,
+    pub ghsa_id: String,
+    pub cve_id: Option<String>,
+    pub severity: String,
+    pub summary: String,
+    pub description: String,
+    pub created_at: String,
+    pub html_url: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RepositoryAdvisory {
+    pub ghsa_id: String,
+    pub cve_id: Option<String>,
+    pub summary: String,
+    pub description: String,
+    pub severity: String,
+    pub state: String,
+    pub author_login: Option<String>,
+    pub created_at: String,
+    pub published_at: Option<String>,
+    pub html_url: String,
+    pub vulnerabilities: Vec<AdvisoryVulnerability>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DependabotPackageRaw {
+    name: String,
+    ecosystem: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct DependabotDependencyRaw {
+    package: DependabotPackageRaw,
+    manifest_path: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct SecurityAdvisoryRaw {
+    ghsa_id: String,
+    cve_id: Option<String>,
+    summary: String,
+    description: String,
+    severity: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct DependabotAlertRaw {
+    number: u32,
+    state: String,
+    dependency: DependabotDependencyRaw,
+    security_advisory: SecurityAdvisoryRaw,
+    created_at: String,
+    html_url: String,
+}
+
+impl From<DependabotAlertRaw> for DependabotAlert {
+    fn from(raw: DependabotAlertRaw) -> Self {
+        Self {
+            number: raw.number,
+            state: raw.state,
+            package_name: raw.dependency.package.name,
+            package_ecosystem: raw.dependency.package.ecosystem,
+            manifest_path: raw.dependency.manifest_path,
+            ghsa_id: raw.security_advisory.ghsa_id,
+            cve_id: raw.security_advisory.cve_id,
+            severity: raw.security_advisory.severity,
+            summary: raw.security_advisory.summary,
+            description: raw.security_advisory.description,
+            created_at: raw.created_at,
+            html_url: raw.html_url,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct AdvisoryVulnerabilityPackageRaw {
+    name: String,
+    ecosystem: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct AdvisoryVulnerabilityRaw {
+    package: Option<AdvisoryVulnerabilityPackageRaw>,
+    vulnerable_version_range: Option<String>,
+    patched_versions: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AdvisoryAuthorRaw {
+    login: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct RepositoryAdvisoryRaw {
+    ghsa_id: String,
+    cve_id: Option<String>,
+    summary: String,
+    description: Option<String>,
+    severity: Option<String>,
+    state: String,
+    author: Option<AdvisoryAuthorRaw>,
+    #[serde(rename = "publisher")]
+    _publisher: Option<AdvisoryAuthorRaw>,
+    created_at: String,
+    published_at: Option<String>,
+    html_url: String,
+    vulnerabilities: Vec<AdvisoryVulnerabilityRaw>,
+}
+
+impl From<RepositoryAdvisoryRaw> for RepositoryAdvisory {
+    fn from(raw: RepositoryAdvisoryRaw) -> Self {
+        Self {
+            ghsa_id: raw.ghsa_id,
+            cve_id: raw.cve_id,
+            summary: raw.summary,
+            description: raw.description.unwrap_or_default(),
+            severity: raw.severity.unwrap_or_else(|| "unknown".to_string()),
+            state: raw.state,
+            author_login: raw.author.map(|author| author.login),
+            created_at: raw.created_at,
+            published_at: raw.published_at,
+            html_url: raw.html_url,
+            vulnerabilities: raw
+                .vulnerabilities
+                .into_iter()
+                .filter_map(|vulnerability| {
+                    vulnerability.package.map(|package| AdvisoryVulnerability {
+                        package_name: package.name,
+                        package_ecosystem: package.ecosystem,
+                        vulnerable_version_range: vulnerability.vulnerable_version_range,
+                        patched_versions: vulnerability.patched_versions,
+                    })
+                })
+                .collect(),
+        }
+    }
 }
 
 pub type GhRunner =
@@ -332,6 +480,111 @@ impl GitHubService {
         })
     }
 
+    pub fn list_dependabot_alerts(
+        &self,
+        project_path: &str,
+        repository: &GitHubRepository,
+        state: Option<&str>,
+    ) -> Result<Vec<DependabotAlert>, BackendError> {
+        let endpoint = format!(
+            "/repos/{}/{}/dependabot/alerts?state={}&per_page=100",
+            repository.owner,
+            repository.repo,
+            state.unwrap_or("open")
+        );
+        let output = (self.runner)(project_path, &["api", &endpoint])?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            if stderr.contains("404") || stderr.contains("Dependabot alerts are not available") {
+                return Ok(Vec::new());
+            }
+            return Err(security_api_failure(output, "Dependabot alerts"));
+        }
+        Ok(parse_json::<Vec<DependabotAlertRaw>>(&output.stdout)?
+            .into_iter()
+            .map(DependabotAlert::from)
+            .collect())
+    }
+
+    pub fn dependabot_alert(
+        &self,
+        project_path: &str,
+        repository: &GitHubRepository,
+        number: u32,
+    ) -> Result<DependabotAlert, BackendError> {
+        let endpoint = format!(
+            "/repos/{}/{}/dependabot/alerts/{number}",
+            repository.owner, repository.repo
+        );
+        let output = (self.runner)(project_path, &["api", &endpoint])?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            if stderr.contains("404") {
+                return Err(BackendError::new(
+                    BackendErrorCode::InvalidArgument,
+                    format!("Dependabot alert #{number} not found"),
+                ));
+            }
+            return Err(security_api_failure(output, "Dependabot alert"));
+        }
+        Ok(DependabotAlert::from(parse_json::<DependabotAlertRaw>(
+            &output.stdout,
+        )?))
+    }
+
+    pub fn list_repository_advisories(
+        &self,
+        project_path: &str,
+        repository: &GitHubRepository,
+        state: Option<&str>,
+    ) -> Result<Vec<RepositoryAdvisory>, BackendError> {
+        let mut endpoint = format!(
+            "/repos/{}/{}/security-advisories?per_page=100",
+            repository.owner, repository.repo
+        );
+        if let Some(state) = state {
+            endpoint.push_str(&format!("&state={state}"));
+        }
+        let output = (self.runner)(project_path, &["api", &endpoint])?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            if stderr.contains("404") {
+                return Ok(Vec::new());
+            }
+            return Err(security_api_failure(output, "repository advisories"));
+        }
+        Ok(parse_json::<Vec<RepositoryAdvisoryRaw>>(&output.stdout)?
+            .into_iter()
+            .map(RepositoryAdvisory::from)
+            .collect())
+    }
+
+    pub fn repository_advisory(
+        &self,
+        project_path: &str,
+        repository: &GitHubRepository,
+        ghsa_id: &str,
+    ) -> Result<RepositoryAdvisory, BackendError> {
+        let endpoint = format!(
+            "/repos/{}/{}/security-advisories/{ghsa_id}",
+            repository.owner, repository.repo
+        );
+        let output = (self.runner)(project_path, &["api", &endpoint])?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            if stderr.contains("404") {
+                return Err(BackendError::new(
+                    BackendErrorCode::InvalidArgument,
+                    format!("Advisory {ghsa_id} not found"),
+                ));
+            }
+            return Err(security_api_failure(output, "repository advisory"));
+        }
+        Ok(RepositoryAdvisory::from(
+            parse_json::<RepositoryAdvisoryRaw>(&output.stdout)?,
+        ))
+    }
+
     fn issue_json<T: for<'de> Deserialize<'de>>(
         &self,
         project_path: &str,
@@ -385,6 +638,24 @@ impl GitHubService {
             .as_u64()
             .map(|count| count as u32)
     }
+}
+
+fn security_api_failure(output: Output, operation: &str) -> BackendError {
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let lower = stderr.to_lowercase();
+    let message = if lower.contains("not a git repository") {
+        "Not a git repository".to_string()
+    } else if lower.contains("not logged")
+        || lower.contains("authentication")
+        || lower.contains("gh auth login")
+    {
+        "GitHub CLI not authenticated. Run 'gh auth login' first.".to_string()
+    } else if stderr.contains("403") {
+        format!("Insufficient permissions to access {operation}.")
+    } else {
+        format!("gh api failed: {stderr}")
+    };
+    BackendError::new(BackendErrorCode::Io, message)
 }
 
 fn parse_json<T: for<'de> Deserialize<'de>>(stdout: &[u8]) -> Result<T, BackendError> {
@@ -571,5 +842,69 @@ mod tests {
         let calls = calls.lock().unwrap();
         assert_eq!(calls[1][2..4], ["--search", "author:octo"]);
         assert_eq!(&calls[2][..3], ["issue", "view", "7"]);
+    }
+
+    #[test]
+    fn security_reads_share_the_injected_gh_api_pipeline() {
+        let calls = Arc::new(Mutex::new(Vec::<String>::new()));
+        let observed = calls.clone();
+        let runner: GhRunner = Arc::new(move |_path, args| {
+            let endpoint = args.get(1).copied().unwrap_or_default();
+            observed.lock().unwrap().push(endpoint.to_string());
+            let dependabot = br#"{"number":7,"state":"open","dependency":{"package":{"name":"lodash","ecosystem":"npm"},"manifest_path":"package.json"},"security_advisory":{"ghsa_id":"GHSA-test","cve_id":"CVE-2026-1","summary":"Prototype pollution","description":"details","severity":"high"},"created_at":"2026-01-01","html_url":"https://github.com/acme/widget/security/dependabot/7"}"#;
+            let advisory = br#"{"ghsa_id":"GHSA-abcd-1234-5678","cve_id":"CVE-2026-2","summary":"Private advisory","description":"details","severity":"critical","state":"published","author":{"login":"octo"},"publisher":null,"created_at":"2026-01-01","published_at":"2026-01-02","html_url":"https://github.com/acme/widget/security/advisories/GHSA-abcd-1234-5678","vulnerabilities":[{"package":{"name":"crate","ecosystem":"rust"},"vulnerable_version_range":"< 2","patched_versions":"2.0"}]}"#;
+            let stdout = if endpoint.contains("dependabot") {
+                if endpoint.contains("/7") {
+                    dependabot.to_vec()
+                } else {
+                    [b"[".as_slice(), dependabot, b"]".as_slice()].concat()
+                }
+            } else if endpoint.ends_with("GHSA-abcd-1234-5678") {
+                advisory.to_vec()
+            } else {
+                [b"[".as_slice(), advisory, b"]".as_slice()].concat()
+            };
+            Ok(successful_output(&stdout))
+        });
+        let service = GitHubService::new(runner);
+        let repository = GitHubRepository {
+            owner: "acme".to_string(),
+            repo: "widget".to_string(),
+        };
+
+        assert_eq!(
+            service
+                .list_dependabot_alerts("/repo", &repository, Some("open"))
+                .unwrap()[0]
+                .package_name,
+            "lodash"
+        );
+        assert_eq!(
+            service
+                .dependabot_alert("/repo", &repository, 7)
+                .unwrap()
+                .severity,
+            "high"
+        );
+        assert_eq!(
+            service
+                .list_repository_advisories("/repo", &repository, Some("published"))
+                .unwrap()[0]
+                .vulnerabilities[0]
+                .patched_versions
+                .as_deref(),
+            Some("2.0")
+        );
+        assert_eq!(
+            service
+                .repository_advisory("/repo", &repository, "GHSA-abcd-1234-5678")
+                .unwrap()
+                .author_login
+                .as_deref(),
+            Some("octo")
+        );
+        let calls = calls.lock().unwrap();
+        assert!(calls[0].contains("state=open"));
+        assert!(calls[2].contains("state=published"));
     }
 }

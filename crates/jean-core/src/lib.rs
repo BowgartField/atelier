@@ -33,17 +33,17 @@ pub use contexts::{
     generate_branch_name_from_security_alert, slugify_issue_title, AdvisoryContext,
     AdvisoryVulnerability, ContextRef, ContextReferences, ContextService, GitHubAuthor,
     GitHubComment, GitHubReview, IssueContext, LinearComment, LinearIssueContext,
-    LinearIssueContextContent, LinearUser, LoadedIssueContext, LoadedLinearIssueContext,
-    LoadedPullRequestContext, PrDiffLoader, PullRequestContext, SecurityAlertContext,
-    WorktreeContexts,
+    LinearIssueContextContent, LinearUser, LoadedAdvisoryContext, LoadedIssueContext,
+    LoadedLinearIssueContext, LoadedPullRequestContext, LoadedSecurityAlertContext, PrDiffLoader,
+    PullRequestContext, SecurityAlertContext, WorktreeContexts,
 };
 pub use error::{BackendError, BackendErrorCode};
 pub use events::{EventSink, ServerEventSink, WsBroadcaster, WsEvent};
 pub use git::{GitHubRepository, GitPushResponse, GitRunner, GitService};
 pub use git_status::{ActiveWorktreeInfo, GitBranchStatus};
 pub use github::{
-    GhRunner, GitHubIssue, GitHubIssueDetail, GitHubIssueListResult, GitHubLabel,
-    GitHubPullRequest, GitHubPullRequestDetail, GitHubService,
+    DependabotAlert, GhRunner, GitHubIssue, GitHubIssueDetail, GitHubIssueListResult, GitHubLabel,
+    GitHubPullRequest, GitHubPullRequestDetail, GitHubService, RepositoryAdvisory,
 };
 pub use linear::{
     LinearConfig, LinearIssue, LinearIssueDetail, LinearIssueListResult, LinearIssueState,

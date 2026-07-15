@@ -8,10 +8,10 @@ use super::git::get_repo_identifier;
 use crate::gh_cli::config::resolve_gh_binary;
 
 pub use jean_core::{
-    AdvisoryContext, AdvisoryVulnerability, GitHubAuthor, GitHubComment, GitHubIssue,
-    GitHubIssueDetail, GitHubIssueListResult, GitHubLabel, GitHubPullRequest,
-    GitHubPullRequestDetail, IssueContext, LoadedIssueContext, LoadedPullRequestContext,
-    PullRequestContext, SecurityAlertContext,
+    AdvisoryContext, DependabotAlert, GitHubAuthor, GitHubComment, GitHubIssue, GitHubIssueDetail,
+    GitHubIssueListResult, GitHubLabel, GitHubPullRequest, GitHubPullRequestDetail, IssueContext,
+    LoadedAdvisoryContext, LoadedIssueContext, LoadedPullRequestContext,
+    LoadedSecurityAlertContext, PullRequestContext, RepositoryAdvisory, SecurityAlertContext,
 };
 
 fn gh_command(gh: &Path, project_path: &str) -> Command {
@@ -338,125 +338,15 @@ pub fn get_session_pr_refs(
         .collect())
 }
 
-/// Add a session reference to a security alert context
-/// Key format: "{owner}-{repo}-{number}"
-pub fn add_security_reference(
-    app: &tauri::AppHandle,
-    repo_key: &str,
-    alert_number: u32,
-    session_id: &str,
-) -> Result<(), String> {
-    let mut refs = load_context_references(app)?;
-    let key = format!("{repo_key}-{alert_number}");
-
-    let entry = refs.security.entry(key).or_default();
-    if !entry.sessions.contains(&session_id.to_string()) {
-        entry.sessions.push(session_id.to_string());
-    }
-    // Clear orphaned status when a reference is added
-    entry.orphaned_at = None;
-
-    save_context_references(app, &refs)
-}
-
-/// Remove a session reference from a security alert context
-/// Returns true if the context is now orphaned (no more references)
-pub fn remove_security_reference(
-    app: &tauri::AppHandle,
-    repo_key: &str,
-    alert_number: u32,
-    session_id: &str,
-) -> Result<bool, String> {
-    let mut refs = load_context_references(app)?;
-    let key = format!("{repo_key}-{alert_number}");
-
-    let orphaned = if let Some(entry) = refs.security.get_mut(&key) {
-        entry.sessions.retain(|s| s != session_id);
-        if entry.sessions.is_empty() && entry.orphaned_at.is_none() {
-            entry.orphaned_at = Some(
-                SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs(),
-            );
-            true
-        } else {
-            false
-        }
-    } else {
-        false
-    };
-
-    save_context_references(app, &refs)?;
-    Ok(orphaned)
-}
-
 /// Get all security alert keys referenced by a session
 /// Returns keys in format "{owner}-{repo}-{number}"
 pub fn get_session_security_refs(
     app: &tauri::AppHandle,
     session_id: &str,
 ) -> Result<Vec<String>, String> {
-    let refs = load_context_references(app)?;
-    Ok(refs
-        .security
-        .iter()
-        .filter(|(_, entry)| entry.sessions.contains(&session_id.to_string()))
-        .map(|(key, _)| key.clone())
-        .collect())
-}
-
-/// Add a session reference to an advisory context
-/// Key format: "{repo_key}::{ghsa_id}"
-pub fn add_advisory_reference(
-    app: &tauri::AppHandle,
-    repo_key: &str,
-    ghsa_id: &str,
-    session_id: &str,
-) -> Result<(), String> {
-    let mut refs = load_context_references(app)?;
-    let key = format!("{repo_key}::{ghsa_id}");
-
-    let entry = refs.advisories.entry(key).or_default();
-    if !entry.sessions.contains(&session_id.to_string()) {
-        entry.sessions.push(session_id.to_string());
-    }
-    // Clear orphaned status when a reference is added
-    entry.orphaned_at = None;
-
-    save_context_references(app, &refs)
-}
-
-/// Remove a session reference from an advisory context
-/// Returns true if the context is now orphaned (no more references)
-pub fn remove_advisory_reference(
-    app: &tauri::AppHandle,
-    repo_key: &str,
-    ghsa_id: &str,
-    session_id: &str,
-) -> Result<bool, String> {
-    let mut refs = load_context_references(app)?;
-    let key = format!("{repo_key}::{ghsa_id}");
-
-    let orphaned = if let Some(entry) = refs.advisories.get_mut(&key) {
-        entry.sessions.retain(|s| s != session_id);
-        if entry.sessions.is_empty() && entry.orphaned_at.is_none() {
-            entry.orphaned_at = Some(
-                SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs(),
-            );
-            true
-        } else {
-            false
-        }
-    } else {
-        false
-    };
-
-    save_context_references(app, &refs)?;
-    Ok(orphaned)
+    crate::backend_runtime::context_service(app)?
+        .security_keys(session_id)
+        .map_err(|error| error.to_string())
 }
 
 /// Get all advisory keys referenced by a session
@@ -465,13 +355,9 @@ pub fn get_session_advisory_refs(
     app: &tauri::AppHandle,
     session_id: &str,
 ) -> Result<Vec<String>, String> {
-    let refs = load_context_references(app)?;
-    Ok(refs
-        .advisories
-        .iter()
-        .filter(|(_, entry)| entry.sessions.contains(&session_id.to_string()))
-        .map(|(key, _)| key.clone())
-        .collect())
+    crate::backend_runtime::context_service(app)?
+        .advisory_keys(session_id)
+        .map_err(|error| error.to_string())
 }
 
 /// Parse an advisory context key into (owner, repo, ghsa_id)
@@ -1264,195 +1150,6 @@ pub async fn get_pr_context_content(
 // Dependabot Alert / Security Types and Commands
 // =============================================================================
 
-/// Raw package info from GitHub Dependabot API
-#[derive(Debug, Clone, Deserialize)]
-pub struct DependabotPackageRaw {
-    pub name: String,
-    pub ecosystem: String,
-}
-
-/// Raw dependency from GitHub Dependabot API
-#[derive(Debug, Clone, Deserialize)]
-pub struct DependabotDependencyRaw {
-    pub package: DependabotPackageRaw,
-    pub manifest_path: String,
-}
-
-/// Raw security advisory from GitHub Dependabot API
-#[derive(Debug, Clone, Deserialize)]
-pub struct SecurityAdvisoryRaw {
-    pub ghsa_id: String,
-    pub cve_id: Option<String>,
-    pub summary: String,
-    pub description: String,
-    pub severity: String,
-}
-
-/// Raw Dependabot alert from GitHub REST API
-#[derive(Debug, Clone, Deserialize)]
-pub struct DependabotAlertRaw {
-    pub number: u32,
-    pub state: String,
-    pub dependency: DependabotDependencyRaw,
-    pub security_advisory: SecurityAdvisoryRaw,
-    pub created_at: String,
-    pub html_url: String,
-    pub dismissed_reason: Option<String>,
-    pub dismissed_comment: Option<String>,
-    pub fixed_at: Option<String>,
-}
-
-/// Dependabot alert flattened for frontend consumption
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct DependabotAlert {
-    pub number: u32,
-    pub state: String,
-    pub package_name: String,
-    pub package_ecosystem: String,
-    pub manifest_path: String,
-    pub ghsa_id: String,
-    pub cve_id: Option<String>,
-    pub severity: String,
-    pub summary: String,
-    pub description: String,
-    pub created_at: String,
-    pub html_url: String,
-}
-
-/// Loaded security alert context info returned to frontend
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct LoadedSecurityAlertContext {
-    pub number: u32,
-    pub package_name: String,
-    pub severity: String,
-    pub summary: String,
-    pub repo_owner: String,
-    pub repo_name: String,
-}
-
-impl DependabotAlertRaw {
-    pub fn into_frontend(self) -> DependabotAlert {
-        DependabotAlert {
-            number: self.number,
-            state: self.state,
-            package_name: self.dependency.package.name,
-            package_ecosystem: self.dependency.package.ecosystem,
-            manifest_path: self.dependency.manifest_path,
-            ghsa_id: self.security_advisory.ghsa_id,
-            cve_id: self.security_advisory.cve_id,
-            severity: self.security_advisory.severity,
-            summary: self.security_advisory.summary,
-            description: self.security_advisory.description,
-            created_at: self.created_at,
-            html_url: self.html_url,
-        }
-    }
-}
-
-// =============================================================================
-// Repository Security Advisory Types
-// =============================================================================
-
-/// Vulnerability package from GitHub Security Advisory API
-#[derive(Debug, Clone, Deserialize)]
-pub struct AdvisoryVulnerabilityPackageRaw {
-    pub name: String,
-    pub ecosystem: String,
-}
-
-/// Vulnerability entry from GitHub Security Advisory API
-#[derive(Debug, Clone, Deserialize)]
-pub struct AdvisoryVulnerabilityRaw {
-    pub package: Option<AdvisoryVulnerabilityPackageRaw>,
-    pub vulnerable_version_range: Option<String>,
-    pub patched_versions: Option<String>,
-    pub vulnerable_functions: Option<Vec<String>>,
-}
-
-/// Author from GitHub Security Advisory API
-#[derive(Debug, Clone, Deserialize)]
-pub struct AdvisoryAuthorRaw {
-    pub login: String,
-}
-
-/// Raw repository security advisory from GitHub REST API
-#[derive(Debug, Clone, Deserialize)]
-pub struct RepositoryAdvisoryRaw {
-    pub ghsa_id: String,
-    pub cve_id: Option<String>,
-    pub summary: String,
-    pub description: Option<String>,
-    pub severity: Option<String>,
-    pub state: String,
-    pub author: Option<AdvisoryAuthorRaw>,
-    pub publisher: Option<AdvisoryAuthorRaw>,
-    pub created_at: String,
-    pub published_at: Option<String>,
-    pub html_url: String,
-    pub vulnerabilities: Vec<AdvisoryVulnerabilityRaw>,
-}
-
-/// Repository security advisory for frontend
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct RepositoryAdvisory {
-    pub ghsa_id: String,
-    pub cve_id: Option<String>,
-    pub summary: String,
-    pub description: String,
-    pub severity: String,
-    pub state: String,
-    pub author_login: Option<String>,
-    pub created_at: String,
-    pub published_at: Option<String>,
-    pub html_url: String,
-    pub vulnerabilities: Vec<AdvisoryVulnerability>,
-}
-
-/// Loaded advisory context info returned from backend
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct LoadedAdvisoryContext {
-    pub ghsa_id: String,
-    pub severity: String,
-    pub summary: String,
-    pub repo_owner: String,
-    pub repo_name: String,
-}
-
-impl RepositoryAdvisoryRaw {
-    pub fn into_frontend(self) -> RepositoryAdvisory {
-        let vulnerabilities: Vec<AdvisoryVulnerability> = self
-            .vulnerabilities
-            .into_iter()
-            .filter_map(|v| {
-                v.package.map(|pkg| AdvisoryVulnerability {
-                    package_name: pkg.name,
-                    package_ecosystem: pkg.ecosystem,
-                    vulnerable_version_range: v.vulnerable_version_range,
-                    patched_versions: v.patched_versions,
-                })
-            })
-            .collect();
-
-        RepositoryAdvisory {
-            ghsa_id: self.ghsa_id,
-            cve_id: self.cve_id,
-            summary: self.summary,
-            description: self.description.unwrap_or_default(),
-            severity: self.severity.unwrap_or_else(|| "unknown".to_string()),
-            state: self.state,
-            author_login: self.author.map(|a| a.login),
-            created_at: self.created_at,
-            published_at: self.published_at,
-            html_url: self.html_url,
-            vulnerabilities,
-        }
-    }
-}
-
 /// Generate a branch name from a security alert
 pub fn generate_branch_name_from_security_alert(
     alert_number: u32,
@@ -1488,48 +1185,12 @@ pub async fn list_dependabot_alerts(
     project_path: String,
     state: Option<String>,
 ) -> Result<Vec<DependabotAlert>, String> {
-    log::trace!("Listing Dependabot alerts for {project_path} with state: {state:?}");
-
-    let gh = resolve_gh_binary(&app);
-    let repo_id = get_repo_identifier(&project_path)?;
-    let state_arg = state.unwrap_or_else(|| "open".to_string());
-
-    let endpoint = format!(
-        "/repos/{}/{}/dependabot/alerts?state={}&per_page=100",
-        repo_id.owner, repo_id.repo, state_arg
-    );
-
-    let output = gh_command(&gh, &project_path)
-        .args(["api", &endpoint])
-        .output()
-        .map_err(|e| format!("Failed to run gh api: {e}"))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        if is_gh_cli_auth_error(&stderr) {
-            return Err("GitHub CLI not authenticated. Run 'gh auth login' first.".to_string());
-        }
-        if stderr.contains("not a git repository") {
-            return Err("Not a git repository".to_string());
-        }
-        if stderr.contains("404") || stderr.contains("Dependabot alerts are not available") {
-            log::debug!("Dependabot alerts not available for this repo, returning empty list");
-            return Ok(vec![]);
-        }
-        if stderr.contains("403") {
-            return Err("Insufficient permissions to access Dependabot alerts.".to_string());
-        }
-        return Err(format!("gh api failed: {stderr}"));
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let raw_alerts: Vec<DependabotAlertRaw> = serde_json::from_str(&stdout)
-        .map_err(|e| format!("Failed to parse Dependabot alerts response: {e}"))?;
-
-    let alerts: Vec<DependabotAlert> = raw_alerts.into_iter().map(|a| a.into_frontend()).collect();
-
-    log::trace!("Found {} Dependabot alerts", alerts.len());
-    Ok(alerts)
+    let repository = crate::backend_runtime::git_service()
+        .github_repository(&project_path)
+        .map_err(|error| error.to_string())?;
+    crate::backend_runtime::github_service(&app)
+        .list_dependabot_alerts(&project_path, &repository, state.as_deref())
+        .map_err(|error| error.to_string())
 }
 
 /// Get a single Dependabot alert by number
@@ -1539,35 +1200,12 @@ pub async fn get_dependabot_alert(
     project_path: String,
     alert_number: u32,
 ) -> Result<DependabotAlert, String> {
-    let gh = resolve_gh_binary(&app);
-    let repo_id = get_repo_identifier(&project_path)?;
-
-    let endpoint = format!(
-        "/repos/{}/{}/dependabot/alerts/{alert_number}",
-        repo_id.owner, repo_id.repo
-    );
-
-    let output = gh_command(&gh, &project_path)
-        .args(["api", &endpoint])
-        .output()
-        .map_err(|e| format!("Failed to run gh api: {e}"))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        if is_gh_cli_auth_error(&stderr) {
-            return Err("GitHub CLI not authenticated. Run 'gh auth login' first.".to_string());
-        }
-        if stderr.contains("404") {
-            return Err(format!("Dependabot alert #{alert_number} not found"));
-        }
-        return Err(format!("gh api failed: {stderr}"));
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let raw: DependabotAlertRaw = serde_json::from_str(&stdout)
-        .map_err(|e| format!("Failed to parse Dependabot alert response: {e}"))?;
-
-    Ok(raw.into_frontend())
+    let repository = crate::backend_runtime::git_service()
+        .github_repository(&project_path)
+        .map_err(|error| error.to_string())?;
+    crate::backend_runtime::github_service(&app)
+        .dependabot_alert(&project_path, &repository, alert_number)
+        .map_err(|error| error.to_string())
 }
 
 /// Load/refresh security alert context for a session by fetching data from GitHub
@@ -1581,67 +1219,14 @@ pub async fn load_security_alert_context(
     alert_number: u32,
     project_path: String,
 ) -> Result<LoadedSecurityAlertContext, String> {
-    log::trace!("Loading security alert #{alert_number} context for session {session_id}");
-
-    let repo_id = get_repo_identifier(&project_path)?;
-    let repo_key = repo_id.to_key();
-
-    // Fetch alert from GitHub
-    let alert_raw = {
-        let gh = resolve_gh_binary(&app);
-        let endpoint = format!(
-            "/repos/{}/{}/dependabot/alerts/{alert_number}",
-            repo_id.owner, repo_id.repo
-        );
-        let output = gh_command(&gh, &project_path)
-            .args(["api", &endpoint])
-            .output()
-            .map_err(|e| format!("Failed to run gh api: {e}"))?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(format!("Failed to fetch Dependabot alert: {stderr}"));
-        }
-
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        serde_json::from_str::<DependabotAlertRaw>(&stdout)
-            .map_err(|e| format!("Failed to parse Dependabot alert: {e}"))?
-    };
-
-    let ctx = SecurityAlertContext {
-        number: alert_raw.number,
-        package_name: alert_raw.dependency.package.name.clone(),
-        package_ecosystem: alert_raw.dependency.package.ecosystem.clone(),
-        severity: alert_raw.security_advisory.severity.clone(),
-        summary: alert_raw.security_advisory.summary.clone(),
-        description: alert_raw.security_advisory.description.clone(),
-        ghsa_id: alert_raw.security_advisory.ghsa_id.clone(),
-        cve_id: alert_raw.security_advisory.cve_id.clone(),
-        manifest_path: alert_raw.dependency.manifest_path.clone(),
-        html_url: Some(alert_raw.html_url.clone()),
-    };
-
-    // Write to shared git-context directory
-    let contexts_dir = get_github_contexts_dir(&app)?;
-    std::fs::create_dir_all(&contexts_dir)
-        .map_err(|e| format!("Failed to create git-context directory: {e}"))?;
-
-    let context_file = contexts_dir.join(format!("{repo_key}-security-{alert_number}.md"));
-    let context_content = format_security_context_markdown(&ctx);
-
-    std::fs::write(&context_file, context_content)
-        .map_err(|e| format!("Failed to write security context file: {e}"))?;
-
-    add_security_reference(&app, &repo_key, alert_number, &session_id)?;
-
-    Ok(LoadedSecurityAlertContext {
-        number: alert_raw.number,
-        package_name: alert_raw.dependency.package.name,
-        severity: alert_raw.security_advisory.severity,
-        summary: alert_raw.security_advisory.summary,
-        repo_owner: repo_id.owner,
-        repo_name: repo_id.repo,
-    })
+    crate::backend_runtime::context_service(&app)?
+        .load_security_alert(
+            &crate::backend_runtime::github_service(&app),
+            &session_id,
+            alert_number,
+            &project_path,
+        )
+        .map_err(|error| error.to_string())
 }
 
 /// List all loaded security alert contexts for a session
@@ -1651,82 +1236,9 @@ pub async fn list_loaded_security_contexts(
     session_id: String,
     worktree_id: Option<String>,
 ) -> Result<Vec<LoadedSecurityAlertContext>, String> {
-    log::trace!("Listing loaded security contexts for session {session_id}");
-
-    let mut security_keys = get_session_security_refs(&app, &session_id)?;
-
-    // Also check worktree_id refs (create_worktree stores refs under worktree_id)
-    if let Some(ref wt_id) = worktree_id {
-        if let Ok(wt_keys) = get_session_security_refs(&app, wt_id) {
-            for key in wt_keys {
-                if !security_keys.contains(&key) {
-                    security_keys.push(key);
-                }
-            }
-        }
-    }
-
-    if security_keys.is_empty() {
-        return Ok(vec![]);
-    }
-
-    let contexts_dir = get_github_contexts_dir(&app)?;
-    let mut contexts = Vec::new();
-
-    for key in security_keys {
-        if let Some((owner, repo, number)) = parse_context_key(&key) {
-            let repo_key = format!("{owner}-{repo}");
-            let context_file = contexts_dir.join(format!("{repo_key}-security-{number}.md"));
-
-            if let Ok(content) = std::fs::read_to_string(&context_file) {
-                // Parse from first line: "# Dependabot Alert #42: Summary text"
-                let summary = content
-                    .lines()
-                    .next()
-                    .and_then(|line| {
-                        line.strip_prefix("# Dependabot Alert #")
-                            .and_then(|rest| rest.split_once(": "))
-                            .map(|(_, title)| title.to_string())
-                    })
-                    .unwrap_or_else(|| format!("Alert #{number}"));
-
-                // Parse severity and package from third line (index 2)
-                // "**Severity:** critical | **Package:** lodash (npm) | **Manifest:** package.json"
-                let (severity, package_name) = content
-                    .lines()
-                    .nth(2)
-                    .map(|line| {
-                        let sev = line
-                            .split("**Severity:** ")
-                            .nth(1)
-                            .and_then(|s| s.split(" |").next())
-                            .unwrap_or("unknown")
-                            .to_string();
-                        let pkg = line
-                            .split("**Package:** ")
-                            .nth(1)
-                            .and_then(|s| s.split(" (").next())
-                            .unwrap_or("unknown")
-                            .to_string();
-                        (sev, pkg)
-                    })
-                    .unwrap_or_else(|| ("unknown".to_string(), "unknown".to_string()));
-
-                contexts.push(LoadedSecurityAlertContext {
-                    number,
-                    package_name,
-                    severity,
-                    summary,
-                    repo_owner: owner,
-                    repo_name: repo,
-                });
-            }
-        }
-    }
-
-    contexts.sort_by_key(|c| c.number);
-    log::trace!("Found {} loaded security contexts", contexts.len());
-    Ok(contexts)
+    crate::backend_runtime::context_service(&app)?
+        .list_security_alerts(&session_id, worktree_id.as_deref())
+        .map_err(|error| error.to_string())
 }
 
 /// Remove a loaded security alert context for a session
@@ -1737,26 +1249,9 @@ pub async fn remove_security_context(
     alert_number: u32,
     project_path: String,
 ) -> Result<(), String> {
-    log::trace!("Removing security alert #{alert_number} context for session {session_id}");
-
-    let repo_id = get_repo_identifier(&project_path)?;
-    let repo_key = repo_id.to_key();
-
-    let is_orphaned = remove_security_reference(&app, &repo_key, alert_number, &session_id)?;
-
-    if is_orphaned {
-        let contexts_dir = get_github_contexts_dir(&app)?;
-        let context_file = contexts_dir.join(format!("{repo_key}-security-{alert_number}.md"));
-
-        if context_file.exists() {
-            std::fs::remove_file(&context_file)
-                .map_err(|e| format!("Failed to remove security context file: {e}"))?;
-            log::trace!("Deleted orphaned security context file");
-        }
-    }
-
-    log::trace!("Security context removed successfully");
-    Ok(())
+    crate::backend_runtime::context_service(&app)?
+        .remove_security_alert(&session_id, alert_number, &project_path)
+        .map_err(|error| error.to_string())
 }
 
 /// Get the content of a loaded security alert context file
@@ -1767,28 +1262,9 @@ pub async fn get_security_context_content(
     alert_number: u32,
     project_path: String,
 ) -> Result<String, String> {
-    let repo_id = get_repo_identifier(&project_path)?;
-    let repo_key = repo_id.to_key();
-
-    let refs = get_session_security_refs(&app, &session_id)?;
-    let expected_key = format!("{repo_key}-{alert_number}");
-    if !refs.contains(&expected_key) {
-        return Err(format!(
-            "Session does not have security alert #{alert_number} loaded"
-        ));
-    }
-
-    let contexts_dir = get_github_contexts_dir(&app)?;
-    let context_file = contexts_dir.join(format!("{repo_key}-security-{alert_number}.md"));
-
-    if !context_file.exists() {
-        return Err(format!(
-            "Security context file not found for alert #{alert_number}"
-        ));
-    }
-
-    std::fs::read_to_string(&context_file)
-        .map_err(|e| format!("Failed to read security context file: {e}"))
+    crate::backend_runtime::context_service(&app)?
+        .security_alert_content(&session_id, alert_number, &project_path)
+        .map_err(|error| error.to_string())
 }
 
 // =============================================================================
@@ -1806,50 +1282,12 @@ pub async fn list_repository_advisories(
     project_path: String,
     state: Option<String>,
 ) -> Result<Vec<RepositoryAdvisory>, String> {
-    log::trace!("Listing repository advisories for {project_path} with state: {state:?}");
-
-    let gh = resolve_gh_binary(&app);
-    let repo_id = get_repo_identifier(&project_path)?;
-
-    let mut endpoint = format!(
-        "/repos/{}/{}/security-advisories?per_page=100",
-        repo_id.owner, repo_id.repo
-    );
-    if let Some(ref s) = state {
-        endpoint.push_str(&format!("&state={s}"));
-    }
-
-    let output = gh_command(&gh, &project_path)
-        .args(["api", &endpoint])
-        .output()
-        .map_err(|e| format!("Failed to run gh api: {e}"))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        if is_gh_cli_auth_error(&stderr) {
-            return Err("GitHub CLI not authenticated. Run 'gh auth login' first.".to_string());
-        }
-        if stderr.contains("not a git repository") {
-            return Err("Not a git repository".to_string());
-        }
-        if stderr.contains("404") {
-            log::debug!("Repository advisories not available for this repo, returning empty list");
-            return Ok(vec![]);
-        }
-        if stderr.contains("403") {
-            return Err("Insufficient permissions to access security advisories.".to_string());
-        }
-        return Err(format!("gh api failed: {stderr}"));
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let raw: Vec<RepositoryAdvisoryRaw> = serde_json::from_str(&stdout)
-        .map_err(|e| format!("Failed to parse advisories response: {e}"))?;
-
-    let advisories: Vec<RepositoryAdvisory> = raw.into_iter().map(|a| a.into_frontend()).collect();
-
-    log::trace!("Found {} repository advisories", advisories.len());
-    Ok(advisories)
+    let repository = crate::backend_runtime::git_service()
+        .github_repository(&project_path)
+        .map_err(|error| error.to_string())?;
+    crate::backend_runtime::github_service(&app)
+        .list_repository_advisories(&project_path, &repository, state.as_deref())
+        .map_err(|error| error.to_string())
 }
 
 /// Get a single repository security advisory by GHSA ID
@@ -1859,35 +1297,12 @@ pub async fn get_repository_advisory(
     project_path: String,
     ghsa_id: String,
 ) -> Result<RepositoryAdvisory, String> {
-    let gh = resolve_gh_binary(&app);
-    let repo_id = get_repo_identifier(&project_path)?;
-
-    let endpoint = format!(
-        "/repos/{}/{}/security-advisories/{ghsa_id}",
-        repo_id.owner, repo_id.repo
-    );
-
-    let output = gh_command(&gh, &project_path)
-        .args(["api", &endpoint])
-        .output()
-        .map_err(|e| format!("Failed to run gh api: {e}"))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        if is_gh_cli_auth_error(&stderr) {
-            return Err("GitHub CLI not authenticated. Run 'gh auth login' first.".to_string());
-        }
-        if stderr.contains("404") {
-            return Err(format!("Advisory {ghsa_id} not found"));
-        }
-        return Err(format!("gh api failed: {stderr}"));
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let raw: RepositoryAdvisoryRaw = serde_json::from_str(&stdout)
-        .map_err(|e| format!("Failed to parse advisory response: {e}"))?;
-
-    Ok(raw.into_frontend())
+    let repository = crate::backend_runtime::git_service()
+        .github_repository(&project_path)
+        .map_err(|error| error.to_string())?;
+    crate::backend_runtime::github_service(&app)
+        .repository_advisory(&project_path, &repository, &ghsa_id)
+        .map_err(|error| error.to_string())
 }
 
 /// Load/refresh advisory context for a session by fetching data from GitHub
@@ -1901,65 +1316,14 @@ pub async fn load_advisory_context(
     ghsa_id: String,
     project_path: String,
 ) -> Result<LoadedAdvisoryContext, String> {
-    log::trace!("Loading advisory {ghsa_id} context for session {session_id}");
-
-    let repo_id = get_repo_identifier(&project_path)?;
-    let repo_key = repo_id.to_key();
-
-    // Fetch advisory from GitHub
-    let advisory_raw = {
-        let gh = resolve_gh_binary(&app);
-        let endpoint = format!(
-            "/repos/{}/{}/security-advisories/{ghsa_id}",
-            repo_id.owner, repo_id.repo
-        );
-        let output = gh_command(&gh, &project_path)
-            .args(["api", &endpoint])
-            .output()
-            .map_err(|e| format!("Failed to run gh api: {e}"))?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(format!("Failed to fetch advisory: {stderr}"));
-        }
-
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        serde_json::from_str::<RepositoryAdvisoryRaw>(&stdout)
-            .map_err(|e| format!("Failed to parse advisory: {e}"))?
-    };
-
-    let advisory = advisory_raw.into_frontend();
-
-    let ctx = AdvisoryContext {
-        ghsa_id: advisory.ghsa_id.clone(),
-        severity: advisory.severity.clone(),
-        summary: advisory.summary.clone(),
-        description: advisory.description.clone(),
-        cve_id: advisory.cve_id.clone(),
-        vulnerabilities: advisory.vulnerabilities.clone(),
-        html_url: Some(advisory.html_url.clone()),
-    };
-
-    // Write to shared git-context directory
-    let contexts_dir = get_github_contexts_dir(&app)?;
-    std::fs::create_dir_all(&contexts_dir)
-        .map_err(|e| format!("Failed to create git-context directory: {e}"))?;
-
-    let context_file = contexts_dir.join(format!("{repo_key}-advisory-{}.md", ctx.ghsa_id));
-    let context_content = format_advisory_context_markdown(&ctx);
-
-    std::fs::write(&context_file, context_content)
-        .map_err(|e| format!("Failed to write advisory context file: {e}"))?;
-
-    add_advisory_reference(&app, &repo_key, &ctx.ghsa_id, &session_id)?;
-
-    Ok(LoadedAdvisoryContext {
-        ghsa_id: advisory.ghsa_id,
-        severity: advisory.severity,
-        summary: advisory.summary,
-        repo_owner: repo_id.owner,
-        repo_name: repo_id.repo,
-    })
+    crate::backend_runtime::context_service(&app)?
+        .load_advisory(
+            &crate::backend_runtime::github_service(&app),
+            &session_id,
+            &ghsa_id,
+            &project_path,
+        )
+        .map_err(|error| error.to_string())
 }
 
 /// List all loaded advisory contexts for a session
@@ -1969,67 +1333,9 @@ pub async fn list_loaded_advisory_contexts(
     session_id: String,
     worktree_id: Option<String>,
 ) -> Result<Vec<LoadedAdvisoryContext>, String> {
-    log::trace!("Listing loaded advisory contexts for session {session_id}");
-
-    let mut advisory_keys = get_session_advisory_refs(&app, &session_id)?;
-
-    // Also check worktree_id refs (create_worktree stores refs under worktree_id)
-    if let Some(ref wt_id) = worktree_id {
-        if let Ok(wt_keys) = get_session_advisory_refs(&app, wt_id) {
-            for key in wt_keys {
-                if !advisory_keys.contains(&key) {
-                    advisory_keys.push(key);
-                }
-            }
-        }
-    }
-
-    if advisory_keys.is_empty() {
-        return Ok(vec![]);
-    }
-
-    let contexts_dir = get_github_contexts_dir(&app)?;
-    let mut contexts = Vec::new();
-
-    for key in advisory_keys {
-        if let Some((owner, repo, ghsa_id)) = parse_advisory_context_key(&key) {
-            let repo_key = format!("{owner}-{repo}");
-            let context_file = contexts_dir.join(format!("{repo_key}-advisory-{ghsa_id}.md"));
-
-            if let Ok(content) = std::fs::read_to_string(&context_file) {
-                // Parse from first line: "# Security Advisory GHSA-xxxx: Summary text"
-                let summary = content
-                    .lines()
-                    .next()
-                    .and_then(|line| line.strip_prefix("# Security Advisory "))
-                    .and_then(|rest| rest.split_once(": "))
-                    .map(|(_, title)| title.to_string())
-                    .unwrap_or_else(|| format!("Advisory {ghsa_id}"));
-
-                // Parse severity from second content line
-                // "**Severity:** critical | **CVE:** CVE-2024-xxxx"
-                let severity = content
-                    .lines()
-                    .nth(2)
-                    .and_then(|line| line.split("**Severity:** ").nth(1))
-                    .and_then(|s| s.split(" |").next().or(Some(s.trim())))
-                    .unwrap_or("unknown")
-                    .to_string();
-
-                contexts.push(LoadedAdvisoryContext {
-                    ghsa_id,
-                    severity,
-                    summary,
-                    repo_owner: owner,
-                    repo_name: repo,
-                });
-            }
-        }
-    }
-
-    contexts.sort_by(|a, b| a.ghsa_id.cmp(&b.ghsa_id));
-    log::trace!("Found {} loaded advisory contexts", contexts.len());
-    Ok(contexts)
+    crate::backend_runtime::context_service(&app)?
+        .list_advisories(&session_id, worktree_id.as_deref())
+        .map_err(|error| error.to_string())
 }
 
 /// Remove a loaded advisory context for a session
@@ -2040,26 +1346,9 @@ pub async fn remove_advisory_context(
     ghsa_id: String,
     project_path: String,
 ) -> Result<(), String> {
-    log::trace!("Removing advisory {ghsa_id} context for session {session_id}");
-
-    let repo_id = get_repo_identifier(&project_path)?;
-    let repo_key = repo_id.to_key();
-
-    let is_orphaned = remove_advisory_reference(&app, &repo_key, &ghsa_id, &session_id)?;
-
-    if is_orphaned {
-        let contexts_dir = get_github_contexts_dir(&app)?;
-        let context_file = contexts_dir.join(format!("{repo_key}-advisory-{ghsa_id}.md"));
-
-        if context_file.exists() {
-            std::fs::remove_file(&context_file)
-                .map_err(|e| format!("Failed to remove advisory context file: {e}"))?;
-            log::trace!("Deleted orphaned advisory context file");
-        }
-    }
-
-    log::trace!("Advisory context removed successfully");
-    Ok(())
+    crate::backend_runtime::context_service(&app)?
+        .remove_advisory(&session_id, &ghsa_id, &project_path)
+        .map_err(|error| error.to_string())
 }
 
 /// Get the content of a loaded advisory context file
@@ -2071,28 +1360,9 @@ pub async fn get_advisory_context_content(
     project_path: String,
     worktree_id: Option<String>,
 ) -> Result<String, String> {
-    let repo_id = get_repo_identifier(&project_path)?;
-    let repo_key = repo_id.to_key();
-
-    let refs = get_session_advisory_refs(&app, &session_id)?;
-    let worktree_refs = worktree_id
-        .as_deref()
-        .map(|id| get_session_advisory_refs(&app, id))
-        .transpose()?;
-    let expected_key = format!("{repo_key}::{ghsa_id}");
-    if !advisory_refs_contain_expected_key(&refs, worktree_refs.as_deref(), &expected_key) {
-        return Err(format!("Session does not have advisory {ghsa_id} loaded"));
-    }
-
-    let contexts_dir = get_github_contexts_dir(&app)?;
-    let context_file = contexts_dir.join(format!("{repo_key}-advisory-{ghsa_id}.md"));
-
-    if !context_file.exists() {
-        return Err(format!("Advisory context file not found for {ghsa_id}"));
-    }
-
-    std::fs::read_to_string(&context_file)
-        .map_err(|e| format!("Failed to read advisory context file: {e}"))
+    crate::backend_runtime::context_service(&app)?
+        .advisory_content(&session_id, worktree_id.as_deref(), &ghsa_id, &project_path)
+        .map_err(|error| error.to_string())
 }
 
 #[cfg(test)]

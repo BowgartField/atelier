@@ -174,6 +174,111 @@ impl CommandDispatcher for HeadlessDispatcher {
                     github.pull_request_detail(path, number)?,
                 )?)
             }
+            "list_dependabot_alerts" => {
+                let path = string_field(&args, "projectPath", "project_path")?;
+                let state = optional_string_field(&args, "state", "state")?;
+                let repository = git.github_repository(path)?;
+                Ok(serde_json::to_value(github.list_dependabot_alerts(
+                    path,
+                    &repository,
+                    state.as_deref(),
+                )?)?)
+            }
+            "get_dependabot_alert" => {
+                let path = string_field(&args, "projectPath", "project_path")?;
+                let number = u32_field(&args, "alertNumber", "alert_number")?;
+                let repository = git.github_repository(path)?;
+                Ok(serde_json::to_value(github.dependabot_alert(
+                    path,
+                    &repository,
+                    number,
+                )?)?)
+            }
+            "list_repository_advisories" => {
+                let path = string_field(&args, "projectPath", "project_path")?;
+                let state = optional_string_field(&args, "state", "state")?;
+                let repository = git.github_repository(path)?;
+                Ok(serde_json::to_value(github.list_repository_advisories(
+                    path,
+                    &repository,
+                    state.as_deref(),
+                )?)?)
+            }
+            "get_repository_advisory" => {
+                let path = string_field(&args, "projectPath", "project_path")?;
+                let ghsa_id = string_field(&args, "ghsaId", "ghsa_id")?;
+                let repository = git.github_repository(path)?;
+                Ok(serde_json::to_value(github.repository_advisory(
+                    path,
+                    &repository,
+                    ghsa_id,
+                )?)?)
+            }
+            "load_security_alert_context" => {
+                let session_id = string_field(&args, "sessionId", "session_id")?;
+                let number = u32_field(&args, "alertNumber", "alert_number")?;
+                let path = string_field(&args, "projectPath", "project_path")?;
+                Ok(serde_json::to_value(
+                    contexts.load_security_alert(&github, session_id, number, path)?,
+                )?)
+            }
+            "list_loaded_security_contexts" => {
+                let session_id = string_field(&args, "sessionId", "session_id")?;
+                let worktree_id = optional_string_field(&args, "worktreeId", "worktree_id")?;
+                Ok(serde_json::to_value(contexts.list_security_alerts(
+                    session_id,
+                    worktree_id.as_deref(),
+                )?)?)
+            }
+            "remove_security_context" => {
+                let session_id = string_field(&args, "sessionId", "session_id")?;
+                let number = u32_field(&args, "alertNumber", "alert_number")?;
+                let path = string_field(&args, "projectPath", "project_path")?;
+                contexts.remove_security_alert(session_id, number, path)?;
+                Ok(Value::Null)
+            }
+            "get_security_context_content" => {
+                let session_id = string_field(&args, "sessionId", "session_id")?;
+                let number = u32_field(&args, "alertNumber", "alert_number")?;
+                let path = string_field(&args, "projectPath", "project_path")?;
+                Ok(Value::String(
+                    contexts.security_alert_content(session_id, number, path)?,
+                ))
+            }
+            "load_advisory_context" => {
+                let session_id = string_field(&args, "sessionId", "session_id")?;
+                let ghsa_id = string_field(&args, "ghsaId", "ghsa_id")?;
+                let path = string_field(&args, "projectPath", "project_path")?;
+                Ok(serde_json::to_value(
+                    contexts.load_advisory(&github, session_id, ghsa_id, path)?,
+                )?)
+            }
+            "list_loaded_advisory_contexts" => {
+                let session_id = string_field(&args, "sessionId", "session_id")?;
+                let worktree_id = optional_string_field(&args, "worktreeId", "worktree_id")?;
+                Ok(serde_json::to_value(
+                    contexts.list_advisories(session_id, worktree_id.as_deref())?,
+                )?)
+            }
+            "remove_advisory_context" => {
+                let session_id = string_field(&args, "sessionId", "session_id")?;
+                let ghsa_id = string_field(&args, "ghsaId", "ghsa_id")?;
+                let path = string_field(&args, "projectPath", "project_path")?;
+                contexts.remove_advisory(session_id, ghsa_id, path)?;
+                Ok(Value::Null)
+            }
+            "get_advisory_context_content" => {
+                let session_id = string_field(&args, "sessionId", "session_id")?;
+                let worktree_id = optional_string_field(&args, "worktreeId", "worktree_id")?;
+                let ghsa_id = string_field(&args, "ghsaId", "ghsa_id")?;
+                let path = string_field(&args, "projectPath", "project_path")?;
+                Ok(Value::String(contexts.advisory_content(
+                    session_id,
+                    worktree_id.as_deref(),
+                    ghsa_id,
+                    path,
+                )?))
+            }
             "list_linear_teams" => {
                 let project_id = string_field(&args, "projectId", "project_id")?;
                 Ok(serde_json::to_value(linear.list_teams(project_id).await?)?)
@@ -1740,11 +1845,35 @@ mod tests {
             "# GitHub Issue #12: Shared dispatch\n\n### @octo (today)\n",
         )
         .unwrap();
+        std::fs::write(
+            directory.join("acme-widget-security-7.md"),
+            "# Dependabot Alert #7: Shared alert\n\n**Severity:** high | **Package:** lodash (npm) | **Manifest:** package.json\n",
+        )
+        .unwrap();
+        std::fs::write(
+            directory.join("acme-widget-advisory-GHSA-abcd-1234-5678.md"),
+            "# Security Advisory GHSA-abcd-1234-5678: Shared advisory\n\n**Severity:** critical | **CVE:** CVE-2026-2\n",
+        )
+        .unwrap();
         context
             .persistence
             .update_context_references(|references| {
                 references.issues.insert(
                     "acme-widget-12".to_string(),
+                    crate::ContextRef {
+                        sessions: vec!["session".to_string()],
+                        orphaned_at: None,
+                    },
+                );
+                references.security.insert(
+                    "acme-widget-7".to_string(),
+                    crate::ContextRef {
+                        sessions: vec!["session".to_string()],
+                        orphaned_at: None,
+                    },
+                );
+                references.advisories.insert(
+                    "acme-widget::GHSA-abcd-1234-5678".to_string(),
                     crate::ContextRef {
                         sessions: vec!["session".to_string()],
                         orphaned_at: None,
@@ -1772,6 +1901,25 @@ mod tests {
             .await
             .unwrap();
         assert!(content.as_str().unwrap().contains("Shared dispatch"));
+        let security = dispatcher
+            .dispatch(
+                "list_loaded_security_contexts",
+                serde_json::json!({"sessionId":"session"}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(security[0]["packageName"], "lodash");
+        let advisory = dispatcher
+            .dispatch(
+                "get_advisory_context_content",
+                serde_json::json!({
+                    "sessionId":"session", "ghsaId":"GHSA-abcd-1234-5678",
+                    "projectPath":path
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(advisory.as_str().unwrap().contains("Shared advisory"));
         dispatcher
             .dispatch(
                 "remove_issue_context",
@@ -1779,7 +1927,30 @@ mod tests {
             )
             .await
             .unwrap();
+        dispatcher
+            .dispatch(
+                "remove_security_context",
+                serde_json::json!({
+                    "sessionId":"session", "alertNumber":7, "projectPath":path
+                }),
+            )
+            .await
+            .unwrap();
+        dispatcher
+            .dispatch(
+                "remove_advisory_context",
+                serde_json::json!({
+                    "sessionId":"session", "ghsaId":"GHSA-abcd-1234-5678",
+                    "projectPath":path
+                }),
+            )
+            .await
+            .unwrap();
         assert!(!directory.join("acme-widget-issue-12.md").exists());
+        assert!(!directory.join("acme-widget-security-7.md").exists());
+        assert!(!directory
+            .join("acme-widget-advisory-GHSA-abcd-1234-5678.md")
+            .exists());
     }
 
     #[tokio::test]

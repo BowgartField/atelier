@@ -408,11 +408,6 @@ pub const UNAVAILABLE_CAPABILITIES: &[CommandCapability] = &[
         available: false,
     },
     CommandCapability {
-        command: "get_advisory_context_content",
-        class: CapabilityClass::AdapterBacked,
-        available: false,
-    },
-    CommandCapability {
         command: "get_app_data_dir",
         class: CapabilityClass::AdapterBacked,
         available: false,
@@ -474,11 +469,6 @@ pub const UNAVAILABLE_CAPABILITIES: &[CommandCapability] = &[
     },
     CommandCapability {
         command: "get_cursor_install_command",
-        class: CapabilityClass::AdapterBacked,
-        available: false,
-    },
-    CommandCapability {
-        command: "get_dependabot_alert",
         class: CapabilityClass::AdapterBacked,
         available: false,
     },
@@ -563,11 +553,6 @@ pub const UNAVAILABLE_CAPABILITIES: &[CommandCapability] = &[
         available: false,
     },
     CommandCapability {
-        command: "get_repository_advisory",
-        class: CapabilityClass::AdapterBacked,
-        available: false,
-    },
-    CommandCapability {
         command: "get_review_job",
         class: CapabilityClass::AdapterBacked,
         available: false,
@@ -584,11 +569,6 @@ pub const UNAVAILABLE_CAPABILITIES: &[CommandCapability] = &[
     },
     CommandCapability {
         command: "get_scheduled_wakeup",
-        class: CapabilityClass::AdapterBacked,
-        available: false,
-    },
-    CommandCapability {
-        command: "get_security_context_content",
         class: CapabilityClass::AdapterBacked,
         available: false,
     },
@@ -738,11 +718,6 @@ pub const UNAVAILABLE_CAPABILITIES: &[CommandCapability] = &[
         available: false,
     },
     CommandCapability {
-        command: "list_dependabot_alerts",
-        class: CapabilityClass::AdapterBacked,
-        available: false,
-    },
-    CommandCapability {
         command: "list_github_releases",
         class: CapabilityClass::AdapterBacked,
         available: false,
@@ -759,16 +734,6 @@ pub const UNAVAILABLE_CAPABILITIES: &[CommandCapability] = &[
     },
     CommandCapability {
         command: "list_http_bind_host_options",
-        class: CapabilityClass::AdapterBacked,
-        available: false,
-    },
-    CommandCapability {
-        command: "list_loaded_advisory_contexts",
-        class: CapabilityClass::AdapterBacked,
-        available: false,
-    },
-    CommandCapability {
-        command: "list_loaded_security_contexts",
         class: CapabilityClass::AdapterBacked,
         available: false,
     },
@@ -818,11 +783,6 @@ pub const UNAVAILABLE_CAPABILITIES: &[CommandCapability] = &[
         available: false,
     },
     CommandCapability {
-        command: "list_repository_advisories",
-        class: CapabilityClass::AdapterBacked,
-        available: false,
-    },
-    CommandCapability {
         command: "list_review_jobs",
         class: CapabilityClass::AdapterBacked,
         available: false,
@@ -843,22 +803,12 @@ pub const UNAVAILABLE_CAPABILITIES: &[CommandCapability] = &[
         available: false,
     },
     CommandCapability {
-        command: "load_advisory_context",
-        class: CapabilityClass::AdapterBacked,
-        available: false,
-    },
-    CommandCapability {
         command: "load_emergency_data",
         class: CapabilityClass::AdapterBacked,
         available: false,
     },
     CommandCapability {
         command: "load_older_session_messages",
-        class: CapabilityClass::AdapterBacked,
-        available: false,
-    },
-    CommandCapability {
-        command: "load_security_alert_context",
         class: CapabilityClass::AdapterBacked,
         available: false,
     },
@@ -998,11 +948,6 @@ pub const UNAVAILABLE_CAPABILITIES: &[CommandCapability] = &[
         available: false,
     },
     CommandCapability {
-        command: "remove_advisory_context",
-        class: CapabilityClass::AdapterBacked,
-        available: false,
-    },
-    CommandCapability {
         command: "remove_project_avatar",
         class: CapabilityClass::AdapterBacked,
         available: false,
@@ -1019,11 +964,6 @@ pub const UNAVAILABLE_CAPABILITIES: &[CommandCapability] = &[
     },
     CommandCapability {
         command: "remove_saved_context",
-        class: CapabilityClass::AdapterBacked,
-        available: false,
-    },
-    CommandCapability {
-        command: "remove_security_context",
         class: CapabilityClass::AdapterBacked,
         available: false,
     },

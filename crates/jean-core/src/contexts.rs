@@ -177,6 +177,27 @@ pub struct LoadedLinearIssueContext {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct LoadedSecurityAlertContext {
+    pub number: u32,
+    pub package_name: String,
+    pub severity: String,
+    pub summary: String,
+    pub repo_owner: String,
+    pub repo_name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LoadedAdvisoryContext {
+    pub ghsa_id: String,
+    pub severity: String,
+    pub summary: String,
+    pub repo_owner: String,
+    pub repo_name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct LinearIssueContextContent {
     pub identifier: String,
     pub title: String,
@@ -547,6 +568,257 @@ impl ContextService {
         self.numbered_content("prs", "pr", session_id, number, project_path)
     }
 
+    pub fn load_security_alert(
+        &self,
+        github: &GitHubService,
+        session_id: &str,
+        number: u32,
+        project_path: &str,
+    ) -> Result<LoadedSecurityAlertContext, BackendError> {
+        let repository = self.git.github_repository(project_path)?;
+        let alert = github.dependabot_alert(project_path, &repository, number)?;
+        let context = SecurityAlertContext {
+            number: alert.number,
+            package_name: alert.package_name.clone(),
+            package_ecosystem: alert.package_ecosystem,
+            severity: alert.severity.clone(),
+            summary: alert.summary.clone(),
+            description: alert.description,
+            ghsa_id: alert.ghsa_id,
+            cve_id: alert.cve_id,
+            manifest_path: alert.manifest_path,
+            html_url: Some(alert.html_url),
+        };
+        std::fs::write(
+            self.persistence
+                .git_contexts_dir()?
+                .join(format!("{}-security-{number}.md", repository.key())),
+            format_security_context_markdown(&context),
+        )?;
+        self.add_reference(
+            "security",
+            format!("{}-{number}", repository.key()),
+            session_id,
+        )?;
+        Ok(LoadedSecurityAlertContext {
+            number: alert.number,
+            package_name: alert.package_name,
+            severity: alert.severity,
+            summary: alert.summary,
+            repo_owner: repository.owner,
+            repo_name: repository.repo,
+        })
+    }
+
+    pub fn list_security_alerts(
+        &self,
+        session_id: &str,
+        worktree_id: Option<&str>,
+    ) -> Result<Vec<LoadedSecurityAlertContext>, BackendError> {
+        let mut contexts = Vec::new();
+        for key in self.combined_keys("security", session_id, worktree_id)? {
+            let Some((owner, repo, number)) = parse_numbered_context_key(&key) else {
+                continue;
+            };
+            let path = self
+                .persistence
+                .git_contexts_dir()?
+                .join(format!("{owner}-{repo}-security-{number}.md"));
+            let Ok(content) = std::fs::read_to_string(path) else {
+                continue;
+            };
+            let summary = context_title(&content, "# Dependabot Alert #")
+                .unwrap_or_else(|| format!("Alert #{number}"));
+            let metadata = content.lines().nth(2).unwrap_or_default();
+            let severity = metadata_value(metadata, "**Severity:** ", " |")
+                .unwrap_or("unknown")
+                .to_string();
+            let package_name = metadata_value(metadata, "**Package:** ", " (")
+                .unwrap_or("unknown")
+                .to_string();
+            contexts.push(LoadedSecurityAlertContext {
+                number,
+                package_name,
+                severity,
+                summary,
+                repo_owner: owner,
+                repo_name: repo,
+            });
+        }
+        contexts.sort_by_key(|context| context.number);
+        Ok(contexts)
+    }
+
+    pub fn remove_security_alert(
+        &self,
+        session_id: &str,
+        number: u32,
+        project_path: &str,
+    ) -> Result<(), BackendError> {
+        let repository = self.git.github_repository(project_path)?;
+        if self.remove_reference(
+            "security",
+            &format!("{}-{number}", repository.key()),
+            session_id,
+        )? {
+            remove_file_if_exists(
+                &self
+                    .persistence
+                    .git_contexts_dir()?
+                    .join(format!("{}-security-{number}.md", repository.key())),
+            )?;
+        }
+        Ok(())
+    }
+
+    pub fn security_alert_content(
+        &self,
+        session_id: &str,
+        number: u32,
+        project_path: &str,
+    ) -> Result<String, BackendError> {
+        self.numbered_content("security", "security", session_id, number, project_path)
+    }
+
+    pub fn security_keys(&self, session_id: &str) -> Result<Vec<String>, BackendError> {
+        self.combined_keys("security", session_id, None)
+    }
+
+    pub fn load_advisory(
+        &self,
+        github: &GitHubService,
+        session_id: &str,
+        ghsa_id: &str,
+        project_path: &str,
+    ) -> Result<LoadedAdvisoryContext, BackendError> {
+        let repository = self.git.github_repository(project_path)?;
+        let advisory = github.repository_advisory(project_path, &repository, ghsa_id)?;
+        let context = AdvisoryContext {
+            ghsa_id: advisory.ghsa_id.clone(),
+            severity: advisory.severity.clone(),
+            summary: advisory.summary.clone(),
+            description: advisory.description,
+            cve_id: advisory.cve_id,
+            vulnerabilities: advisory.vulnerabilities,
+            html_url: Some(advisory.html_url),
+        };
+        std::fs::write(
+            self.persistence.git_contexts_dir()?.join(format!(
+                "{}-advisory-{}.md",
+                repository.key(),
+                context.ghsa_id
+            )),
+            format_advisory_context_markdown(&context),
+        )?;
+        self.add_reference(
+            "advisories",
+            format!("{}::{}", repository.key(), context.ghsa_id),
+            session_id,
+        )?;
+        Ok(LoadedAdvisoryContext {
+            ghsa_id: advisory.ghsa_id,
+            severity: advisory.severity,
+            summary: advisory.summary,
+            repo_owner: repository.owner,
+            repo_name: repository.repo,
+        })
+    }
+
+    pub fn list_advisories(
+        &self,
+        session_id: &str,
+        worktree_id: Option<&str>,
+    ) -> Result<Vec<LoadedAdvisoryContext>, BackendError> {
+        let mut contexts = Vec::new();
+        for key in self.combined_keys("advisories", session_id, worktree_id)? {
+            let Some((owner, repo, ghsa_id)) = parse_advisory_context_key(&key) else {
+                continue;
+            };
+            let path = self
+                .persistence
+                .git_contexts_dir()?
+                .join(format!("{owner}-{repo}-advisory-{ghsa_id}.md"));
+            let Ok(content) = std::fs::read_to_string(path) else {
+                continue;
+            };
+            let summary = context_title(&content, "# Security Advisory ")
+                .unwrap_or_else(|| format!("Advisory {ghsa_id}"));
+            let severity = content
+                .lines()
+                .nth(2)
+                .and_then(|line| metadata_value(line, "**Severity:** ", " |"))
+                .unwrap_or("unknown")
+                .to_string();
+            contexts.push(LoadedAdvisoryContext {
+                ghsa_id,
+                severity,
+                summary,
+                repo_owner: owner,
+                repo_name: repo,
+            });
+        }
+        contexts.sort_by(|left, right| left.ghsa_id.cmp(&right.ghsa_id));
+        Ok(contexts)
+    }
+
+    pub fn remove_advisory(
+        &self,
+        session_id: &str,
+        ghsa_id: &str,
+        project_path: &str,
+    ) -> Result<(), BackendError> {
+        let repository = self.git.github_repository(project_path)?;
+        if self.remove_reference(
+            "advisories",
+            &format!("{}::{ghsa_id}", repository.key()),
+            session_id,
+        )? {
+            remove_file_if_exists(
+                &self
+                    .persistence
+                    .git_contexts_dir()?
+                    .join(format!("{}-advisory-{ghsa_id}.md", repository.key())),
+            )?;
+        }
+        Ok(())
+    }
+
+    pub fn advisory_content(
+        &self,
+        session_id: &str,
+        worktree_id: Option<&str>,
+        ghsa_id: &str,
+        project_path: &str,
+    ) -> Result<String, BackendError> {
+        let repository = self.git.github_repository(project_path)?;
+        let expected = format!("{}::{ghsa_id}", repository.key());
+        if !self
+            .combined_keys("advisories", session_id, worktree_id)?
+            .iter()
+            .any(|key| key == &expected)
+        {
+            return Err(BackendError::new(
+                BackendErrorCode::InvalidArgument,
+                format!("Session does not have advisory {ghsa_id} loaded"),
+            ));
+        }
+        std::fs::read_to_string(
+            self.persistence
+                .git_contexts_dir()?
+                .join(format!("{}-advisory-{ghsa_id}.md", repository.key())),
+        )
+        .map_err(|error| {
+            BackendError::new(
+                BackendErrorCode::Io,
+                format!("Failed to read advisory context file: {error}"),
+            )
+        })
+    }
+
+    pub fn advisory_keys(&self, session_id: &str) -> Result<Vec<String>, BackendError> {
+        self.combined_keys("advisories", session_id, None)
+    }
+
     pub async fn load_linear_issue(
         &self,
         linear: &LinearService,
@@ -844,6 +1116,18 @@ fn parse_numbered_context_key(key: &str) -> Option<(String, String, u32)> {
     let (repository, number) = key.rsplit_once('-')?;
     let (owner, repo) = repository.split_once('-')?;
     Some((owner.to_string(), repo.to_string(), number.parse().ok()?))
+}
+
+fn parse_advisory_context_key(key: &str) -> Option<(String, String, String)> {
+    let (repository, ghsa_id) = key.split_once("::")?;
+    let (owner, repo) = repository.split_once('-')?;
+    Some((owner.to_string(), repo.to_string(), ghsa_id.to_string()))
+}
+
+fn metadata_value<'a>(line: &'a str, prefix: &str, end: &str) -> Option<&'a str> {
+    line.split(prefix)
+        .nth(1)
+        .map(|value| value.split(end).next().unwrap_or(value).trim())
 }
 
 fn context_title(content: &str, prefix: &str) -> Option<String> {
@@ -1475,6 +1759,8 @@ mod tests {
                 (Some("issue"), Some("view")) => br#"{"number":12,"title":"Shared issue","body":"body","state":"OPEN","labels":[],"createdAt":"2026-01-01","author":{"login":"octo"},"comments":[{"body":"hello","author":{"login":"octo"},"createdAt":"2026-01-02"}]}"#.as_slice(),
                 (Some("pr"), Some("view")) => br#"{"number":42,"title":"Shared PR","body":"body","state":"OPEN","headRefName":"feature","baseRefName":"main","isDraft":false,"createdAt":"2026-01-01","author":{"login":"octo"},"comments":[{"body":"comment","author":{"login":"octo"},"createdAt":"2026-01-02"}],"reviews":[{"body":"review","state":"APPROVED","author":{"login":"reviewer"},"submittedAt":"2026-01-03"}]}"#.as_slice(),
                 (Some("pr"), Some("diff")) => b"diff --git a/file b/file\n".as_slice(),
+                (Some("api"), Some(endpoint)) if endpoint.contains("dependabot") => br#"{"number":7,"state":"open","dependency":{"package":{"name":"lodash","ecosystem":"npm"},"manifest_path":"package.json"},"security_advisory":{"ghsa_id":"GHSA-test","cve_id":"CVE-2026-1","summary":"Prototype pollution","description":"details","severity":"high"},"created_at":"2026-01-01","html_url":"https://github.com/acme/widget/security/dependabot/7"}"#.as_slice(),
+                (Some("api"), Some(endpoint)) if endpoint.contains("security-advisories") => br#"{"ghsa_id":"GHSA-abcd-1234-5678","cve_id":"CVE-2026-2","summary":"Private advisory","description":"details","severity":"critical","state":"published","author":{"login":"octo"},"publisher":null,"created_at":"2026-01-01","published_at":"2026-01-02","html_url":"https://github.com/acme/widget/security/advisories/GHSA-abcd-1234-5678","vulnerabilities":[{"package":{"name":"crate","ecosystem":"rust"},"vulnerable_version_range":"< 2","patched_versions":"2.0"}]}"#.as_slice(),
                 _ => unreachable!(),
             };
             Ok(successful_output(stdout))
@@ -1486,8 +1772,16 @@ mod tests {
         let pr = service
             .load_pull_request(&github, "session", 42, path)
             .unwrap();
+        let security = service
+            .load_security_alert(&github, "session", 7, path)
+            .unwrap();
+        let advisory = service
+            .load_advisory(&github, "session", "GHSA-abcd-1234-5678", path)
+            .unwrap();
         assert_eq!(issue.comment_count, 1);
         assert_eq!(pr.review_count, 1);
+        assert_eq!(security.package_name, "lodash");
+        assert_eq!(advisory.severity, "critical");
         assert_eq!(
             service.list_issues("session", None).unwrap()[0].title,
             "Shared issue"
@@ -1504,12 +1798,36 @@ mod tests {
             .pull_request_content("session", 42, path)
             .unwrap()
             .contains("diff --git"));
+        assert_eq!(
+            service.list_security_alerts("session", None).unwrap()[0].summary,
+            "Prototype pollution"
+        );
+        assert_eq!(
+            service.list_advisories("session", None).unwrap()[0].summary,
+            "Private advisory"
+        );
+        assert!(service
+            .security_alert_content("session", 7, path)
+            .unwrap()
+            .contains("lodash"));
+        assert!(service
+            .advisory_content("session", None, "GHSA-abcd-1234-5678", path,)
+            .unwrap()
+            .contains("Private advisory"));
 
         service.remove_issue("session", 12, path).unwrap();
         service.remove_pull_request("session", 42, path).unwrap();
+        service.remove_security_alert("session", 7, path).unwrap();
+        service
+            .remove_advisory("session", "GHSA-abcd-1234-5678", path)
+            .unwrap();
         let directory = persistence.git_contexts_dir().unwrap();
         assert!(!directory.join("acme-widget-issue-12.md").exists());
         assert!(!directory.join("acme-widget-pr-42.md").exists());
+        assert!(!directory.join("acme-widget-security-7.md").exists());
+        assert!(!directory
+            .join("acme-widget-advisory-GHSA-abcd-1234-5678.md")
+            .exists());
         assert!(service.issue_content("session", 12, path).is_err());
     }
 
