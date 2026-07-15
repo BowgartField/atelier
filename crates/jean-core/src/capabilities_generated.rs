@@ -528,16 +528,6 @@ pub const UNAVAILABLE_CAPABILITIES: &[CommandCapability] = &[
         available: false,
     },
     CommandCapability {
-        command: "get_linear_issue",
-        class: CapabilityClass::AdapterBacked,
-        available: false,
-    },
-    CommandCapability {
-        command: "get_linear_issue_by_number",
-        class: CapabilityClass::AdapterBacked,
-        available: false,
-    },
-    CommandCapability {
         command: "get_linear_issue_context_contents",
         class: CapabilityClass::AdapterBacked,
         available: false,
@@ -784,16 +774,6 @@ pub const UNAVAILABLE_CAPABILITIES: &[CommandCapability] = &[
     },
     CommandCapability {
         command: "list_http_bind_host_options",
-        class: CapabilityClass::AdapterBacked,
-        available: false,
-    },
-    CommandCapability {
-        command: "list_linear_issues",
-        class: CapabilityClass::AdapterBacked,
-        available: false,
-    },
-    CommandCapability {
-        command: "list_linear_teams",
         class: CapabilityClass::AdapterBacked,
         available: false,
     },
@@ -1229,11 +1209,6 @@ pub const UNAVAILABLE_CAPABILITIES: &[CommandCapability] = &[
     },
     CommandCapability {
         command: "save_worktree_pr",
-        class: CapabilityClass::AdapterBacked,
-        available: false,
-    },
-    CommandCapability {
-        command: "search_linear_issues",
         class: CapabilityClass::AdapterBacked,
         available: false,
     },

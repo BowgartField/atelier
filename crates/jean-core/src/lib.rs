@@ -9,6 +9,7 @@ pub mod events;
 pub mod git;
 pub mod git_status;
 pub mod github;
+pub mod linear;
 pub mod names;
 pub mod paths;
 pub mod persistence;
@@ -40,6 +41,10 @@ pub use git_status::{ActiveWorktreeInfo, GitBranchStatus};
 pub use github::{
     GhRunner, GitHubIssue, GitHubIssueDetail, GitHubIssueListResult, GitHubLabel,
     GitHubPullRequest, GitHubPullRequestDetail, GitHubService,
+};
+pub use linear::{
+    LinearConfig, LinearIssue, LinearIssueDetail, LinearIssueListResult, LinearIssueState,
+    LinearLabel, LinearService, LinearTeam, LinearTransport, ReqwestLinearTransport,
 };
 pub use paths::{AppPaths, HeadlessAppPaths, ResolvedAppPaths};
 pub use persistence::{PersistenceService, ProjectsSnapshot};

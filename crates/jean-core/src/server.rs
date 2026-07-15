@@ -1,7 +1,7 @@
 use crate::auth::validate_token;
 use crate::{
     BackendContext, BackendError, BackendErrorCode, ChatService, GitHubService, GitService,
-    ProjectService, SessionService, WsEvent,
+    LinearService, ProjectService, SessionService, WsEvent,
 };
 use async_trait::async_trait;
 use axum::body::Body;
@@ -104,6 +104,7 @@ impl CommandDispatcher for HeadlessDispatcher {
         let projects = ProjectService::new(self.context.persistence.clone());
         let git = GitService::default();
         let github = GitHubService::default();
+        let linear = LinearService::new(self.context.persistence.clone());
         let sessions = SessionService::new(self.context.persistence.clone());
         let chat = ChatService::new(self.context.clone());
         match command {
@@ -165,6 +166,35 @@ impl CommandDispatcher for HeadlessDispatcher {
                 let number = u32_field(&args, "prNumber", "pr_number")?;
                 Ok(serde_json::to_value(
                     github.pull_request_detail(path, number)?,
+                )?)
+            }
+            "list_linear_teams" => {
+                let project_id = string_field(&args, "projectId", "project_id")?;
+                Ok(serde_json::to_value(linear.list_teams(project_id).await?)?)
+            }
+            "list_linear_issues" => {
+                let project_id = string_field(&args, "projectId", "project_id")?;
+                Ok(serde_json::to_value(linear.list_issues(project_id).await?)?)
+            }
+            "search_linear_issues" => {
+                let project_id = string_field(&args, "projectId", "project_id")?;
+                let query = string_field(&args, "query", "query")?;
+                Ok(serde_json::to_value(
+                    linear.search_issues(project_id, query).await?,
+                )?)
+            }
+            "get_linear_issue" => {
+                let project_id = string_field(&args, "projectId", "project_id")?;
+                let issue_id = string_field(&args, "issueId", "issue_id")?;
+                Ok(serde_json::to_value(
+                    linear.issue(project_id, issue_id).await?,
+                )?)
+            }
+            "get_linear_issue_by_number" => {
+                let project_id = string_field(&args, "projectId", "project_id")?;
+                let number = i64_field(&args, "issueNumber", "issue_number")?;
+                Ok(serde_json::to_value(
+                    linear.issue_by_number(project_id, number).await?,
                 )?)
             }
             "load_preferences" => self.context.persistence.load_preferences(),
@@ -879,6 +909,13 @@ fn u32_field(args: &Value, camel_case: &str, snake_case: &str) -> Result<u32, Ba
         .or_else(|| args.get(snake_case))
         .and_then(Value::as_u64)
         .and_then(|value| u32::try_from(value).ok())
+        .ok_or_else(|| missing_field(camel_case))
+}
+
+fn i64_field(args: &Value, camel_case: &str, snake_case: &str) -> Result<i64, BackendError> {
+    args.get(camel_case)
+        .or_else(|| args.get(snake_case))
+        .and_then(Value::as_i64)
         .ok_or_else(|| missing_field(camel_case))
 }
 

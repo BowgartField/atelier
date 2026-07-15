@@ -7,70 +7,15 @@ use tauri::AppHandle;
 use super::github_issues::{
     get_github_contexts_dir, load_context_references, save_context_references, IssueContext,
 };
-use super::storage::load_projects_data;
 
-pub use jean_core::{LinearComment, LinearIssueContext, LinearUser};
+pub use jean_core::{
+    LinearIssue, LinearIssueContext, LinearIssueDetail, LinearIssueListResult, LinearIssueState,
+    LinearTeam,
+};
 
 // =============================================================================
 // Types
 // =============================================================================
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct LinearIssueState {
-    pub name: String,
-    #[serde(rename = "type")]
-    pub state_type: String,
-    pub color: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct LinearLabel {
-    pub name: String,
-    pub color: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct LinearIssue {
-    pub id: String,
-    pub identifier: String,
-    pub title: String,
-    pub description: Option<String>,
-    pub state: LinearIssueState,
-    #[serde(default)]
-    pub labels: Vec<LinearLabel>,
-    pub assignee: Option<LinearUser>,
-    pub created_at: String,
-    pub url: String,
-    pub priority: u32,
-    pub priority_label: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct LinearIssueDetail {
-    pub id: String,
-    pub identifier: String,
-    pub title: String,
-    pub description: Option<String>,
-    pub state: LinearIssueState,
-    #[serde(default)]
-    pub labels: Vec<LinearLabel>,
-    pub assignee: Option<LinearUser>,
-    pub created_at: String,
-    pub url: String,
-    pub priority: u32,
-    pub priority_label: String,
-    pub comments: Vec<LinearComment>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct LinearIssueListResult {
-    pub issues: Vec<LinearIssue>,
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -82,61 +27,11 @@ pub struct LoadedLinearIssueContext {
     pub url: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct LinearTeam {
-    pub id: String,
-    pub name: String,
-    pub key: String,
-}
-
 // =============================================================================
 // GraphQL Client
 // =============================================================================
 
-const LINEAR_API_URL: &str = "https://api.linear.app/graphql";
 const MAX_LINEAR_CONTEXT_IMAGE_BYTES: usize = 15 * 1024 * 1024;
-
-async fn linear_graphql(
-    api_key: &str,
-    query: &str,
-    variables: Option<serde_json::Value>,
-) -> Result<serde_json::Value, String> {
-    let client = reqwest::Client::new();
-    let mut body = serde_json::json!({ "query": query });
-    if let Some(vars) = variables {
-        body["variables"] = vars;
-    }
-
-    let response = client
-        .post(LINEAR_API_URL)
-        .header("Authorization", api_key)
-        .header("Content-Type", "application/json")
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| format!("Linear API request failed: {e}"))?;
-
-    if !response.status().is_success() {
-        let status = response.status();
-        let text = response.text().await.unwrap_or_default();
-        if status.as_u16() == 401 {
-            return Err("Linear API key is invalid. Update it in project settings.".to_string());
-        }
-        return Err(format!("Linear API error ({status}): {text}"));
-    }
-
-    let json: serde_json::Value = response
-        .json()
-        .await
-        .map_err(|e| format!("Failed to parse Linear response: {e}"))?;
-
-    if let Some(errors) = json.get("errors") {
-        return Err(format!("Linear GraphQL errors: {errors}"));
-    }
-
-    Ok(json)
-}
 
 // =============================================================================
 // Helpers
@@ -461,220 +356,15 @@ struct LinearConfig {
 
 /// Get the Linear config for a project, falling back to global preferences for the API key.
 fn get_linear_config(app: &AppHandle, project_id: &str) -> Result<LinearConfig, String> {
-    let data = load_projects_data(app)?;
-    let project = data
-        .find_project(project_id)
-        .ok_or_else(|| format!("Project not found: {project_id}"))?;
-
-    let team_id = project.linear_team_id.clone().filter(|t| !t.is_empty());
-    let project_name = project.name.clone();
-
-    // 1. Check project-level key first
-    if let Some(key) = project.linear_api_key.as_ref().filter(|k| !k.is_empty()) {
-        return Ok(LinearConfig {
-            api_key: key.clone(),
-            project_name,
-            team_id,
-        });
-    }
-
-    // 2. Fall back to global key from AppPreferences
-    let prefs = crate::load_preferences_sync(app)?;
-    if let Some(key) = prefs.linear_api_key.as_ref().filter(|k| !k.is_empty()) {
-        return Ok(LinearConfig {
-            api_key: key.clone(),
-            project_name,
-            team_id,
-        });
-    }
-
-    Err("No Linear API key configured. Add one in Settings → Integrations, or override per-project.".to_string())
-}
-
-/// Parse a GraphQL response node into a LinearIssue
-fn parse_issue_node(node: &serde_json::Value) -> Option<LinearIssue> {
-    let state = node.get("state")?;
-    let labels_nodes = node
-        .get("labels")
-        .and_then(|l| l.get("nodes"))
-        .and_then(|n| n.as_array())
-        .cloned()
-        .unwrap_or_default();
-
-    let labels: Vec<LinearLabel> = labels_nodes
-        .iter()
-        .filter_map(|l| {
-            Some(LinearLabel {
-                name: l.get("name")?.as_str()?.to_string(),
-                color: l.get("color")?.as_str()?.to_string(),
-            })
-        })
-        .collect();
-
-    let assignee = node.get("assignee").and_then(|a| {
-        if a.is_null() {
-            None
-        } else {
-            Some(LinearUser {
-                name: a.get("name")?.as_str()?.to_string(),
-                display_name: a.get("displayName")?.as_str()?.to_string(),
-            })
-        }
-    });
-
-    Some(LinearIssue {
-        id: node.get("id")?.as_str()?.to_string(),
-        identifier: node.get("identifier")?.as_str()?.to_string(),
-        title: node.get("title")?.as_str()?.to_string(),
-        description: node
-            .get("description")
-            .and_then(|d| d.as_str())
-            .map(|s| s.to_string()),
-        state: LinearIssueState {
-            name: state.get("name")?.as_str()?.to_string(),
-            state_type: state.get("type")?.as_str()?.to_string(),
-            color: state.get("color")?.as_str()?.to_string(),
-        },
-        labels,
-        assignee,
-        created_at: node.get("createdAt")?.as_str()?.to_string(),
-        url: node.get("url")?.as_str()?.to_string(),
-        priority: node.get("priority")?.as_u64()? as u32,
-        priority_label: node
-            .get("priorityLabel")
-            .and_then(|p| p.as_str())
-            .unwrap_or("No priority")
-            .to_string(),
+    let config = crate::backend_runtime::linear_service(app)?
+        .config(project_id)
+        .map_err(|error| error.to_string())?;
+    Ok(LinearConfig {
+        api_key: config.api_key,
+        project_name: config.project_name,
+        team_id: config.team_id,
     })
 }
-
-// =============================================================================
-// GraphQL Queries
-// =============================================================================
-
-const ISSUE_FIELDS: &str = r#"
-            id
-            identifier
-            title
-            description
-            state { name type color }
-            labels { nodes { name color } }
-            assignee { name displayName }
-            createdAt
-            url
-            priority
-            priorityLabel
-"#;
-
-/// Build list issues query, optionally filtering by team.
-fn build_list_issues_query(team_id: Option<&str>) -> String {
-    let team_filter = match team_id {
-        Some(_) => r#", team: { id: { eq: $teamId } }"#,
-        None => "",
-    };
-    let vars = match team_id {
-        Some(_) => "($teamId: ID!)",
-        None => "",
-    };
-    format!(
-        r#"query ListIssues{vars} {{
-    issues(
-        filter: {{
-            state: {{ type: {{ in: ["started", "unstarted", "backlog", "triage"] }} }}{team_filter}
-        }}
-        orderBy: updatedAt
-        first: 100
-    ) {{
-        nodes {{{ISSUE_FIELDS}
-        }}
-    }}
-}}"#
-    )
-}
-
-/// Build search issues query, optionally filtering by team.
-fn build_search_issues_query(team_id: Option<&str>) -> String {
-    let team_filter = match team_id {
-        Some(_) => r#", team: { id: { eq: $teamId } }"#,
-        None => "",
-    };
-    let vars = match team_id {
-        Some(_) => "($query: String!, $teamId: ID!)",
-        None => "($query: String!)",
-    };
-    format!(
-        r#"query SearchIssues{vars} {{
-    issueSearch(query: $query, first: 50, filter: {{
-        state: {{ type: {{ in: ["started", "unstarted", "backlog", "triage"] }} }}{team_filter}
-    }}) {{
-        nodes {{{ISSUE_FIELDS}
-        }}
-    }}
-}}"#
-    )
-}
-
-const LIST_TEAMS_QUERY: &str = r#"
-query ListTeams {
-    teams(first: 250) {
-        nodes {
-            id
-            name
-            key
-        }
-    }
-}
-"#;
-
-/// Build get-issue-by-number query, optionally filtering by team.
-fn build_issue_by_number_query(team_id: Option<&str>) -> String {
-    let team_filter = match team_id {
-        Some(_) => r#", team: { id: { eq: $teamId } }"#,
-        None => "",
-    };
-    let vars = match team_id {
-        Some(_) => "($number: Float!, $teamId: ID!)",
-        None => "($number: Float!)",
-    };
-    format!(
-        r#"query GetIssueByNumber{vars} {{
-    issues(
-        filter: {{
-            number: {{ eq: $number }}{team_filter}
-        }}
-        first: 1
-    ) {{
-        nodes {{{ISSUE_FIELDS}
-        }}
-    }}
-}}"#
-    )
-}
-
-const GET_ISSUE_QUERY: &str = r#"
-query GetIssue($id: String!) {
-    issue(id: $id) {
-        id
-        identifier
-        title
-        description
-        state { name type color }
-        labels { nodes { name color } }
-        assignee { name displayName }
-        createdAt
-        url
-        priority
-        priorityLabel
-        comments {
-            nodes {
-                body
-                user { name displayName }
-                createdAt
-            }
-        }
-    }
-}
-"#;
 
 // =============================================================================
 // Tauri Commands
@@ -686,42 +376,10 @@ pub async fn list_linear_teams(
     app: AppHandle,
     project_id: String,
 ) -> Result<Vec<LinearTeam>, String> {
-    log::info!("Listing Linear teams for project {project_id}");
-
-    let config = get_linear_config(&app, &project_id)?;
-    log::info!(
-        "Linear config resolved: api_key_len={}, project={}",
-        config.api_key.len(),
-        config.project_name
-    );
-
-    let response = linear_graphql(&config.api_key, LIST_TEAMS_QUERY, None).await?;
-    log::info!("Linear teams raw response: {response}");
-
-    let nodes = response
-        .get("data")
-        .and_then(|d| d.get("teams"))
-        .and_then(|t| t.get("nodes"))
-        .and_then(|n| n.as_array())
-        .ok_or("Unexpected Linear API response format")?;
-
-    log::info!("Linear teams raw nodes count: {}", nodes.len());
-
-    let teams: Vec<LinearTeam> = nodes
-        .iter()
-        .filter_map(|node| {
-            let team = LinearTeam {
-                id: node.get("id")?.as_str()?.to_string(),
-                name: node.get("name")?.as_str()?.to_string(),
-                key: node.get("key")?.as_str()?.to_string(),
-            };
-            log::info!("Parsed team: {} ({}) [{}]", team.name, team.key, team.id);
-            Some(team)
-        })
-        .collect();
-
-    log::info!("Found {} Linear teams total", teams.len());
-    Ok(teams)
+    crate::backend_runtime::linear_service(&app)?
+        .list_teams(&project_id)
+        .await
+        .map_err(|error| error.to_string())
 }
 
 /// List Linear issues for a project (active states only)
@@ -730,25 +388,10 @@ pub async fn list_linear_issues(
     app: AppHandle,
     project_id: String,
 ) -> Result<LinearIssueListResult, String> {
-    log::trace!("Listing Linear issues for project {project_id}");
-
-    let config = get_linear_config(&app, &project_id)?;
-    let query = build_list_issues_query(config.team_id.as_deref());
-    let variables = config.team_id.map(|id| serde_json::json!({ "teamId": id }));
-
-    let response = linear_graphql(&config.api_key, &query, variables).await?;
-
-    let nodes = response
-        .get("data")
-        .and_then(|d| d.get("issues"))
-        .and_then(|i| i.get("nodes"))
-        .and_then(|n| n.as_array())
-        .ok_or("Unexpected Linear API response format")?;
-
-    let issues: Vec<LinearIssue> = nodes.iter().filter_map(parse_issue_node).collect();
-
-    log::trace!("Found {} Linear issues", issues.len());
-    Ok(LinearIssueListResult { issues })
+    crate::backend_runtime::linear_service(&app)?
+        .list_issues(&project_id)
+        .await
+        .map_err(|error| error.to_string())
 }
 
 /// Search Linear issues
@@ -758,27 +401,10 @@ pub async fn search_linear_issues(
     project_id: String,
     query: String,
 ) -> Result<Vec<LinearIssue>, String> {
-    log::trace!("Searching Linear issues for project {project_id}: {query}");
-
-    let config = get_linear_config(&app, &project_id)?;
-    let gql_query = build_search_issues_query(config.team_id.as_deref());
-    let mut variables = serde_json::json!({ "query": query });
-    if let Some(team_id) = &config.team_id {
-        variables["teamId"] = serde_json::json!(team_id);
-    }
-    let response = linear_graphql(&config.api_key, &gql_query, Some(variables)).await?;
-
-    let nodes = response
-        .get("data")
-        .and_then(|d| d.get("issueSearch"))
-        .and_then(|i| i.get("nodes"))
-        .and_then(|n| n.as_array())
-        .ok_or("Unexpected Linear search response format")?;
-
-    let issues: Vec<LinearIssue> = nodes.iter().filter_map(parse_issue_node).collect();
-
-    log::trace!("Search returned {} Linear issues", issues.len());
-    Ok(issues)
+    crate::backend_runtime::linear_service(&app)?
+        .search_issues(&project_id, &query)
+        .await
+        .map_err(|error| error.to_string())
 }
 
 /// Get a single Linear issue with comments
@@ -788,61 +414,10 @@ pub async fn get_linear_issue(
     project_id: String,
     issue_id: String,
 ) -> Result<LinearIssueDetail, String> {
-    log::trace!("Getting Linear issue {issue_id} for project {project_id}");
-
-    let config = get_linear_config(&app, &project_id)?;
-
-    let variables = serde_json::json!({ "id": issue_id });
-    let response = linear_graphql(&config.api_key, GET_ISSUE_QUERY, Some(variables)).await?;
-
-    let node = response
-        .get("data")
-        .and_then(|d| d.get("issue"))
-        .ok_or("Issue not found")?;
-
-    let base = parse_issue_node(node).ok_or("Failed to parse Linear issue")?;
-
-    let comment_nodes = node
-        .get("comments")
-        .and_then(|c| c.get("nodes"))
-        .and_then(|n| n.as_array())
-        .cloned()
-        .unwrap_or_default();
-
-    let comments: Vec<LinearComment> = comment_nodes
-        .iter()
-        .filter_map(|c| {
-            Some(LinearComment {
-                body: c.get("body")?.as_str()?.to_string(),
-                user: c.get("user").and_then(|u| {
-                    if u.is_null() {
-                        None
-                    } else {
-                        Some(LinearUser {
-                            name: u.get("name")?.as_str()?.to_string(),
-                            display_name: u.get("displayName")?.as_str()?.to_string(),
-                        })
-                    }
-                }),
-                created_at: c.get("createdAt")?.as_str()?.to_string(),
-            })
-        })
-        .collect();
-
-    Ok(LinearIssueDetail {
-        id: base.id,
-        identifier: base.identifier,
-        title: base.title,
-        description: base.description,
-        state: base.state,
-        labels: base.labels,
-        assignee: base.assignee,
-        created_at: base.created_at,
-        url: base.url,
-        priority: base.priority,
-        priority_label: base.priority_label,
-        comments,
-    })
+    crate::backend_runtime::linear_service(&app)?
+        .issue(&project_id, &issue_id)
+        .await
+        .map_err(|error| error.to_string())
 }
 
 /// Get a single Linear issue by its number (e.g., #12 → ENG-12)
@@ -852,25 +427,10 @@ pub async fn get_linear_issue_by_number(
     project_id: String,
     issue_number: i64,
 ) -> Result<Option<LinearIssue>, String> {
-    log::trace!("Getting Linear issue #{issue_number} for project {project_id}");
-
-    let config = get_linear_config(&app, &project_id)?;
-    let query = build_issue_by_number_query(config.team_id.as_deref());
-    let mut variables = serde_json::json!({ "number": issue_number });
-    if let Some(team_id) = &config.team_id {
-        variables["teamId"] = serde_json::json!(team_id);
-    }
-
-    let response = linear_graphql(&config.api_key, &query, Some(variables)).await?;
-
-    let nodes = response
-        .get("data")
-        .and_then(|d| d.get("issues"))
-        .and_then(|i| i.get("nodes"))
-        .and_then(|n| n.as_array())
-        .ok_or("Unexpected Linear API response format")?;
-
-    Ok(nodes.first().and_then(parse_issue_node))
+    crate::backend_runtime::linear_service(&app)?
+        .issue_by_number(&project_id, issue_number)
+        .await
+        .map_err(|error| error.to_string())
 }
 
 /// Load/refresh Linear issue context for a session

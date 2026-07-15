@@ -137,6 +137,10 @@ pub fn github_service(app: &AppHandle) -> jean_core::GitHubService {
     jean_core::GitHubService::new(runner)
 }
 
+pub fn linear_service(app: &AppHandle) -> Result<jean_core::LinearService, String> {
+    Ok(jean_core::LinearService::new(context(app)?.persistence))
+}
+
 pub fn project_service(app: &AppHandle) -> Result<jean_core::ProjectService, String> {
     let context = context(app)?;
     let app_for_diff = app.clone();
