@@ -1,0 +1,22 @@
+[workspace]
+members = [
+  "crates/jean-core",
+  "src-server",
+  "src-tauri",
+]
+resolver = "2"
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = "s"
+panic = "abort"
+strip = true
+
+[profile.release-fast]
+inherits = "release"
+codegen-units = 16
+lto = "thin"
+opt-level = 2
+strip = "debuginfo"
+incremental = true

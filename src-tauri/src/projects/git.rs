@@ -1,9 +1,6 @@
 use crate::platform::silent_command;
 use crate::platform::wsl_aware_command;
-use once_cell::sync::Lazy;
 use std::path::Path;
-use std::sync::Mutex;
-use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
@@ -12,9 +9,6 @@ use super::types::{JeanConfig, MergeType};
 fn gh_command(gh: &Path, repo_path: &str) -> std::process::Command {
     crate::platform::resolved_cli_command(gh, Some(Path::new(repo_path)))
 }
-
-static WORKTREE_CREATE_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
-const WORKTREE_CREATE_ATTEMPTS: usize = 4;
 
 /// Resolve the git metadata directories for a working directory.
 ///
@@ -93,33 +87,6 @@ pub fn get_repo_identifier(repo_path: &str) -> Result<RepoIdentifier, String> {
         owner: parts[0].to_string(),
         repo: parts[1].to_string(),
     })
-}
-
-/// Detect user's default shell and determine if it supports login mode.
-///
-/// On macOS/Linux, GUI apps don't inherit the user's shell PATH. Using a login shell
-/// (`-l` flag) sources the user's shell profile (.zshrc, .bashrc, etc.) which
-/// includes PATH modifications for tools like bun, nvm, homebrew, etc.
-///
-/// On Windows, PowerShell doesn't have a login mode concept.
-#[cfg(unix)]
-fn get_user_shell() -> (String, bool) {
-    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
-
-    // Check if shell supports -l (login) flag
-    let supports_login = shell.ends_with("bash")
-        || shell.ends_with("zsh")
-        || shell.ends_with("fish")
-        || shell.ends_with("ksh")
-        || shell.ends_with("tcsh");
-
-    (shell, supports_login)
-}
-
-#[cfg(windows)]
-fn get_user_shell() -> (String, bool) {
-    // Windows PowerShell doesn't have a login mode concept
-    ("powershell.exe".to_string(), false)
 }
 
 /// Check if a path is a valid git repository
@@ -295,12 +262,6 @@ pub fn get_repo_name(path: &str) -> Result<String, String> {
         })
 }
 
-/// A git remote name
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct GitRemote {
-    pub name: String,
-}
-
 /// A GitHub remote with its name and resolved HTTPS URL
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -387,43 +348,6 @@ pub fn get_github_remotes(repo_path: &str) -> Result<Vec<GitHubRemote>, String> 
     Ok(result)
 }
 
-/// Remove a git remote from a repository
-pub fn remove_git_remote(repo_path: &str, remote_name: &str) -> Result<(), String> {
-    let output = wsl_aware_command("git", Some(Path::new(repo_path)))
-        .args(["remote", "remove", remote_name])
-        .output()
-        .map_err(|e| format!("Failed to remove remote: {e}"))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("Failed to remove remote: {stderr}"));
-    }
-
-    Ok(())
-}
-
-/// Get all git remotes for a repository (not filtered to GitHub)
-pub fn get_git_remotes(repo_path: &str) -> Result<Vec<GitRemote>, String> {
-    let output = wsl_aware_command("git", Some(Path::new(repo_path)))
-        .args(["remote"])
-        .output()
-        .map_err(|e| format!("Failed to list remotes: {e}"))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("Failed to list remotes: {stderr}"));
-    }
-
-    let remotes = String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .map(|l| l.trim().to_string())
-        .filter(|l| !l.is_empty())
-        .map(|name| GitRemote { name })
-        .collect();
-
-    Ok(remotes)
-}
-
 /// Get the current branch name (HEAD) for a repository
 /// Uses symbolic-ref first (works on repos with no commits), falls back to rev-parse
 pub fn get_current_branch(repo_path: &str) -> Result<String, String> {
@@ -458,37 +382,17 @@ pub fn get_current_branch(repo_path: &str) -> Result<String, String> {
 
 /// Check if a branch exists in a repository
 pub fn branch_exists(repo_path: &str, branch_name: &str) -> bool {
-    wsl_aware_command("git", Some(Path::new(repo_path)))
-        .args([
-            "rev-parse",
-            "--verify",
-            &format!("refs/heads/{branch_name}"),
-        ])
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+    crate::backend_runtime::git_service().branch_exists(repo_path, branch_name)
 }
 
 /// Check if a remote-tracking branch exists (refs/remotes/origin/<branch>)
 pub fn remote_branch_exists(repo_path: &str, branch_name: &str) -> bool {
-    wsl_aware_command("git", Some(Path::new(repo_path)))
-        .args([
-            "rev-parse",
-            "--verify",
-            &format!("refs/remotes/origin/{branch_name}"),
-        ])
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+    crate::backend_runtime::git_service().remote_branch_exists(repo_path, branch_name)
 }
 
 /// Check if a repository has any commits
 pub fn has_commits(repo_path: &str) -> bool {
-    wsl_aware_command("git", Some(Path::new(repo_path)))
-        .args(["rev-parse", "HEAD"])
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+    crate::backend_runtime::git_service().has_commits(repo_path)
 }
 
 /// Get a valid base branch for creating worktrees
@@ -497,34 +401,9 @@ pub fn has_commits(repo_path: &str) -> bool {
 /// or the current branch if none of those exist.
 /// Returns an error if the repository has no commits yet.
 pub fn get_valid_base_branch(repo_path: &str, preferred_branch: &str) -> Result<String, String> {
-    // First check if repo has any commits - worktrees require at least one commit
-    if !has_commits(repo_path) {
-        return Err("Cannot create worktree: repository has no commits yet. \
-             Please make an initial commit first."
-            .to_string());
-    }
-
-    // Try preferred branch first (local or remote-tracking)
-    if branch_exists(repo_path, preferred_branch)
-        || remote_branch_exists(repo_path, preferred_branch)
-    {
-        return Ok(preferred_branch.to_string());
-    }
-
-    log::warn!("Preferred branch '{preferred_branch}' not found, trying fallbacks");
-
-    // Try common defaults
-    for fallback in &["main", "master"] {
-        if branch_exists(repo_path, fallback) {
-            log::trace!("Using fallback branch: {fallback}");
-            return Ok(fallback.to_string());
-        }
-    }
-
-    // Last resort: use current branch
-    let current = get_current_branch(repo_path)?;
-    log::trace!("Using current branch as fallback: {current}");
-    Ok(current)
+    crate::backend_runtime::git_service()
+        .valid_base_branch(repo_path, preferred_branch)
+        .map_err(|error| error.to_string())
 }
 
 /// Rename the current branch to a new name
@@ -613,27 +492,6 @@ fn find_unique_branch_name(repo_path: &str, base_name: &str) -> Result<String, S
     Err("Could not find unique branch name after 10 attempts".to_string())
 }
 
-/// Get list of local branches for a repository
-pub fn get_branches(repo_path: &str) -> Result<Vec<String>, String> {
-    let output = wsl_aware_command("git", Some(Path::new(repo_path)))
-        .args(["branch", "--format=%(refname:short)"])
-        .output()
-        .map_err(|e| format!("Failed to run git command: {e}"))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("Failed to list branches: {stderr}"));
-    }
-
-    let branches = String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .collect();
-
-    Ok(branches)
-}
-
 /// Fetch a branch from remote without merging (safe, no conflict risk)
 pub fn git_fetch(repo_path: &str, branch: &str, remote: Option<&str>) -> Result<(), String> {
     let remote = remote.unwrap_or("origin");
@@ -652,210 +510,6 @@ pub fn git_fetch(repo_path: &str, branch: &str, remote: Option<&str>) -> Result<
 
     log::trace!("Successfully fetched {remote}/{branch}");
     Ok(())
-}
-
-/// Pull changes from remote origin for the specified base branch
-pub fn git_pull(
-    repo_path: &str,
-    base_branch: &str,
-    remote: Option<&str>,
-) -> Result<String, String> {
-    let remote = remote.unwrap_or("origin");
-    log::trace!("Pulling from {remote}/{base_branch} in {repo_path}");
-
-    // Use explicit fetch + merge instead of `git pull` to avoid
-    // "Cannot rebase onto multiple branches" when pull.rebase=true
-    // is set in git config (common in worktree contexts)
-    let fetch = wsl_aware_command("git", Some(Path::new(repo_path)))
-        .args(["fetch", remote, base_branch])
-        .output()
-        .map_err(|e| format!("Failed to run git fetch: {e}"))?;
-
-    if !fetch.status.success() {
-        let stderr = String::from_utf8_lossy(&fetch.stderr).to_string();
-        log::error!("Failed to fetch {remote}/{base_branch}: {stderr}");
-        return Err(stderr);
-    }
-
-    let merge = wsl_aware_command("git", Some(Path::new(repo_path)))
-        .args(["merge", &format!("{remote}/{base_branch}")])
-        .output()
-        .map_err(|e| format!("Failed to run git merge: {e}"))?;
-
-    if merge.status.success() {
-        let stdout = String::from_utf8_lossy(&merge.stdout).to_string();
-        log::trace!("Successfully merged origin/{base_branch}");
-        Ok(stdout)
-    } else {
-        let stdout_str = String::from_utf8_lossy(&merge.stdout);
-        let stderr_str = String::from_utf8_lossy(&merge.stderr);
-
-        // Check for merge conflicts (git reports these on stdout)
-        if stdout_str.contains("CONFLICT") || stdout_str.contains("Automatic merge failed") {
-            let conflicts = wsl_aware_command("git", Some(Path::new(repo_path)))
-                .args(["diff", "--name-only", "--diff-filter=U"])
-                .output()
-                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-                .unwrap_or_default();
-
-            let msg = format!(
-                "Merge conflicts in: {conflicts}. Resolve manually or run 'git merge --abort'"
-            );
-            log::warn!("Merge conflicts during pull: {conflicts}");
-            return Err(msg);
-        }
-
-        // Fallback: prefer stderr, else stdout
-        let error = if stderr_str.trim().is_empty() {
-            stdout_str.trim().to_string()
-        } else {
-            stderr_str.trim().to_string()
-        };
-        log::error!("Failed to merge origin/{base_branch}: {error}");
-        Err(error)
-    }
-}
-
-/// Stash all local changes including untracked files
-pub fn git_stash(repo_path: &str) -> Result<String, String> {
-    log::trace!("Stashing changes in {repo_path}");
-
-    let output = wsl_aware_command("git", Some(Path::new(repo_path)))
-        .args(["stash", "--include-untracked"])
-        .output()
-        .map_err(|e| format!("Failed to run git stash: {e}"))?;
-
-    if output.status.success() {
-        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        log::trace!("Stash result: {stdout}");
-        Ok(stdout)
-    } else {
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let combined = format!("{stdout}\n{stderr}").trim().to_string();
-        log::error!("Failed to stash: {combined}");
-        Err(combined)
-    }
-}
-
-/// Pop the most recent stash
-pub fn git_stash_pop(repo_path: &str) -> Result<String, String> {
-    log::trace!("Popping stash in {repo_path}");
-
-    let output = wsl_aware_command("git", Some(Path::new(repo_path)))
-        .args(["stash", "pop"])
-        .output()
-        .map_err(|e| format!("Failed to run git stash pop: {e}"))?;
-
-    if output.status.success() {
-        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        log::trace!("Stash pop result: {stdout}");
-        Ok(stdout)
-    } else {
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let combined = format!("{stdout}\n{stderr}").trim().to_string();
-        log::error!("Failed to pop stash: {combined}");
-        Err(combined)
-    }
-}
-
-fn push_output_text(output: &std::process::Output) -> String {
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-    // Git push often outputs to stderr even on success
-    if stdout.is_empty() {
-        stderr
-    } else {
-        stdout
-    }
-}
-
-fn git_push_needs_upstream_retry(stderr: &str) -> bool {
-    stderr.contains("has no upstream branch")
-        || stderr.contains("upstream branch of your current branch does not match")
-        || stderr.contains("push.default is set to simple")
-}
-
-fn current_upstream(repo_path: &str) -> Option<(String, String)> {
-    let output = wsl_aware_command("git", Some(Path::new(repo_path)))
-        .args(["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"])
-        .output()
-        .ok()?;
-
-    if !output.status.success() {
-        return None;
-    }
-
-    let upstream = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    let (remote, branch) = upstream.split_once('/')?;
-    if remote.is_empty() || branch.is_empty() {
-        return None;
-    }
-
-    Some((remote.to_string(), branch.to_string()))
-}
-
-fn git_push_set_upstream(repo_path: &str, remote: &str) -> Result<String, String> {
-    log::trace!("Publishing branch with upstream: git push -u {remote} HEAD");
-    let output = wsl_aware_command("git", Some(Path::new(repo_path)))
-        .args(["push", "-u", remote, "HEAD"])
-        .output()
-        .map_err(|e| format!("Failed to run git push -u: {e}"))?;
-
-    if output.status.success() {
-        log::trace!("Successfully pushed with upstream set");
-        Ok(push_output_text(&output))
-    } else {
-        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-        log::error!("Failed to push with -u: {stderr}");
-        Err(stderr)
-    }
-}
-
-/// Push current branch to remote.
-///
-/// New Jean worktrees are created from `origin/<base>`, which can make the new
-/// local branch track `origin/main`. A plain `git push origin` then fails when
-/// `push.default=simple` because the upstream branch name differs. Publish with
-/// `-u <remote> HEAD` whenever upstream is missing or not the same-named branch
-/// on the selected remote.
-pub fn git_push(repo_path: &str, remote: Option<&str>) -> Result<String, String> {
-    let remote = remote.unwrap_or("origin");
-    log::trace!("Pushing to {remote} in {repo_path}");
-
-    let current_branch = get_current_branch(repo_path)?;
-    let upstream_matches = current_upstream(repo_path)
-        .map(|(upstream_remote, upstream_branch)| {
-            upstream_remote == remote && upstream_branch == current_branch
-        })
-        .unwrap_or(false);
-
-    if !upstream_matches {
-        log::trace!("Upstream is missing or mismatched; publishing {current_branch} to {remote}");
-        return git_push_set_upstream(repo_path, remote);
-    }
-
-    let output = wsl_aware_command("git", Some(Path::new(repo_path)))
-        .args(["push", remote])
-        .output()
-        .map_err(|e| format!("Failed to run git push: {e}"))?;
-
-    if output.status.success() {
-        let result = push_output_text(&output);
-        log::trace!("Successfully pushed to {remote}");
-        Ok(result)
-    } else {
-        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-
-        if git_push_needs_upstream_retry(&stderr) {
-            log::trace!("Push failed due to upstream config, retrying with -u {remote} HEAD");
-            return git_push_set_upstream(repo_path, remote);
-        }
-
-        log::error!("Failed to push to {remote}: {stderr}");
-        Err(stderr)
-    }
 }
 
 /// Result of a PR-aware push operation
@@ -913,7 +567,10 @@ pub fn git_push_to_pr(
     if !gh_output.status.success() {
         let stderr = String::from_utf8_lossy(&gh_output.stderr).to_string();
         log::warn!("gh pr view failed, falling back to regular push: {stderr}");
-        let output = git_push(repo_path, None)?;
+        let output = crate::backend_runtime::git_service()
+            .push(repo_path, None)
+            .map_err(|error| error.to_string())?
+            .output;
         return Ok(PushResult {
             output,
             fell_back: true,
@@ -967,7 +624,10 @@ pub fn git_push_to_pr(
             log::warn!(
                 "Failed to push to origin/{head_ref_name}, falling back to regular push: {stderr}"
             );
-            let fallback_output = git_push(repo_path, None)?;
+            let fallback_output = crate::backend_runtime::git_service()
+                .push(repo_path, None)
+                .map_err(|error| error.to_string())?
+                .output;
             return Ok(PushResult {
                 output: fallback_output,
                 fell_back: true,
@@ -1083,7 +743,10 @@ pub fn git_push_to_pr(
             });
         }
         log::warn!("Failed to push to {remote_name}/{head_ref_name}, falling back to regular push: {stderr}");
-        let fallback_output = git_push(repo_path, None)?;
+        let fallback_output = crate::backend_runtime::git_service()
+            .push(repo_path, None)
+            .map_err(|error| error.to_string())?
+            .output;
         Ok(PushResult {
             output: fallback_output,
             fell_back: true,
@@ -1198,31 +861,9 @@ pub fn create_worktree(
     new_branch_name: &str,
     base_branch: &str,
 ) -> Result<(), String> {
-    log::trace!(
-        "Creating worktree at {worktree_path} with branch {new_branch_name} from {base_branch}"
-    );
-
-    // Ensure parent directory exists
-    let worktree_path_obj = Path::new(worktree_path);
-    if let Some(parent) = worktree_path_obj.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| format!("Failed to create parent directory: {e}"))?;
-    }
-
-    run_git_worktree_add_with_retry(
-        repo_path,
-        &[
-            "worktree",
-            "add",
-            "-b",
-            new_branch_name,
-            worktree_path,
-            base_branch,
-        ],
-    )?;
-
-    log::trace!("Successfully created worktree at {worktree_path}");
-    Ok(())
+    crate::backend_runtime::git_service()
+        .create_worktree(repo_path, worktree_path, new_branch_name, base_branch)
+        .map_err(|error| error.to_string())
 }
 
 /// Create a worktree using an existing branch (no new branch created)
@@ -1236,67 +877,13 @@ pub fn create_worktree_from_existing_branch(
     worktree_path: &str,
     existing_branch: &str,
 ) -> Result<(), String> {
-    log::trace!("Creating worktree at {worktree_path} using existing branch {existing_branch}");
-
-    // Ensure parent directory exists
-    let worktree_path_obj = Path::new(worktree_path);
-    if let Some(parent) = worktree_path_obj.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| format!("Failed to create parent directory: {e}"))?;
-    }
-
-    run_git_worktree_add_with_retry(
-        repo_path,
-        &["worktree", "add", worktree_path, existing_branch],
-    )?;
-
-    log::trace!(
-        "Successfully created worktree at {worktree_path} using existing branch {existing_branch}"
-    );
-    Ok(())
+    crate::backend_runtime::git_service()
+        .create_worktree_from_existing_branch(repo_path, worktree_path, existing_branch)
+        .map_err(|error| error.to_string())
 }
 
 pub fn is_retryable_worktree_create_error(error: &str) -> bool {
-    let lower = error.to_lowercase();
-    lower.contains("could not lock config file")
-        || lower.contains("config.lock")
-        || (lower.contains(".git/config") && lower.contains("file exists"))
-        || lower.contains("unable to write upstream branch configuration")
-}
-
-fn run_git_worktree_add_with_retry(repo_path: &str, args: &[&str]) -> Result<(), String> {
-    let _guard = WORKTREE_CREATE_LOCK
-        .lock()
-        .expect("worktree create mutex poisoned");
-
-    for attempt in 1..=WORKTREE_CREATE_ATTEMPTS {
-        // Prune stale worktree entries (folders deleted outside the app)
-        let _ = wsl_aware_command("git", Some(Path::new(repo_path)))
-            .args(["worktree", "prune"])
-            .output();
-
-        let output = wsl_aware_command("git", Some(Path::new(repo_path)))
-            .args(args)
-            .output()
-            .map_err(|e| format!("Failed to run git worktree add: {e}"))?;
-
-        if output.status.success() {
-            return Ok(());
-        }
-
-        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-        if attempt < WORKTREE_CREATE_ATTEMPTS && is_retryable_worktree_create_error(&stderr) {
-            log::warn!(
-                "Retrying git worktree add after retryable config-lock error (attempt {attempt}/{WORKTREE_CREATE_ATTEMPTS}): {stderr}"
-            );
-            std::thread::sleep(Duration::from_millis(150 * attempt as u64));
-            continue;
-        }
-
-        return Err(format!("Failed to create worktree: {stderr}"));
-    }
-
-    Err("Failed to create worktree: retry attempts exhausted".to_string())
+    jean_core::git::retryable_worktree_create_error(error)
 }
 
 /// Checkout a PR using gh CLI in the specified directory
@@ -1384,169 +971,15 @@ pub fn gh_pr_checkout(
     Ok(branch_name)
 }
 
-/// Number of attempts when removing a worktree directory tree.
-const WORKTREE_RM_ATTEMPTS: u32 = 5;
-
-/// Whether a directory-removal error is a transient race worth retrying.
-///
-/// A dev server, file watcher, or backend process can keep writing into the
-/// tree while `remove_dir_all` walks it, so the final `rmdir` fails even though
-/// no handle stays open.
-fn is_transient_dir_removal_error(e: &std::io::Error) -> bool {
-    use std::io::ErrorKind;
-    // `ENOTEMPTY` (39 on Linux, 66 on macOS/BSD) and Windows `ERROR_DIR_NOT_EMPTY`
-    // both surface as `DirectoryNotEmpty`; `EACCES` / Windows `ERROR_ACCESS_DENIED`
-    // as `PermissionDenied`. Using `ErrorKind` keeps the mapping correct across
-    // platforms without hard-coded errno values.
-    if matches!(
-        e.kind(),
-        ErrorKind::DirectoryNotEmpty | ErrorKind::PermissionDenied
-    ) {
-        return true;
-    }
-    // Windows `ERROR_SHARING_VIOLATION` (a lingering file lock) has no dedicated
-    // `ErrorKind`, so match its raw code explicitly.
-    #[cfg(windows)]
-    {
-        const ERROR_SHARING_VIOLATION: i32 = 32;
-        if e.raw_os_error() == Some(ERROR_SHARING_VIOLATION) {
-            return true;
-        }
-    }
-    false
-}
-
-/// Recursively remove a directory, retrying briefly on transient races.
-///
-/// Removing a worktree can race with a process still writing inside it (e.g.
-/// `node_modules`, `elm-stuff`), making removal fail with `ENOTEMPTY`
-/// (os error 39) even though nothing holds an open handle. A few short retries
-/// let the writer settle so the removal can finish. Treats an already-absent
-/// path as success.
-fn remove_dir_all_with_retry(path: &Path) -> std::io::Result<()> {
-    let mut attempt = 1;
-    loop {
-        match std::fs::remove_dir_all(path) {
-            Ok(()) => return Ok(()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            Err(e) => {
-                if attempt >= WORKTREE_RM_ATTEMPTS || !is_transient_dir_removal_error(&e) {
-                    return Err(e);
-                }
-                log::debug!(
-                    "Retrying directory removal of {} after transient error (attempt {attempt}/{WORKTREE_RM_ATTEMPTS}): {e}",
-                    path.display()
-                );
-                std::thread::sleep(Duration::from_millis(150 * attempt as u64));
-                attempt += 1;
-            }
-        }
-    }
-}
-
 /// Remove a git worktree
 ///
 /// # Arguments
 /// * `repo_path` - Path to the main repository
 /// * `worktree_path` - Path to the worktree to remove
 pub fn remove_worktree(repo_path: &str, worktree_path: &str) -> Result<(), String> {
-    log::trace!("Removing worktree at {worktree_path}");
-
-    // SAFETY: Never remove the main working tree — this would delete the entire repo
-    if is_main_worktree(repo_path, worktree_path) {
-        return Err(format!(
-            "Refusing to remove main working tree at {worktree_path}"
-        ));
-    }
-
-    // Prune stale worktree entries (folders deleted outside the app)
-    let _ = wsl_aware_command("git", Some(Path::new(repo_path)))
-        .args(["worktree", "prune"])
-        .output();
-
-    log::trace!("git worktree remove {worktree_path} --force (in {repo_path})");
-
-    // git worktree remove <path>
-    let output = wsl_aware_command("git", Some(Path::new(repo_path)))
-        .args(["worktree", "remove", worktree_path, "--force"])
-        .output()
-        .map_err(|e| format!("Failed to run git worktree remove: {e}"))?;
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    log::trace!(
-        "git worktree remove result: status={}, stdout={}, stderr={}",
-        output.status,
-        stdout.trim(),
-        stderr.trim()
-    );
-
-    if !output.status.success() {
-        // Don't fail if worktree doesn't exist or is not a working tree
-        // This allows cleanup of stale worktree entries
-        if stderr.contains("is not a working tree")
-            || stderr.contains("does not exist")
-            || stderr.contains("No such file or directory")
-        {
-            log::warn!(
-                "Worktree at {worktree_path} not found or not a working tree, proceeding with cleanup"
-            );
-            // Try to prune stale worktrees
-            let _ = wsl_aware_command("git", Some(Path::new(repo_path)))
-                .args(["worktree", "prune"])
-                .output();
-        } else {
-            // git worktree remove failed (e.g. file locks on Windows)
-            // Try manual directory removal as fallback, but NEVER on the repo root
-            let is_repo_root = {
-                let wt = Path::new(worktree_path).canonicalize().ok();
-                let rp = Path::new(repo_path).canonicalize().ok();
-                wt.is_some() && wt == rp
-            };
-            if is_repo_root {
-                return Err(format!(
-                    "Refusing to remove directory: path matches repository root ({repo_path})"
-                ));
-            }
-            if Path::new(worktree_path).exists() {
-                log::warn!(
-                    "git worktree remove failed ({stderr}), attempting manual directory removal"
-                );
-                if let Err(rm_err) = remove_dir_all_with_retry(Path::new(worktree_path)) {
-                    return Err(format!("Failed to remove worktree: {stderr} (manual cleanup also failed: {rm_err})"));
-                }
-                log::info!("Manually removed worktree directory at {worktree_path}");
-                // Prune the now-stale git worktree entry
-                let _ = wsl_aware_command("git", Some(Path::new(repo_path)))
-                    .args(["worktree", "prune"])
-                    .output();
-            } else {
-                return Err(format!("Failed to remove worktree: {stderr}"));
-            }
-        }
-    }
-
-    // Safety net: if git reported success but directory still exists, clean it up
-    // But NEVER remove the repo root directory
-    let is_repo_root = {
-        let wt = Path::new(worktree_path).canonicalize().ok();
-        let rp = Path::new(repo_path).canonicalize().ok();
-        wt.is_some() && wt == rp
-    };
-    if Path::new(worktree_path).exists() && !is_repo_root {
-        log::warn!(
-            "Worktree directory still exists after git worktree remove, cleaning up manually"
-        );
-        // Best-effort: `git worktree remove` already reported success, so a
-        // leftover directory is unexpected. Log the final outcome rather than
-        // swallowing it silently.
-        if let Err(e) = remove_dir_all_with_retry(Path::new(worktree_path)) {
-            log::warn!("Best-effort cleanup of {worktree_path} failed: {e}");
-        }
-    }
-
-    log::trace!("Successfully removed worktree at {worktree_path}");
-    Ok(())
+    crate::backend_runtime::git_service()
+        .remove_worktree(repo_path, worktree_path)
+        .map_err(|error| error.to_string())
 }
 
 /// Delete the branch associated with a worktree
@@ -1555,34 +988,9 @@ pub fn remove_worktree(repo_path: &str, worktree_path: &str) -> Result<(), Strin
 /// * `repo_path` - Path to the main repository
 /// * `branch_name` - Name of the branch to delete
 pub fn delete_branch(repo_path: &str, branch_name: &str) -> Result<(), String> {
-    log::trace!("Deleting branch {branch_name}");
-    log::trace!("git branch -D {branch_name} (in {repo_path})");
-
-    // git branch -D <branch>
-    let output = wsl_aware_command("git", Some(Path::new(repo_path)))
-        .args(["branch", "-D", branch_name])
-        .output()
-        .map_err(|e| format!("Failed to run git branch -D: {e}"))?;
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    log::trace!(
-        "git branch -D result: status={}, stdout={}, stderr={}",
-        output.status,
-        stdout.trim(),
-        stderr.trim()
-    );
-
-    if !output.status.success() {
-        // Don't fail if branch doesn't exist
-        if !stderr.contains("not found") {
-            return Err(format!("Failed to delete branch: {stderr}"));
-        }
-        log::trace!("Branch {branch_name} not found, skipping delete");
-    }
-
-    log::trace!("Successfully deleted branch {branch_name}");
-    Ok(())
+    crate::backend_runtime::git_service()
+        .delete_branch(repo_path, branch_name)
+        .map_err(|error| error.to_string())
 }
 
 /// Find which worktree (if any) has a given branch checked out.
@@ -1639,36 +1047,6 @@ pub fn cleanup_stale_branch(repo_path: &str, branch: &str) {
     }
 }
 
-/// Check if a path is the main working tree (not a linked worktree).
-/// Uses `git worktree list --porcelain` — the first entry is always the main worktree.
-pub fn is_main_worktree(repo_path: &str, worktree_path: &str) -> bool {
-    let output = silent_command("git")
-        .args(["worktree", "list", "--porcelain"])
-        .current_dir(repo_path)
-        .output()
-        .ok();
-
-    let Some(output) = output else { return false };
-    if !output.status.success() {
-        return false;
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    // First "worktree <path>" line is always the main worktree
-    for line in stdout.lines() {
-        if let Some(path) = line.strip_prefix("worktree ") {
-            // Canonicalize both paths for reliable comparison (handles symlinks, trailing slashes, ..)
-            let main = Path::new(path).canonicalize().ok();
-            let target = Path::new(worktree_path).canonicalize().ok();
-            return match (main, target) {
-                (Some(m), Some(t)) => m == t,
-                _ => path == worktree_path,
-            };
-        }
-    }
-    false
-}
-
 /// List existing worktrees for a repository
 #[allow(dead_code)]
 pub fn list_worktrees(repo_path: &str) -> Result<Vec<String>, String> {
@@ -1690,93 +1068,6 @@ pub fn list_worktrees(repo_path: &str) -> Result<Vec<String>, String> {
         .collect();
 
     Ok(worktrees)
-}
-
-/// Commit staged changes with a message
-///
-/// # Arguments
-/// * `repo_path` - Path to the repository
-/// * `message` - Commit message
-/// * `stage_all` - Whether to stage all changes before committing (git add -A)
-///
-/// Returns the commit hash on success
-pub fn commit_changes(repo_path: &str, message: &str, stage_all: bool) -> Result<String, String> {
-    log::trace!("Committing changes in {repo_path}");
-
-    // Optionally stage all changes
-    if stage_all {
-        let add_output = wsl_aware_command("git", Some(Path::new(repo_path)))
-            .args(["add", "-A"])
-            .output()
-            .map_err(|e| format!("Failed to run git add: {e}"))?;
-
-        if !add_output.status.success() {
-            let stderr = String::from_utf8_lossy(&add_output.stderr);
-            return Err(format!("Failed to stage changes: {stderr}"));
-        }
-    }
-
-    // Check if there are any changes in the working tree
-    let status_output = wsl_aware_command("git", Some(Path::new(repo_path)))
-        .args(["status", "--porcelain"])
-        .output()
-        .map_err(|e| format!("Failed to check git status: {e}"))?;
-
-    let status = String::from_utf8_lossy(&status_output.stdout);
-    if status.trim().is_empty() {
-        return Err("Nothing to commit, working tree clean".to_string());
-    }
-
-    // Check if there are staged changes
-    let diff_output = wsl_aware_command("git", Some(Path::new(repo_path)))
-        .args(["diff", "--cached", "--quiet"])
-        .output()
-        .map_err(|e| format!("Failed to check staged changes: {e}"))?;
-
-    // Exit code 0 means no staged changes, 1 means there are staged changes
-    if diff_output.status.success() {
-        return Err(
-            "No staged changes to commit. Stage your changes first or enable 'Stage all changes'."
-                .to_string(),
-        );
-    }
-
-    // Commit
-    let commit_output = wsl_aware_command("git", Some(Path::new(repo_path)))
-        .args(["commit", "-m", message])
-        .output()
-        .map_err(|e| format!("Failed to run git commit: {e}"))?;
-
-    if !commit_output.status.success() {
-        let stderr = String::from_utf8_lossy(&commit_output.stderr)
-            .trim()
-            .to_string();
-        let stdout = String::from_utf8_lossy(&commit_output.stdout)
-            .trim()
-            .to_string();
-        // Git sometimes outputs to stdout for certain messages
-        let error_msg = if !stderr.is_empty() {
-            stderr
-        } else if !stdout.is_empty() {
-            stdout
-        } else {
-            "Unknown git error".to_string()
-        };
-        return Err(error_msg);
-    }
-
-    // Get the commit hash
-    let hash_output = wsl_aware_command("git", Some(Path::new(repo_path)))
-        .args(["rev-parse", "HEAD"])
-        .output()
-        .map_err(|e| format!("Failed to get commit hash: {e}"))?;
-
-    let hash = String::from_utf8_lossy(&hash_output.stdout)
-        .trim()
-        .to_string();
-    log::trace!("Successfully committed changes: {hash}");
-
-    Ok(hash)
 }
 
 /// Open a pull request using the GitHub CLI (gh)
@@ -1913,28 +1204,7 @@ pub fn generate_pr_context(repo_path: &str, target_branch: &str) -> Result<PrCon
 ///
 /// Returns None if the file doesn't exist or can't be parsed
 pub fn read_jean_config(worktree_path: &str) -> Option<JeanConfig> {
-    let config_path = Path::new(worktree_path).join("jean.json");
-    if !config_path.exists() {
-        log::trace!("No jean.json found at {}", config_path.display());
-        return None;
-    }
-
-    match std::fs::read_to_string(&config_path) {
-        Ok(content) => match serde_json::from_str(&content) {
-            Ok(config) => {
-                log::trace!("Successfully parsed jean.json from {worktree_path}");
-                Some(config)
-            }
-            Err(e) => {
-                log::warn!("Failed to parse jean.json: {e}");
-                None
-            }
-        },
-        Err(e) => {
-            log::warn!("Failed to read jean.json: {e}");
-            None
-        }
-    }
+    jean_core::read_jean_config(worktree_path)
 }
 
 /// Run a setup script in a worktree directory
@@ -1950,7 +1220,9 @@ pub fn run_setup_script(
     branch: &str,
     script: &str,
 ) -> Result<String, String> {
-    run_jean_script("setup", worktree_path, root_path, branch, script)
+    crate::backend_runtime::script_service()
+        .run_setup(worktree_path, root_path, branch, script)
+        .map_err(|error| error.to_string())
 }
 
 /// Run a teardown script in a worktree directory before deletion
@@ -1966,97 +1238,9 @@ pub fn run_teardown_script(
     branch: &str,
     script: &str,
 ) -> Result<String, String> {
-    run_jean_script("teardown", worktree_path, root_path, branch, script)
-}
-
-/// Validate that environment variables passed to jean.json scripts are safe.
-///
-/// Rejects empty strings and non-absolute paths to prevent destructive commands
-/// when scripts reference `$JEAN_WORKSPACE_PATH` or `$JEAN_ROOT_PATH`.
-/// For example, `rm -rf $JEAN_WORKSPACE_PATH/node_modules` with an empty var
-/// would expand to `rm -rf /node_modules`.
-fn validate_script_env(worktree_path: &str, root_path: &str, branch: &str) -> Result<(), String> {
-    if worktree_path.is_empty() {
-        return Err("JEAN_WORKSPACE_PATH is empty — refusing to run script".to_string());
-    }
-    if root_path.is_empty() {
-        return Err("JEAN_ROOT_PATH is empty — refusing to run script".to_string());
-    }
-    if branch.is_empty() {
-        return Err("JEAN_BRANCH is empty — refusing to run script".to_string());
-    }
-    if !std::path::Path::new(worktree_path).is_absolute() {
-        return Err(format!(
-            "JEAN_WORKSPACE_PATH is not an absolute path: {worktree_path}"
-        ));
-    }
-    if !std::path::Path::new(root_path).is_absolute() {
-        return Err(format!(
-            "JEAN_ROOT_PATH is not an absolute path: {root_path}"
-        ));
-    }
-    Ok(())
-}
-
-/// Shared implementation for running jean.json setup/teardown scripts.
-///
-/// Validates environment variables, then executes the script in the user's
-/// login shell with JEAN_WORKSPACE_PATH, JEAN_ROOT_PATH, and JEAN_BRANCH set.
-fn run_jean_script(
-    kind: &str,
-    worktree_path: &str,
-    root_path: &str,
-    branch: &str,
-    script: &str,
-) -> Result<String, String> {
-    log::trace!("Running {kind} script in {worktree_path}: {script}");
-
-    validate_script_env(worktree_path, root_path, branch)?;
-
-    let (shell, supports_login) = get_user_shell();
-    log::trace!("Using shell: {shell} (login mode: {supports_login})");
-
-    let mut cmd = silent_command(&shell);
-    if supports_login {
-        cmd.args(["-l", "-i", "-c", script]);
-    } else {
-        cmd.args(["-c", script]);
-    }
-
-    let output = cmd
-        .current_dir(worktree_path)
-        .env("JEAN_WORKSPACE_PATH", worktree_path)
-        .env("JEAN_ROOT_PATH", root_path)
-        .env("JEAN_BRANCH", branch)
-        .output()
-        .map_err(|e| format!("Failed to run {kind} script: {e}"))?;
-
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-
-    if !output.status.success() {
-        let combined = format!("{stdout}{stderr}").trim().to_string();
-        return Err(format!("{kind} script failed:\n{combined}"));
-    }
-
-    let combined = format!("{stdout}{stderr}").trim().to_string();
-    log::trace!("{kind} script completed successfully");
-    Ok(combined)
-}
-
-/// Check if there are uncommitted changes (staged or unstaged)
-pub fn has_uncommitted_changes(repo_path: &str) -> bool {
-    wsl_aware_command("git", Some(Path::new(repo_path)))
-        .args(["status", "--porcelain"])
-        .output()
-        .map(|o| {
-            if o.status.success() {
-                !String::from_utf8_lossy(&o.stdout).trim().is_empty()
-            } else {
-                false
-            }
-        })
-        .unwrap_or(false)
+    crate::backend_runtime::script_service()
+        .run_teardown(worktree_path, root_path, branch, script)
+        .map_err(|error| error.to_string())
 }
 
 /// Rebase the current branch onto a base branch from origin
@@ -2076,7 +1260,10 @@ pub fn rebase_onto_base(
     log::trace!("Starting rebase onto {base_branch} in {repo_path}");
 
     // Step 1: Check for uncommitted changes and commit if needed
-    if has_uncommitted_changes(repo_path) {
+    if crate::backend_runtime::git_service()
+        .has_uncommitted_changes(repo_path)
+        .map_err(|error| error.to_string())?
+    {
         let message = commit_message.unwrap_or("WIP: Committing changes before rebase");
         log::trace!("Committing uncommitted changes: {message}");
 
@@ -2147,7 +1334,7 @@ pub fn rebase_onto_base(
         let stderr = String::from_utf8_lossy(&push_output.stderr);
         // Check if branch doesn't have upstream yet, or upstream points at a
         // differently named branch (common for worktrees created from origin/main)
-        if git_push_needs_upstream_retry(&stderr) {
+        if jean_core::git::push_needs_upstream_retry(&stderr) {
             // Try regular push with -u
             let push_u_output = wsl_aware_command("git", Some(Path::new(repo_path)))
                 .args(["push", "-u", "origin", "HEAD"])
@@ -2218,7 +1405,10 @@ pub fn merge_branch_to_base(
     );
 
     // Step 1: Check for uncommitted changes in main repo - refuse to merge if any
-    if has_uncommitted_changes(repo_path) {
+    if crate::backend_runtime::git_service()
+        .has_uncommitted_changes(repo_path)
+        .unwrap_or(false)
+    {
         return MergeResult::Error {
             message: "Cannot merge: there are uncommitted changes in the base branch. Please commit or stash them first.".to_string(),
         };
@@ -2550,44 +1740,6 @@ mod tests {
     use super::*;
 
     // ========================================================================
-    // remove_dir_all_with_retry tests
-    // ========================================================================
-
-    #[test]
-    fn test_remove_dir_all_with_retry_removes_populated_tree() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().join("worktree");
-        std::fs::create_dir_all(root.join("nested/deeper")).unwrap();
-        std::fs::write(root.join("nested/file.txt"), b"data").unwrap();
-
-        remove_dir_all_with_retry(&root).unwrap();
-        assert!(!root.exists());
-    }
-
-    #[test]
-    fn test_remove_dir_all_with_retry_absent_path_is_ok() {
-        let dir = tempfile::tempdir().unwrap();
-        let missing = dir.path().join("does-not-exist");
-        // An already-absent path must be treated as success, not an error.
-        remove_dir_all_with_retry(&missing).unwrap();
-    }
-
-    #[test]
-    fn test_is_transient_dir_removal_error_classifies_transient_kinds() {
-        use std::io::ErrorKind;
-        // The "directory not empty" race (ENOTEMPTY / ERROR_DIR_NOT_EMPTY) and a
-        // lingering lock surfacing as PermissionDenied are what we retry on.
-        let dir_not_empty = std::io::Error::from(ErrorKind::DirectoryNotEmpty);
-        assert!(is_transient_dir_removal_error(&dir_not_empty));
-        let permission = std::io::Error::from(ErrorKind::PermissionDenied);
-        assert!(is_transient_dir_removal_error(&permission));
-
-        // A non-transient error (e.g. ENOENT/NotFound) must not be retried here.
-        let not_found = std::io::Error::from(ErrorKind::NotFound);
-        assert!(!is_transient_dir_removal_error(&not_found));
-    }
-
-    // ========================================================================
     // get_repo_name tests
     // ========================================================================
 
@@ -2647,7 +1799,7 @@ mod tests {
     #[test]
     fn test_git_push_needs_upstream_retry_for_no_upstream() {
         let stderr = "fatal: The current branch feature has no upstream branch.";
-        assert!(git_push_needs_upstream_retry(stderr));
+        assert!(jean_core::git::push_needs_upstream_retry(stderr));
     }
 
     #[test]
@@ -2660,7 +1812,7 @@ mod tests {
                       git push origin HEAD\n\n\
                       To choose either option permanently, see push.default in git-config.\n\
                       fatal: push.default is set to simple";
-        assert!(git_push_needs_upstream_retry(stderr));
+        assert!(jean_core::git::push_needs_upstream_retry(stderr));
     }
 
     #[test]
@@ -2687,7 +1839,7 @@ mod tests {
         let stderr = "remote: Permission to owner/repo.git denied to user.\n\
                       fatal: unable to access 'https://github.com/owner/repo.git/': \
                       The requested URL returned error: 403";
-        assert!(!git_push_needs_upstream_retry(stderr));
+        assert!(!jean_core::git::push_needs_upstream_retry(stderr));
     }
 
     // ========================================================================

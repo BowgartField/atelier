@@ -12,6 +12,8 @@ on:
 
 permissions:
   contents: write
+  id-token: write
+  attestations: write
   packages: write
 
 concurrency:
@@ -64,11 +66,6 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v5
 
-      - name: Install Linux dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf xdg-utils
-
       - name: Setup Bun
         uses: oven-sh/setup-bun@v2
 
@@ -79,8 +76,7 @@ jobs:
         uses: swatinem/rust-cache@v2
         with:
           workspaces: |
-            ./src-tauri -> target
-            ./src-server -> target
+            ./ -> target
           shared-key: server-${{ matrix.arch }}
 
       - name: Install frontend dependencies
@@ -90,7 +86,47 @@ jobs:
         run: bun run build
 
       - name: Build jean-server
-        run: cd src-server && cargo build --release
+        run: cargo build --locked --release -p jean-server
+
+      - name: Reject desktop and graphical dependencies
+        run: |
+          set -euo pipefail
+          cargo tree -p jean-server --target x86_64-unknown-linux-gnu > server-tree.txt
+          if grep -Eiq '(^|[[:space:]├└│─])((tauri|tao|wry|gtk|gdk|webkit|javascriptcore|soup|pango|cairo|atk)([-_[:space:]@]|$))' server-tree.txt; then
+            cat server-tree.txt
+            echo 'Forbidden desktop or graphical dependency found in jean-server'
+            exit 1
+          fi
+
+      - name: Inspect linked libraries
+        run: |
+          set -euo pipefail
+          readelf -d target/release/jean-server | tee readelf.txt
+          ldd target/release/jean-server | tee ldd.txt
+          if grep -Eiq '(gtk|gdk|webkit|javascriptcore|libsoup|pango|cairo|atk|X11|wayland)' readelf.txt ldd.txt; then
+            echo 'Forbidden graphical shared library linked into jean-server'
+            exit 1
+          fi
+
+      - name: Verify no-display runtime
+        run: |
+          set -euo pipefail
+          unset DISPLAY WAYLAND_DISPLAY XDG_SESSION_TYPE
+          target/release/jean-server --host 127.0.0.1 --port 3456 --token ci-token > server.log 2>&1 &
+          SERVER_PID=$!
+          trap 'kill -TERM "$SERVER_PID" 2>/dev/null || true' EXIT
+          for attempt in $(seq 1 30); do
+            if curl --fail --silent http://127.0.0.1:3456/healthz >/dev/null; then
+              break
+            fi
+            sleep 1
+          done
+          curl --fail --silent http://127.0.0.1:3456/readyz
+          curl --fail --silent 'http://127.0.0.1:3456/api/auth?token=ci-token'
+          curl --fail --silent 'http://127.0.0.1:3456/api/init?token=ci-token'
+          kill -TERM "$SERVER_PID"
+          wait "$SERVER_PID"
+          trap - EXIT
 
       - name: Package binary
         env:
@@ -98,7 +134,7 @@ jobs:
           ASSET: ${{ matrix.asset }}
         run: |
           mkdir -p artifacts
-          cp src-server/target/release/jean-server "artifacts/${ASSET}"
+          cp target/release/jean-server "artifacts/${ASSET}"
           tar -C artifacts -czf "artifacts/${ASSET}-${VERSION}.tar.gz" "${ASSET}"
           shasum -a 256 "artifacts/${ASSET}-${VERSION}.tar.gz" > "artifacts/${ASSET}-${VERSION}.tar.gz.sha256"
 
@@ -109,6 +145,11 @@ jobs:
           path: |
             artifacts/*.tar.gz
             artifacts/*.sha256
+
+      - name: Attest server artifact provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: artifacts/*.tar.gz
 
       - name: Upload release assets
         if: github.event_name == 'release'
@@ -151,7 +192,6 @@ jobs:
           tar -xzf "artifacts/jean-server-linux-${ARCH}-${VERSION}.tar.gz" -C docker-context
           mv "docker-context/jean-server-linux-${ARCH}" docker-context/jean-server
           chmod +x docker-context/jean-server
-          cp scripts/docker-entrypoint.sh docker-context/docker-entrypoint.sh
           cp Dockerfile.server-runtime docker-context/Dockerfile
 
       - name: Set up Docker Buildx

@@ -35,6 +35,7 @@ use tauri::{AppHandle, Emitter, Manager};
 use tauri::menu::{MenuBuilder, MenuItemBuilder, PredefinedMenuItem, SubmenuBuilder};
 
 mod auto_fix;
+mod backend_runtime;
 mod background_tasks;
 mod browser;
 mod chat;
@@ -2481,9 +2482,7 @@ impl Default for UIState {
 }
 
 pub fn get_preferences_path(app: &AppHandle) -> Result<PathBuf, String> {
-    let app_data_dir = app
-        .path()
-        .app_data_dir()
+    let app_data_dir = backend_runtime::data_dir(app)
         .map_err(|e| format!("Failed to get app data directory: {e}"))?;
 
     // Ensure the directory exists
@@ -2826,9 +2825,7 @@ async fn delete_cli_profile(name: String) -> Result<(), String> {
 }
 
 fn get_ui_state_path(app: &AppHandle) -> Result<PathBuf, String> {
-    let app_data_dir = app
-        .path()
-        .app_data_dir()
+    let app_data_dir = backend_runtime::data_dir(app)
         .map_err(|e| format!("Failed to get app data directory: {e}"))?;
 
     // Ensure the directory exists
@@ -2931,9 +2928,7 @@ async fn send_native_notification(
 
 // Recovery functions - simple pattern for saving JSON data to disk
 fn get_recovery_dir(app: &AppHandle) -> Result<PathBuf, String> {
-    let app_data_dir = app
-        .path()
-        .app_data_dir()
+    let app_data_dir = backend_runtime::data_dir(app)
         .map_err(|e| format!("Failed to get app data directory: {e}"))?;
 
     let recovery_dir = app_data_dir.join("recovery");
@@ -4036,7 +4031,9 @@ pub fn run() {
 
             // In headless mode, close the window immediately
             if headless {
-                log::info!("Running in headless mode");
+                log::warn!(
+                    "Running the compatibility headless runtime; Tauri/GTK/WebKitGTK are still initialized. Use the standalone jean-server binary for a GUI-free runtime."
+                );
                 if let Some(window) = app.get_webview_window("main") {
                     let _ = window.close();
                 }
@@ -4460,6 +4457,14 @@ pub fn run() {
             // Initialize HTTP server infrastructure
             let (broadcaster, _) = http_server::WsBroadcaster::new();
             app.manage(broadcaster);
+            let core_broadcaster = std::sync::Arc::new(jean_core::WsBroadcaster::new());
+            let core_state = std::sync::Arc::new(jean_core::BackendState::new(core_broadcaster));
+            let core_context = jean_core::BackendContext::new(
+                std::sync::Arc::new(backend_runtime::DesktopAppPaths::new(app.handle().clone())),
+                std::sync::Arc::new(backend_runtime::DesktopEventSink::new(app.handle().clone())),
+                core_state,
+            );
+            app.manage(core_context);
             app.manage(std::sync::Arc::new(tokio::sync::Mutex::new(
                 None::<http_server::server::HttpServerHandle>,
             )));

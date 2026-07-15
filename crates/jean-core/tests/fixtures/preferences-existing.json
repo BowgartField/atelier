@@ -1,0 +1,14 @@
+{
+  "theme": "dark",
+  "default_backend": "codex",
+  "http_server_port": 3456,
+  "cli_profiles": [
+    {
+      "name": "work",
+      "provider": "anthropic"
+    }
+  ],
+  "future_nested_field": {
+    "must_survive": true
+  }
+}

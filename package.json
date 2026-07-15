@@ -21,11 +21,11 @@
     "test:run": "vitest run",
     "test:ui": "vitest --ui",
     "test:coverage": "vitest run --coverage",
-    "rust:fmt": "cd src-tauri && cargo fmt",
-    "rust:fmt:check": "cd src-tauri && cargo fmt --check",
-    "rust:clippy": "cd src-tauri && cargo clippy -- -D warnings",
-    "rust:clippy:fix": "cd src-tauri && cargo clippy --fix --allow-dirty",
-    "rust:test": "cd src-tauri && cargo test",
+    "rust:fmt": "cargo fmt --all",
+    "rust:fmt:check": "cargo fmt --all --check",
+    "rust:clippy": "cargo clippy --workspace -- -D warnings",
+    "rust:clippy:fix": "cargo clippy --workspace --fix --allow-dirty",
+    "rust:test": "cargo test --workspace",
     "tauri": "tauri",
     "tauri:dev:rdp": "bash scripts/tauri-dev-rdp.sh",
     "tauri:dev": "tauri dev --config src-tauri/tauri.conf.dev.json",
@@ -53,7 +53,7 @@
     "task:rename-done": "node scripts/complete-task.js --rename-existing",
     "version:bump": "node scripts/bump-version.js",
     "release:assert-version": "node scripts/assert-release-version.js",
-    "test:server-ci": "node --test scripts/server-ci-assets.test.mjs"
+    "test:server-ci": "node scripts/generate-headless-capabilities.mjs --check && node --test scripts/server-ci-assets.test.mjs && cargo test -p jean-core -p jean-server"
   },
   "dependencies": {
     "@atlaskit/pragmatic-drag-and-drop": "^1.8.1",

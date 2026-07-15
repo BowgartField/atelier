@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 
 use once_cell::sync::Lazy;
-use tauri::{AppHandle, Manager};
+use tauri::AppHandle;
 
 use super::types::ProjectsData;
 
@@ -13,9 +13,7 @@ static PROJECTS_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
 
 /// Get the path to the projects.json data file
 pub fn get_projects_path(app: &AppHandle) -> Result<PathBuf, String> {
-    let app_data_dir = app
-        .path()
-        .app_data_dir()
+    let app_data_dir = crate::backend_runtime::data_dir(app)
         .map_err(|e| format!("Failed to get app data directory: {e}"))?;
 
     // Ensure the directory exists

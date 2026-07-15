@@ -34,5 +34,6 @@ playwright-report
 playwright/.cache
 
 # Rust build artifacts for standalone server wrapper
+target/
 src-server/target/
 src-server/Cargo.lock

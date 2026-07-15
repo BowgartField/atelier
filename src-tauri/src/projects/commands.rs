@@ -1,4 +1,3 @@
-use ignore::WalkBuilder;
 use once_cell::sync::Lazy;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -42,10 +41,9 @@ use super::release_notes::{
 use super::storage::{get_project_worktrees_dir, load_projects_data, save_projects_data};
 use super::types::{
     JeanConfig, MergeType, Project, ProjectAutoFixSettings, SessionType, Worktree,
-    WorktreeArchivedEvent, WorktreeBranchExistsEvent, WorktreeCreateErrorEvent,
-    WorktreeCreatedEvent, WorktreeCreatingEvent, WorktreeDeleteErrorEvent, WorktreeDeletedEvent,
-    WorktreeDeletingEvent, WorktreeOrigin, WorktreePathExistsEvent,
-    WorktreePermanentlyDeletedEvent, WorktreeSetupCompleteEvent, WorktreeUnarchivedEvent,
+    WorktreeBranchExistsEvent, WorktreeCreateErrorEvent, WorktreeCreatedEvent,
+    WorktreeCreatingEvent, WorktreeDeleteErrorEvent, WorktreeDeletedEvent, WorktreeDeletingEvent,
+    WorktreeOrigin, WorktreePathExistsEvent, WorktreeSetupCompleteEvent,
 };
 use crate::chat::types::{LabelData, Session, SessionMetadata, WorktreeSessions};
 use crate::claude_cli::resolve_cli_binary;
@@ -490,57 +488,16 @@ fn review_session_name(source: &str, backend: Option<&str>, model: Option<&str>)
 /// List all projects
 /// Check if git global user identity is configured
 #[tauri::command]
-pub async fn check_git_identity() -> Result<GitIdentity, String> {
-    let name = wsl_aware_command("git", Some(&std::env::temp_dir()))
-        .args(["config", "--global", "user.name"])
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .filter(|s| !s.is_empty());
-
-    let email = wsl_aware_command("git", Some(&std::env::temp_dir()))
-        .args(["config", "--global", "user.email"])
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .filter(|s| !s.is_empty());
-
-    Ok(GitIdentity { name, email })
+pub async fn check_git_identity() -> Result<jean_core::git::GitIdentity, String> {
+    Ok(crate::backend_runtime::git_service().identity())
 }
 
 /// Set git global user identity
 #[tauri::command]
 pub async fn set_git_identity(name: String, email: String) -> Result<(), String> {
-    let name_output = wsl_aware_command("git", Some(&std::env::temp_dir()))
-        .args(["config", "--global", "user.name", &name])
-        .output()
-        .map_err(|e| format!("Failed to set git user.name: {e}"))?;
-
-    if !name_output.status.success() {
-        let stderr = String::from_utf8_lossy(&name_output.stderr);
-        return Err(format!("Failed to set git user.name: {stderr}"));
-    }
-
-    let email_output = wsl_aware_command("git", Some(&std::env::temp_dir()))
-        .args(["config", "--global", "user.email", &email])
-        .output()
-        .map_err(|e| format!("Failed to set git user.email: {e}"))?;
-
-    if !email_output.status.success() {
-        let stderr = String::from_utf8_lossy(&email_output.stderr);
-        return Err(format!("Failed to set git user.email: {stderr}"));
-    }
-
-    log::trace!("Git identity set: {name} <{email}>");
-    Ok(())
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct GitIdentity {
-    pub name: Option<String>,
-    pub email: Option<String>,
+    crate::backend_runtime::git_service()
+        .set_identity(&name, &email)
+        .map_err(|error| error.to_string())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -640,7 +597,14 @@ pub async fn browse_directory(path: Option<String>) -> Result<BrowseDirectoryRes
 #[tauri::command]
 pub async fn list_projects(app: AppHandle) -> Result<Vec<Project>, String> {
     log::trace!("Listing all projects");
-    let mut projects = load_projects_data(&app)?.projects;
+    let service = crate::backend_runtime::project_service(&app)?;
+    let mut projects: Vec<Project> = service
+        .list()
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .map(serde_json::from_value)
+        .collect::<Result<_, _>>()
+        .map_err(|error| error.to_string())?;
     for project in &mut projects {
         attach_default_avatar(project);
     }
@@ -656,55 +620,13 @@ pub async fn add_project(
 ) -> Result<Project, String> {
     log::trace!("Adding project from path: {path}, parent_id: {parent_id:?}");
 
-    // Validate it's a git repository
-    if !git::validate_git_repo(&path)? {
-        return Err(format!(
-            "The selected folder is not a git repository.\n\n\
-            To add this project, first initialize it as a git repository by running:\n\
-            cd \"{path}\" && git init"
-        ));
-    }
-
-    // Get repository name and current branch
-    let name = git::get_repo_name(&path)?;
-    // Fall back to "main" if HEAD doesn't exist yet (no commits)
-    let default_branch = git::get_current_branch(&path).unwrap_or_else(|_| "main".to_string());
-
-    // Check if project already exists
-    let mut data = load_projects_data(&app)?;
-    if data.projects.iter().any(|p| p.path == path) {
-        return Err(format!("Project already exists: {path}"));
-    }
-
-    // Create project with order at the end of the specified parent level
-    let max_order = data.get_next_order(parent_id.as_deref());
-    let project = Project {
-        id: Uuid::new_v4().to_string(),
-        name,
-        path,
-        default_branch,
-        added_at: now(),
-        order: max_order,
-        parent_id,
-        is_folder: false,
-        avatar_path: None,
-        default_avatar_path: None,
-        enabled_mcp_servers: None,
-        known_mcp_servers: Vec::new(),
-        custom_system_prompt: None,
-        default_provider: None,
-        default_backend: None,
-        worktrees_dir: None,
-        server_id: None,
-        remote_clones: Vec::new(),
-        linear_api_key: None,
-        linear_team_id: None,
-        linked_project_ids: Vec::new(),
-        auto_fix_settings: None,
-    };
-
-    data.add_project(project.clone());
-    save_projects_data(&app, &data)?;
+    let service = crate::backend_runtime::project_service(&app)?;
+    let project: Project = serde_json::from_value(
+        service
+            .add(path, parent_id)
+            .map_err(|error| error.to_string())?,
+    )
+    .map_err(|error| error.to_string())?;
     allow_project_in_asset_scope(&app, &project.path);
 
     let mut project = project;
@@ -821,52 +743,14 @@ pub async fn init_project(
 ) -> Result<Project, String> {
     log::trace!("Initializing new project at path: {path}, parent_id: {parent_id:?}");
 
-    // Initialize git repository (creates dir if needed)
-    git::init_repo(&path)?;
-
-    // Get repository name (directory name)
-    let name = git::get_repo_name(&path)?;
-
-    // For new repos, the default branch is typically "main" or "master"
-    // Get it from git to be sure
-    let default_branch = git::get_current_branch(&path).unwrap_or_else(|_| "main".to_string());
-
-    // Check if project already exists
-    let mut data = load_projects_data(&app)?;
-    if data.projects.iter().any(|p| p.path == path) {
-        return Err(format!("Project already exists: {path}"));
-    }
-
-    // Create project with order at the end of the specified parent level
-    let max_order = data.get_next_order(parent_id.as_deref());
-    let project = Project {
-        id: Uuid::new_v4().to_string(),
-        name,
-        path,
-        default_branch,
-        added_at: now(),
-        order: max_order,
-        parent_id,
-        is_folder: false,
-        avatar_path: None,
-        default_avatar_path: None,
-        enabled_mcp_servers: None,
-        known_mcp_servers: Vec::new(),
-        custom_system_prompt: None,
-        default_provider: None,
-        default_backend: None,
-        worktrees_dir: None,
-        server_id: None,
-        remote_clones: Vec::new(),
-        linear_api_key: None,
-        linear_team_id: None,
-        linked_project_ids: Vec::new(),
-        auto_fix_settings: None,
-    };
-
-    data.add_project(project.clone());
-    save_projects_data(&app, &data)?;
+    let mut project: Project = serde_json::from_value(
+        crate::backend_runtime::project_service(&app)?
+            .init(path, parent_id)
+            .map_err(|error| error.to_string())?,
+    )
+    .map_err(|error| error.to_string())?;
     allow_project_in_asset_scope(&app, &project.path);
+    attach_default_avatar(&mut project);
 
     log::trace!("Successfully initialized project: {}", project.name);
     Ok(project)
@@ -882,49 +766,14 @@ pub async fn clone_project(
 ) -> Result<Project, String> {
     log::trace!("Cloning project from {url} to {path}, parent_id: {parent_id:?}");
 
-    // Clone the repository
-    git::clone_repo(&url, &path)?;
-
-    // Get repository name and default branch from the cloned repo
-    let name = git::get_repo_name(&path)?;
-    let default_branch = git::get_current_branch(&path).unwrap_or_else(|_| "main".to_string());
-
-    // Check if project already exists
-    let mut data = load_projects_data(&app)?;
-    if data.projects.iter().any(|p| p.path == path) {
-        return Err(format!("Project already exists: {path}"));
-    }
-
-    // Create project with order at the end of the specified parent level
-    let max_order = data.get_next_order(parent_id.as_deref());
-    let project = Project {
-        id: Uuid::new_v4().to_string(),
-        name,
-        path,
-        default_branch,
-        added_at: now(),
-        order: max_order,
-        parent_id,
-        is_folder: false,
-        avatar_path: None,
-        default_avatar_path: None,
-        enabled_mcp_servers: None,
-        known_mcp_servers: Vec::new(),
-        custom_system_prompt: None,
-        default_provider: None,
-        default_backend: None,
-        worktrees_dir: None,
-        server_id: None,
-        remote_clones: Vec::new(),
-        linear_api_key: None,
-        linear_team_id: None,
-        linked_project_ids: Vec::new(),
-        auto_fix_settings: None,
-    };
-
-    data.add_project(project.clone());
-    save_projects_data(&app, &data)?;
+    let mut project: Project = serde_json::from_value(
+        crate::backend_runtime::project_service(&app)?
+            .clone_repository(&url, path, parent_id)
+            .map_err(|error| error.to_string())?,
+    )
+    .map_err(|error| error.to_string())?;
     allow_project_in_asset_scope(&app, &project.path);
+    attach_default_avatar(&mut project);
 
     log::trace!("Successfully cloned project: {}", project.name);
     Ok(project)
@@ -937,7 +786,7 @@ pub async fn clone_project(
 pub async fn remove_project(app: AppHandle, project_id: String) -> Result<(), String> {
     log::trace!("Removing project: {project_id}");
 
-    let mut data = load_projects_data(&app)?;
+    let data = load_projects_data(&app)?;
 
     // Check if project has active (non-archived) worktrees
     let has_active_worktrees = data
@@ -959,22 +808,9 @@ pub async fn remove_project(app: AppHandle, project_id: String) -> Result<(), St
         .map(|w| w.id.clone())
         .collect();
 
-    // Remove archived worktrees from data
-    for worktree_id in &archived_worktree_ids {
-        data.remove_worktree(worktree_id);
-        log::trace!("Removed archived worktree: {worktree_id}");
-    }
-
-    // Clean up reciprocal linked project references
-    for other in &mut data.projects {
-        other.linked_project_ids.retain(|id| id != &project_id);
-    }
-
-    // Remove project
-    data.remove_project(&project_id)
-        .ok_or_else(|| format!("Project not found: {project_id}"))?;
-
-    save_projects_data(&app, &data)?;
+    crate::backend_runtime::project_service(&app)?
+        .remove(&project_id)
+        .map_err(|error| error.to_string())?;
 
     // Clean up sessions files for archived worktrees (in background, non-blocking)
     for worktree_id in archived_worktree_ids {
@@ -1011,15 +847,13 @@ pub async fn remove_project(app: AppHandle, project_id: String) -> Result<(), St
 pub async fn list_worktrees(app: AppHandle, project_id: String) -> Result<Vec<Worktree>, String> {
     log::trace!("Listing worktrees for project: {project_id}");
 
-    let data = load_projects_data(&app)?;
-    let worktrees = data
-        .worktrees_for_project(&project_id)
+    crate::backend_runtime::project_service(&app)?
+        .list_worktrees(&project_id)
+        .map_err(|error| error.to_string())?
         .into_iter()
-        .filter(|w| w.archived_at.is_none()) // Filter out archived worktrees
-        .cloned()
-        .collect();
-
-    Ok(worktrees)
+        .map(serde_json::from_value)
+        .collect::<Result<_, _>>()
+        .map_err(|error| error.to_string())
 }
 
 /// Get a single worktree by ID
@@ -1027,10 +861,12 @@ pub async fn list_worktrees(app: AppHandle, project_id: String) -> Result<Vec<Wo
 pub async fn get_worktree(app: AppHandle, worktree_id: String) -> Result<Worktree, String> {
     log::trace!("Getting worktree: {worktree_id}");
 
-    let data = load_projects_data(&app)?;
-    data.find_worktree(&worktree_id)
-        .cloned()
-        .ok_or_else(|| format!("Worktree not found: {worktree_id}"))
+    serde_json::from_value(
+        crate::backend_runtime::project_service(&app)?
+            .get_worktree(&worktree_id)
+            .map_err(|error| error.to_string())?,
+    )
+    .map_err(|error| error.to_string())
 }
 
 /// Get a bounded summary of a worktree's git changes.
@@ -1041,43 +877,9 @@ pub async fn get_worktree_changes(
     max_files: Option<usize>,
 ) -> Result<serde_json::Value, String> {
     let max_files = max_files.unwrap_or(100).clamp(1, 500);
-    let (worktree, project_default_branch) =
-        resolve_worktree_and_project_default(&app, &worktree_id)?;
-    let base_branch = worktree
-        .base_branch
-        .clone()
-        .unwrap_or_else(|| project_default_branch.clone());
-    let status = crate::projects::git_status::get_branch_status(
-        &crate::projects::git_status::ActiveWorktreeInfo {
-            worktree_id: worktree.id.clone(),
-            worktree_path: worktree.path.clone(),
-            base_branch: base_branch.clone(),
-            pr_number: worktree.pr_number,
-            pr_url: worktree.pr_url.clone(),
-            pr_push_remote: worktree.pr_push_remote.clone(),
-            pr_push_branch: worktree.pr_push_branch.clone(),
-        },
-    )
-    .ok();
-    let porcelain = git_output(&worktree.path, &["status", "--porcelain=v1"])?;
-    let all_files = parse_porcelain_files(&porcelain);
-    let truncated = all_files.len() > max_files;
-    let files: Vec<serde_json::Value> = all_files
-        .into_iter()
-        .take(max_files)
-        .map(|(status, path)| serde_json::json!({ "status": status, "path": path }))
-        .collect();
-
-    Ok(serde_json::json!({
-        "worktreeId": worktree.id,
-        "worktreePath": worktree.path,
-        "branch": worktree.branch,
-        "baseBranch": base_branch,
-        "status": status,
-        "files": files,
-        "filesTruncated": truncated,
-        "porcelain": porcelain,
-    }))
+    crate::backend_runtime::project_service(&app)?
+        .worktree_changes(&worktree_id, max_files)
+        .map_err(|error| error.to_string())
 }
 
 /// Get a bounded unified git diff for a worktree.
@@ -1096,68 +898,9 @@ pub async fn get_worktree_diff(
     let max_bytes = max_bytes
         .unwrap_or(DEFAULT_DIFF_MAX_BYTES)
         .clamp(1, MAX_DIFF_BYTES);
-    let (worktree, project_default_branch) =
-        resolve_worktree_and_project_default(&app, &worktree_id)?;
-    let base_branch = worktree.base_branch.unwrap_or(project_default_branch);
-    let has_head = git_has_head(&worktree.path);
-    let mut args = match diff_type.as_str() {
-        "uncommitted" => {
-            let diff_base = if has_head {
-                "HEAD"
-            } else {
-                "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
-            };
-            vec![
-                "diff".to_string(),
-                diff_base.to_string(),
-                "--unified=3".to_string(),
-            ]
-        }
-        "branch" => vec![
-            "diff".to_string(),
-            "--unified=3".to_string(),
-            format!("origin/{base_branch}...HEAD"),
-        ],
-        other => {
-            return Err(format!(
-                "Invalid diffType: {other}; expected uncommitted or branch"
-            ))
-        }
-    };
-    let path = path.filter(|p| !p.trim().is_empty());
-    if let Some(path) = path.as_deref() {
-        args.push("--".to_string());
-        args.push(path.to_string());
-    }
-    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    let raw_patch = git_output(&worktree.path, &arg_refs)?;
-    let (patch, truncated) = truncate_utf8(&raw_patch, max_bytes);
-
-    Ok(serde_json::json!({
-        "worktreeId": worktree.id,
-        "diffType": diff_type,
-        "baseBranch": base_branch,
-        "path": path,
-        "maxBytes": max_bytes,
-        "truncated": truncated,
-        "rawBytes": raw_patch.len(),
-        "patch": patch,
-    }))
-}
-
-fn resolve_worktree_and_project_default(
-    app: &AppHandle,
-    worktree_id: &str,
-) -> Result<(Worktree, String), String> {
-    let data = load_projects_data(app)?;
-    let worktree = data
-        .find_worktree(worktree_id)
-        .cloned()
-        .ok_or_else(|| format!("Unknown worktreeId: {worktree_id}"))?;
-    let project = data
-        .find_project(&worktree.project_id)
-        .ok_or_else(|| format!("Worktree {worktree_id} has no parent project"))?;
-    Ok((worktree, project.default_branch.clone()))
+    crate::backend_runtime::project_service(&app)?
+        .worktree_diff(&worktree_id, &diff_type, path.as_deref(), max_bytes)
+        .map_err(|error| error.to_string())
 }
 
 fn git_output(repo_path: &str, args: &[&str]) -> Result<String, String> {
@@ -1171,34 +914,6 @@ fn git_output(repo_path: &str, args: &[&str]) -> Result<String, String> {
         return Err(format!("git {} failed: {stderr}", args.join(" ")));
     }
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
-}
-
-fn git_has_head(repo_path: &str) -> bool {
-    silent_command("git")
-        .args(["rev-parse", "--verify", "HEAD"])
-        .current_dir(repo_path)
-        .output()
-        .map(|output| output.status.success())
-        .unwrap_or(false)
-}
-
-fn parse_porcelain_files(porcelain: &str) -> Vec<(String, String)> {
-    porcelain
-        .lines()
-        .filter_map(|line| {
-            if line.len() < 4 {
-                return None;
-            }
-            let status = line[..2].trim().to_string();
-            let path = line[3..]
-                .rsplit_once(" -> ")
-                .map(|(_, path)| path)
-                .unwrap_or(&line[3..])
-                .trim_matches('"')
-                .to_string();
-            Some((status, path))
-        })
-        .collect()
 }
 
 fn truncate_utf8(input: &str, max_bytes: usize) -> (String, bool) {
@@ -2580,542 +2295,28 @@ pub async fn create_worktree_from_existing_branch(
     auto_open_in_jean: Option<bool>,
 ) -> Result<Worktree, String> {
     log::trace!("Creating worktree from existing branch {branch_name} for project: {project_id}");
-    let auto_open_in_jean = auto_open_in_jean.unwrap_or(true);
-
-    let data = load_projects_data(&app)?;
-
-    let project = data
-        .find_project(&project_id)
-        .ok_or_else(|| format!("Project not found: {project_id}"))?
-        .clone();
-
-    // Use the branch name as the worktree name
-    let name = branch_name.clone();
-
-    // Build worktree path: <base>/<project-name>/<folder-name>
-    // Use sanitized name for folder path (branch name may contain slashes)
-    let project_worktrees_dir =
-        get_project_worktrees_dir(&project.name, project.worktrees_dir.as_deref())?;
-    let folder_name = sanitize_folder_name(&name);
-    let worktree_path = project_worktrees_dir.join(&folder_name);
-    let worktree_path_str = worktree_path
-        .to_str()
-        .ok_or_else(|| "Invalid worktree path".to_string())?
-        .to_string();
-
-    // Generate ID upfront so we can track this worktree
-    let worktree_id = Uuid::new_v4().to_string();
-    let created_at = now();
-
-    // Emit creating event immediately
-    let creating_event = WorktreeCreatingEvent {
-        id: worktree_id.clone(),
-        project_id: project_id.clone(),
-        name: name.clone(),
-        path: worktree_path_str.clone(),
-        branch: name.clone(),
-        pr_number: pr_context.as_ref().map(|ctx| ctx.number as u64),
-        issue_number: issue_context.as_ref().map(|ctx| ctx.number as u64),
-        security_alert_number: security_context.as_ref().map(|ctx| ctx.number as u64),
-        advisory_ghsa_id: advisory_context.as_ref().map(|ctx| ctx.ghsa_id.clone()),
-        origin: None,
-        auto_open_in_jean,
-    };
-    if let Err(e) = app.emit_all("worktree:creating", &creating_event) {
-        log::error!("Failed to emit worktree:creating event: {e}");
-    }
-
-    // Create a pending worktree record to return immediately
-    let pending_worktree = Worktree {
-        id: worktree_id.clone(),
-        project_id: project_id.clone(),
-        name: name.clone(),
-        path: worktree_path_str.clone(),
-        branch: name.clone(),
-        base_branch: Some(branch_name.clone()),
-        created_at,
-        setup_output: None,
-        setup_script: None,
-        setup_success: None,
-        session_type: SessionType::Worktree,
-        pr_number: pr_context.as_ref().map(|ctx| ctx.number),
-        pr_url: None,
-        issue_number: issue_context.as_ref().map(|ctx| ctx.number),
-        linear_issue_identifier: linear_context.as_ref().map(|ctx| ctx.identifier.clone()),
-        security_alert_number: security_context.as_ref().map(|ctx| ctx.number),
-        security_alert_url: security_context
-            .as_ref()
-            .and_then(|ctx| ctx.html_url.clone()),
-        advisory_ghsa_id: advisory_context.as_ref().map(|ctx| ctx.ghsa_id.clone()),
-        advisory_url: advisory_context
-            .as_ref()
-            .and_then(|ctx| ctx.html_url.clone()),
-        cached_pr_status: None,
-        cached_check_status: None,
-        cached_behind_count: None,
-        cached_ahead_count: None,
-        cached_status_at: None,
-        cached_uncommitted_added: None,
-        cached_uncommitted_removed: None,
-        cached_branch_diff_added: None,
-        cached_branch_diff_removed: None,
-        cached_base_branch_ahead_count: None,
-        cached_base_branch_behind_count: None,
-        cached_worktree_ahead_count: None,
-        cached_unpushed_count: None,
-        pr_push_remote: None,
-        pr_push_branch: None,
-        order: 0, // Placeholder, actual order is set in background thread
-        origin: None,
-        archived_at: None,
-        labels: Vec::new(),
-        label: None,
-        last_opened_at: None,
-    };
-
-    // Clone values for the background thread
-    let app_clone = app.clone();
-    let project_path = project.path.clone();
-    let project_name = project.name.clone();
-    let worktree_id_clone = worktree_id.clone();
-    let project_id_clone = project_id.clone();
-    let name_clone = name.clone();
-    let worktree_path_clone = worktree_path_str.clone();
-    let branch_name_clone = branch_name.clone();
-    let issue_context_clone = issue_context.clone();
-    let pr_context_clone = pr_context.clone();
-    let security_context_clone = security_context.clone();
-    let advisory_context_clone = advisory_context.clone();
-    let linear_context_clone = linear_context.clone();
-
-    // Spawn background thread for git operations
-    thread::spawn(move || {
-        // Clone IDs for panic handler (before they're moved into the inner closure)
-        let panic_wt_id = worktree_id_clone.clone();
-        let panic_proj_id = project_id_clone.clone();
-        let panic_app = app_clone.clone();
-
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
-            log::trace!("Background: Creating git worktree {name_clone} at {worktree_path_clone} using existing branch {branch_name_clone}");
-
-            // Check if path already exists
-            let worktree_path = std::path::Path::new(&worktree_path_clone);
-            if worktree_path.exists() {
-                log::trace!("Background: Path already exists: {worktree_path_clone}");
-
-                // Check if this path matches an archived worktree
-                let archived_info = load_projects_data(&app_clone).ok().and_then(|data| {
-                    data.worktrees
-                        .iter()
-                        .find(|w| w.path == worktree_path_clone && w.archived_at.is_some())
-                        .map(|w| (w.id.clone(), w.name.clone()))
-                });
-
-                // Generate a suggested alternative name with random suffix
-                let suggested_name = {
-                    let data = load_projects_data(&app_clone).ok();
-                    generate_unique_suffix_name(
-                        &name_clone,
-                        &project_path,
-                        &project_id_clone,
-                        data.as_ref(),
-                    )
-                };
-
-                // Emit path_exists event with archived worktree info if available
-                let path_exists_event = WorktreePathExistsEvent {
-                    id: worktree_id_clone.clone(),
-                    project_id: project_id_clone.clone(),
-                    path: worktree_path_clone.clone(),
-                    suggested_name,
-                    archived_worktree_id: archived_info.as_ref().map(|(id, _)| id.clone()),
-                    archived_worktree_name: archived_info.map(|(_, name)| name),
-                    issue_context: issue_context_clone.clone(),
-                    pr_context: pr_context_clone.clone(),
-                    security_context: security_context_clone.clone(),
-                    advisory_context: advisory_context_clone.clone(),
-                    origin: None,
-                };
-                if let Err(e) = app_clone.emit_all("worktree:path_exists", &path_exists_event) {
-                    log::error!("Failed to emit worktree:path_exists event: {e}");
-                }
-
-                // Also emit error event to remove the pending worktree from UI
-                let error_event = WorktreeCreateErrorEvent {
-                    id: worktree_id_clone,
-                    project_id: project_id_clone,
-                    error: format!("Directory already exists: {worktree_path_clone}"),
-                };
-                if let Err(e) = app_clone.emit_all("worktree:error", &error_event) {
-                    log::error!("Failed to emit worktree:error event: {e}");
-                }
-                return;
-            }
-
-            // Create the git worktree from existing branch
-            if let Err(e) = git::create_worktree_from_existing_branch(
-                &project_path,
-                &worktree_path_clone,
-                &branch_name_clone,
-            ) {
-                log::error!("Background: Failed to create worktree: {e}");
-                let error_event = WorktreeCreateErrorEvent {
-                    id: worktree_id_clone,
-                    project_id: project_id_clone,
-                    error: e,
-                };
-                if let Err(emit_err) = app_clone.emit_all("worktree:error", &error_event) {
-                    log::error!("Failed to emit worktree:error event: {emit_err}");
-                }
-                return;
-            }
-
-            log::trace!("Background: Git worktree created successfully from existing branch");
-
-            // Write issue context file if provided
-            if let Some(ctx) = &issue_context_clone {
-                log::trace!(
-                    "Background: Writing issue context file for issue #{}",
-                    ctx.number
-                );
-                if let Ok(repo_id) = get_repo_identifier(&project_path) {
-                    let repo_key = repo_id.to_key();
-                    if let Ok(contexts_dir) = get_github_contexts_dir(&app_clone) {
-                        if let Err(e) = std::fs::create_dir_all(&contexts_dir) {
-                            log::warn!("Background: Failed to create git-context directory: {e}");
-                        } else {
-                            let context_file =
-                                contexts_dir.join(format!("{repo_key}-issue-{}.md", ctx.number));
-                            let context_content = format_issue_context_markdown(ctx);
-                            if let Err(e) = std::fs::write(&context_file, context_content) {
-                                log::warn!("Background: Failed to write issue context file: {e}");
-                            } else {
-                                if let Err(e) = add_issue_reference(
-                                    &app_clone,
-                                    &repo_key,
-                                    ctx.number,
-                                    &worktree_id_clone,
-                                ) {
-                                    log::warn!("Background: Failed to add issue reference: {e}");
-                                }
-                                log::trace!(
-                                    "Background: Issue context file written to {:?}",
-                                    context_file
-                                );
-                            }
-                        }
-                    }
-                }
-            }
-
-            // Write PR context file if provided
-            if let Some(ctx) = &pr_context_clone {
-                log::trace!("Background: Writing PR context file for PR #{}", ctx.number);
-                if let Ok(repo_id) = get_repo_identifier(&project_path) {
-                    let repo_key = repo_id.to_key();
-                    if let Ok(contexts_dir) = get_github_contexts_dir(&app_clone) {
-                        if let Err(e) = std::fs::create_dir_all(&contexts_dir) {
-                            log::warn!("Background: Failed to create git-context directory: {e}");
-                        } else {
-                            // Fetch the diff if not already present
-                            let gh = resolve_gh_binary(&app_clone);
-                            let ctx_with_diff = if ctx.diff.is_none() {
-                                log::debug!("Background: Fetching diff for PR #{}", ctx.number);
-                                let diff = get_pr_diff(&project_path, ctx.number, &gh).ok();
-                                PullRequestContext {
-                                    number: ctx.number,
-                                    title: ctx.title.clone(),
-                                    body: ctx.body.clone(),
-                                    head_ref_name: ctx.head_ref_name.clone(),
-                                    base_ref_name: ctx.base_ref_name.clone(),
-                                    comments: ctx.comments.clone(),
-                                    reviews: ctx.reviews.clone(),
-                                    diff,
-                                }
-                            } else {
-                                ctx.clone()
-                            };
-
-                            let context_file =
-                                contexts_dir.join(format!("{repo_key}-pr-{}.md", ctx.number));
-                            let context_content = format_pr_context_markdown(&ctx_with_diff);
-                            if let Err(e) = std::fs::write(&context_file, context_content) {
-                                log::warn!("Background: Failed to write PR context file: {e}");
-                            } else {
-                                if let Err(e) = add_pr_reference(
-                                    &app_clone,
-                                    &repo_key,
-                                    ctx.number,
-                                    &worktree_id_clone,
-                                ) {
-                                    log::warn!("Background: Failed to add PR reference: {e}");
-                                }
-                                log::trace!(
-                                    "Background: PR context file written to {:?}",
-                                    context_file
-                                );
-                            }
-                        }
-                    }
-                }
-            }
-
-            // Write security context file if provided (to shared git-context directory)
-            if let Some(ctx) = &security_context_clone {
-                log::trace!(
-                    "Background: Writing security context file for alert #{}",
-                    ctx.number
-                );
-                if let Ok(repo_id) = get_repo_identifier(&project_path) {
-                    let repo_key = repo_id.to_key();
-                    if let Ok(contexts_dir) = get_github_contexts_dir(&app_clone) {
-                        if let Err(e) = std::fs::create_dir_all(&contexts_dir) {
-                            log::warn!("Background: Failed to create git-context directory: {e}");
-                        } else {
-                            let context_file =
-                                contexts_dir.join(format!("{repo_key}-security-{}.md", ctx.number));
-                            let context_content = format_security_context_markdown(ctx);
-                            if let Err(e) = std::fs::write(&context_file, context_content) {
-                                log::warn!(
-                                    "Background: Failed to write security context file: {e}"
-                                );
-                            } else {
-                                if let Err(e) = add_security_reference(
-                                    &app_clone,
-                                    &repo_key,
-                                    ctx.number,
-                                    &worktree_id_clone,
-                                ) {
-                                    log::warn!("Background: Failed to add security reference: {e}");
-                                }
-                                log::trace!(
-                                    "Background: Security context file written to {:?}",
-                                    context_file
-                                );
-                            }
-                        }
-                    }
-                } else {
-                    log::warn!("Background: Could not get repo identifier for security context");
-                }
-            }
-
-            // Write advisory context file if provided (to shared git-context directory)
-            if let Some(ctx) = &advisory_context_clone {
-                log::trace!(
-                    "Background: Writing advisory context file for {}",
-                    ctx.ghsa_id
-                );
-                if let Ok(repo_id) = get_repo_identifier(&project_path) {
-                    let repo_key = repo_id.to_key();
-                    if let Ok(contexts_dir) = get_github_contexts_dir(&app_clone) {
-                        if let Err(e) = std::fs::create_dir_all(&contexts_dir) {
-                            log::warn!("Background: Failed to create git-context directory: {e}");
-                        } else {
-                            let context_file = contexts_dir
-                                .join(format!("{repo_key}-advisory-{}.md", ctx.ghsa_id));
-                            let context_content = format_advisory_context_markdown(ctx);
-                            if let Err(e) = std::fs::write(&context_file, context_content) {
-                                log::warn!(
-                                    "Background: Failed to write advisory context file: {e}"
-                                );
-                            } else {
-                                if let Err(e) = add_advisory_reference(
-                                    &app_clone,
-                                    &repo_key,
-                                    &ctx.ghsa_id,
-                                    &worktree_id_clone,
-                                ) {
-                                    log::warn!("Background: Failed to add advisory reference: {e}");
-                                }
-                                log::trace!(
-                                    "Background: Advisory context file written to {:?}",
-                                    context_file
-                                );
-                            }
-                        }
-                    }
-                } else {
-                    log::warn!("Background: Could not get repo identifier for advisory context");
-                }
-            }
-
-            // Write Linear issue context file if provided
-            if let Some(ctx) = &linear_context_clone {
-                log::trace!(
-                    "Background: Writing Linear issue context file for {}",
-                    ctx.identifier
-                );
-                if let Ok(contexts_dir) = get_github_contexts_dir(&app_clone) {
-                    if let Err(e) = std::fs::create_dir_all(&contexts_dir) {
-                        log::warn!("Background: Failed to create git-context directory: {e}");
-                    } else {
-                        let identifier_lower = ctx.identifier.to_lowercase();
-                        let context_file = contexts_dir
-                            .join(format!("{project_name}-linear-{identifier_lower}.md"));
-                        let detail = linear_context_to_detail(ctx);
-                        let context_content = format_linear_issue_context_markdown(&detail);
-                        if let Err(e) = std::fs::write(&context_file, context_content) {
-                            log::warn!(
-                                "Background: Failed to write Linear issue context file: {e}"
-                            );
-                        } else {
-                            if let Err(e) = add_linear_reference(
-                                &app_clone,
-                                &project_name,
-                                &ctx.identifier,
-                                &worktree_id_clone,
-                            ) {
-                                log::warn!("Background: Failed to add Linear reference: {e}");
-                            }
-                            log::trace!(
-                                "Background: Linear issue context file written to {:?}",
-                                context_file
-                            );
-                        }
-                    }
-                }
-            }
-
-            // Check for jean.json and run setup script
-            let (setup_output, setup_script, setup_success) =
-                if let Some(config) = git::read_jean_config(&project_path) {
-                    if let Some(script) = config.scripts.setup {
-                        log::trace!("Background: Found jean.json with setup script, executing...");
-                        match git::run_setup_script(
-                            &worktree_path_clone,
-                            &project_path,
-                            &name_clone,
-                            &script,
-                        ) {
-                            Ok(output) => (Some(output), Some(script), Some(true)),
-                            Err(e) => {
-                                log::warn!("Background: Setup script failed (continuing): {e}");
-                                (Some(e), Some(script), Some(false))
-                            }
-                        }
-                    } else {
-                        (None, None, None)
-                    }
-                } else {
-                    (None, None, None)
-                };
-
-            // Save to storage
-            if let Ok(mut data) = load_projects_data(&app_clone) {
-                // Get max order for worktrees in this project
-                let max_order = data
-                    .worktrees
-                    .iter()
-                    .filter(|w| w.project_id == project_id_clone)
-                    .map(|w| w.order)
-                    .max()
-                    .unwrap_or(0);
-
-                // Create the final worktree record
-                let worktree = Worktree {
-                    id: worktree_id_clone.clone(),
-                    project_id: project_id_clone.clone(),
-                    name: name_clone.clone(),
-                    path: worktree_path_clone.clone(),
-                    branch: branch_name_clone.clone(),
-                    base_branch: Some(branch_name_clone),
-                    created_at,
-                    setup_output,
-                    setup_script,
-                    setup_success,
-                    session_type: SessionType::Worktree,
-                    pr_number: pr_context_clone.as_ref().map(|ctx| ctx.number),
-                    pr_url: None,
-                    issue_number: issue_context_clone.as_ref().map(|ctx| ctx.number),
-                    linear_issue_identifier: linear_context_clone
-                        .as_ref()
-                        .map(|ctx| ctx.identifier.clone()),
-                    security_alert_number: security_context_clone.as_ref().map(|ctx| ctx.number),
-                    security_alert_url: security_context_clone
-                        .as_ref()
-                        .and_then(|ctx| ctx.html_url.clone()),
-                    advisory_ghsa_id: advisory_context_clone
-                        .as_ref()
-                        .map(|ctx| ctx.ghsa_id.clone()),
-                    advisory_url: advisory_context_clone
-                        .as_ref()
-                        .and_then(|ctx| ctx.html_url.clone()),
-                    cached_pr_status: None,
-                    cached_check_status: None,
-                    cached_behind_count: None,
-                    cached_ahead_count: None,
-                    cached_status_at: None,
-                    cached_uncommitted_added: None,
-                    cached_uncommitted_removed: None,
-                    cached_branch_diff_added: None,
-                    cached_branch_diff_removed: None,
-                    cached_base_branch_ahead_count: None,
-                    cached_base_branch_behind_count: None,
-                    cached_worktree_ahead_count: None,
-                    cached_unpushed_count: None,
-                    pr_push_remote: None,
-                    pr_push_branch: None,
-                    order: max_order + 1,
-                    origin: None,
-                    archived_at: None,
-                    labels: Vec::new(),
-                    label: None,
-                    last_opened_at: None,
-                };
-
-                data.add_worktree(worktree.clone());
-                if let Err(e) = save_projects_data(&app_clone, &data) {
-                    log::error!("Background: Failed to save worktree data: {e}");
-                    let error_event = WorktreeCreateErrorEvent {
-                        id: worktree_id_clone,
-                        project_id: project_id_clone,
-                        error: format!("Failed to save worktree: {e}"),
-                    };
-                    if let Err(emit_err) = app_clone.emit_all("worktree:error", &error_event) {
-                        log::error!("Failed to emit worktree:error event: {emit_err}");
-                    }
-                    return;
-                }
-
-                // Emit success event
-                log::trace!(
-                    "Background: Worktree created successfully from existing branch: {}",
-                    worktree.name
-                );
-                let created_event = WorktreeCreatedEvent {
-                    worktree,
-                    auto_open_in_jean,
-                };
-                if let Err(e) = app_clone.emit_all("worktree:created", &created_event) {
-                    log::error!("Failed to emit worktree:created event: {e}");
-                }
-            } else {
-                log::error!("Background: Failed to load projects data for saving");
-                let error_event = WorktreeCreateErrorEvent {
-                    id: worktree_id_clone,
-                    project_id: project_id_clone,
-                    error: "Failed to load projects data".to_string(),
-                };
-                if let Err(emit_err) = app_clone.emit_all("worktree:error", &error_event) {
-                    log::error!("Failed to emit worktree:error event: {emit_err}");
-                }
-            }
-        })); // end catch_unwind
-
-        if let Err(panic_info) = result {
-            log::error!("Background thread panicked during worktree creation from existing branch: {panic_info:?}");
-            let error_event = WorktreeCreateErrorEvent {
-                id: panic_wt_id,
-                project_id: panic_proj_id,
-                error: "Internal error: worktree creation failed unexpectedly".to_string(),
-            };
-            let _ = panic_app.emit_all("worktree:error", &error_event);
-        }
-    });
-
-    log::trace!("Returning pending worktree: {}", pending_worktree.name);
-    Ok(pending_worktree)
+    let service = crate::backend_runtime::project_service(&app)?;
+    let context = crate::backend_runtime::context(&app)?;
+    let (pending, task) = service
+        .prepare_existing_branch_worktree(
+            jean_core::ExistingBranchWorktreeInput {
+                project_id,
+                branch_name,
+                contexts: jean_core::WorktreeContexts {
+                    issue: issue_context,
+                    pull_request: pr_context,
+                    security: security_context,
+                    advisory: advisory_context,
+                    linear: linear_context,
+                },
+                auto_open_in_jean: auto_open_in_jean.unwrap_or(true),
+            },
+            context.events.as_ref(),
+        )
+        .map_err(|error| error.to_string())?;
+    let events = context.events.clone();
+    thread::spawn(move || service.run_existing_branch_worktree_task(task, events.as_ref()));
+    serde_json::from_value(pending).map_err(|error| error.to_string())
 }
 
 /// Checkout a GitHub PR to a new worktree
@@ -3909,66 +3110,14 @@ pub async fn delete_worktree(app: AppHandle, worktree_id: String) -> Result<(), 
 pub async fn create_base_session(app: AppHandle, project_id: String) -> Result<Worktree, String> {
     log::trace!("Creating base session for project: {project_id}");
 
-    let mut data = load_projects_data(&app)?;
-
-    // Check if base session already exists - return existing for reopening
-    if let Some(existing) = data.find_base_session(&project_id) {
-        log::trace!("Returning existing base session: {}", existing.name);
-        return Ok(existing.clone());
+    let (session, created) = crate::backend_runtime::project_service(&app)?
+        .create_base_session(&project_id)
+        .map_err(|error| error.to_string())?;
+    let session: Worktree = serde_json::from_value(session).map_err(|error| error.to_string())?;
+    if !created {
+        log::trace!("Returning existing base session: {}", session.name);
+        return Ok(session);
     }
-
-    let project = data
-        .find_project(&project_id)
-        .ok_or_else(|| format!("Project not found: {project_id}"))?
-        .clone();
-
-    // Create base session record (NO git worktree creation)
-    // Base sessions always have order 0 (first in list)
-    let session = Worktree {
-        id: Uuid::new_v4().to_string(),
-        project_id: project_id.clone(),
-        name: project.default_branch.clone(),
-        path: project.path.clone(), // Uses project's base directory directly
-        branch: project.default_branch.clone(),
-        base_branch: None,
-        created_at: now(),
-        setup_output: None,
-        setup_script: None,
-        setup_success: None,
-        session_type: SessionType::Base,
-        pr_number: None,
-        pr_url: None,
-        issue_number: None,
-        linear_issue_identifier: None,
-        security_alert_number: None,
-        security_alert_url: None,
-        advisory_ghsa_id: None,
-        advisory_url: None,
-        cached_pr_status: None,
-        cached_check_status: None,
-        cached_behind_count: None,
-        cached_ahead_count: None,
-        cached_status_at: None,
-        cached_uncommitted_added: None,
-        cached_uncommitted_removed: None,
-        cached_branch_diff_added: None,
-        cached_branch_diff_removed: None,
-        cached_base_branch_ahead_count: None,
-        cached_base_branch_behind_count: None,
-        cached_worktree_ahead_count: None,
-        cached_unpushed_count: None,
-        pr_push_remote: None,
-        pr_push_branch: None,
-        order: 0, // Base sessions are always first
-        origin: None,
-        archived_at: None,
-        labels: Vec::new(),
-        label: None,
-        last_opened_at: None,
-    };
-
-    data.add_worktree(session.clone());
-    save_projects_data(&app, &data)?;
 
     // Try to restore preserved sessions from a previous close
     // This migrates base-{project_id}.json to {new_worktree_id}.json
@@ -4000,10 +3149,7 @@ pub async fn create_base_session(app: AppHandle, project_id: String) -> Result<W
         }
     }
 
-    log::trace!(
-        "Successfully created base session for project: {}",
-        project.name
-    );
+    log::trace!("Successfully created base session for project: {project_id}");
     Ok(session)
 }
 
@@ -4041,116 +3187,17 @@ async fn close_base_session_internal(
 ) -> Result<(), String> {
     log::info!("[BASE_CLOSE] Closing base session: {worktree_id} (preserve_sessions: {preserve_sessions}, archive_sessions: {archive_sessions})");
 
-    let mut data = load_projects_data(app)?;
-
-    let worktree = data
-        .find_worktree(worktree_id)
-        .ok_or_else(|| format!("Session not found: {worktree_id}"))?
-        .clone();
-
-    // Verify it's a base session
-    if worktree.session_type != SessionType::Base {
-        return Err("Not a base session. Use delete_worktree instead.".to_string());
-    }
-
-    log::info!(
-        "[BASE_CLOSE] Found base session, session_type={:?}, path={}",
-        worktree.session_type,
-        worktree.path
-    );
-
-    // Archive all non-archived sessions before closing
-    if archive_sessions {
-        let worktree_path = worktree.path.clone();
-        let wt_id = worktree_id.to_string();
-        log::info!("[BASE_CLOSE] Archiving sessions for worktree_id={wt_id}, path={worktree_path}");
-        let archive_result = crate::chat::with_sessions_mut(
-            app,
-            &worktree_path,
-            &wt_id,
-            |sessions| {
-                let ts = now();
-                let mut archived_count = 0u32;
-                let total = sessions.sessions.len();
-                for session in &mut sessions.sessions {
-                    log::info!(
-                        "[BASE_CLOSE] Session '{}' (id={}): archived_at={:?}",
-                        session.name,
-                        session.id,
-                        session.archived_at
-                    );
-                    if session.archived_at.is_none() {
-                        session.archived_at = Some(ts);
-                        session.archived_by_base_close = Some(true);
-                        archived_count += 1;
-                        log::info!("[BASE_CLOSE] -> Archived session '{}'", session.name);
-                    }
-                }
-                log::info!("[BASE_CLOSE] Archived {archived_count}/{total} sessions in base session {wt_id}");
-                Ok(archived_count)
-            },
-        );
-        match &archive_result {
-            Ok(count) => log::info!("[BASE_CLOSE] Archive result: Ok({count})"),
-            Err(e) => log::warn!("[BASE_CLOSE] Failed to archive sessions: {e}"),
-        }
-    } else {
-        log::info!("[BASE_CLOSE] Skipping session archival (archive_sessions=false)");
-    }
-
-    if preserve_sessions || archive_sessions {
-        // Preserve the sessions file before removing the worktree
-        // This renames {worktree_id}.json to base-{project_id}.json
-        log::info!(
-            "[BASE_CLOSE] Preserving sessions file for worktree_id={worktree_id}, project_id={}",
-            worktree.project_id
-        );
-        crate::chat::preserve_base_sessions(app, worktree_id, &worktree.project_id)?;
-    } else {
-        // Clean close: delete session data directories before removing the index
-        let session_ids: Vec<String> =
-            crate::chat::storage::load_sessions(app, &worktree.path, worktree_id)
-                .map(|ws| ws.sessions.iter().map(|s| s.id.clone()).collect())
-                .unwrap_or_default();
-
-        for sid in &session_ids {
-            if let Err(e) = crate::chat::storage::delete_session_data(app, sid) {
-                log::warn!("Failed to delete session data for {sid}: {e}");
-            }
-            crate::chat::storage::cleanup_combined_context_files(app, sid);
-        }
-
-        // Delete the sessions file entirely for a clean close
-        if let Ok(sessions_file) = crate::chat::storage::get_sessions_path(app, worktree_id) {
-            if sessions_file.exists() {
-                if let Err(e) = std::fs::remove_file(&sessions_file) {
-                    log::warn!("Failed to delete sessions file for {worktree_id}: {e}");
-                } else {
-                    log::trace!(
-                        "Deleted sessions file for clean base session close: {worktree_id}"
-                    );
-                }
-            }
-        }
-    }
-
-    let project_id = worktree.project_id.clone();
-
-    // Remove from data (NO git operations - we don't delete the project directory!)
-    data.remove_worktree(worktree_id);
-    save_projects_data(app, &data)?;
-
-    // Emit deleted event so other clients clear their ChatWindow state
-    let deleted_event = WorktreeDeletedEvent {
-        id: worktree_id.to_string(),
-        project_id,
-        teardown_output: None,
+    let context = crate::backend_runtime::context(app)?;
+    let mode = match (preserve_sessions, archive_sessions) {
+        (_, true) => jean_core::BaseSessionCloseMode::Archive,
+        (true, false) => jean_core::BaseSessionCloseMode::Preserve,
+        (false, false) => jean_core::BaseSessionCloseMode::Clean,
     };
-    if let Err(e) = app.emit_all("worktree:deleted", &deleted_event) {
-        log::error!("Failed to emit worktree:deleted event for base session close: {e}");
-    }
+    crate::backend_runtime::project_service(app)?
+        .close_base_session(worktree_id, mode, context.events.as_ref())
+        .map_err(|error| error.to_string())?;
 
-    log::trace!("Successfully closed base session: {}", worktree.name);
+    log::trace!("Successfully closed base session: {worktree_id}");
     Ok(())
 }
 
@@ -4170,41 +3217,10 @@ pub async fn archive_worktree(app: AppHandle, worktree_id: String) -> Result<(),
 
     // Cancel any running Claude processes for this worktree
     crate::chat::registry::cancel_processes_for_worktree(&app, &worktree_id);
-
-    let mut data = load_projects_data(&app)?;
-
-    let worktree = data
-        .find_worktree_mut(&worktree_id)
-        .ok_or_else(|| format!("Worktree not found: {worktree_id}"))?;
-
-    // Base sessions cannot be archived - they should be closed instead
-    if worktree.session_type == SessionType::Base {
-        return Err(
-            "Base sessions cannot be archived. Use close_base_session instead.".to_string(),
-        );
-    }
-
-    // Check if already archived
-    if worktree.archived_at.is_some() {
-        return Err("Worktree is already archived".to_string());
-    }
-
-    let project_id = worktree.project_id.clone();
-
-    // Set archived timestamp
-    worktree.archived_at = Some(now());
-
-    // Save the updated data
-    save_projects_data(&app, &data)?;
-
-    // Emit archived event
-    let event = WorktreeArchivedEvent {
-        id: worktree_id.clone(),
-        project_id,
-    };
-    if let Err(e) = app.emit_all("worktree:archived", &event) {
-        log::error!("Failed to emit worktree:archived event: {e}");
-    }
+    let context = crate::backend_runtime::context(&app)?;
+    crate::backend_runtime::project_service(&app)?
+        .archive_worktree(&worktree_id, context.events.as_ref())
+        .map_err(|error| error.to_string())?;
 
     log::trace!("Successfully archived worktree: {worktree_id}");
     Ok(())
@@ -4217,43 +3233,12 @@ pub async fn archive_worktree(app: AppHandle, worktree_id: String) -> Result<(),
 pub async fn unarchive_worktree(app: AppHandle, worktree_id: String) -> Result<Worktree, String> {
     log::trace!("Unarchiving worktree: {worktree_id}");
 
-    let mut data = load_projects_data(&app)?;
-
-    let worktree = data
-        .find_worktree_mut(&worktree_id)
-        .ok_or_else(|| format!("Worktree not found: {worktree_id}"))?;
-
-    // Verify it's archived
-    if worktree.archived_at.is_none() {
-        return Err("Worktree is not archived".to_string());
-    }
-
-    // For non-base sessions, validate git worktree still exists
-    if worktree.session_type != SessionType::Base {
-        let path = std::path::Path::new(&worktree.path);
-        if !path.exists() {
-            return Err(format!(
-                "Git worktree directory no longer exists: {}. The worktree may need to be permanently deleted.",
-                worktree.path
-            ));
-        }
-    }
-
-    // Clear archived timestamp
-    worktree.archived_at = None;
-
-    let restored_worktree = worktree.clone();
-
-    // Save the updated data
-    save_projects_data(&app, &data)?;
-
-    // Emit unarchived event
-    let event = WorktreeUnarchivedEvent {
-        worktree: restored_worktree.clone(),
-    };
-    if let Err(e) = app.emit_all("worktree:unarchived", &event) {
-        log::error!("Failed to emit worktree:unarchived event: {e}");
-    }
+    let context = crate::backend_runtime::context(&app)?;
+    let restored_worktree = crate::backend_runtime::project_service(&app)?
+        .unarchive_worktree(&worktree_id, context.events.as_ref())
+        .map_err(|error| error.to_string())?;
+    let restored_worktree: Worktree =
+        serde_json::from_value(restored_worktree).map_err(|error| error.to_string())?;
 
     log::trace!("Successfully unarchived worktree: {worktree_id}");
     Ok(restored_worktree)
@@ -4264,15 +3249,13 @@ pub async fn unarchive_worktree(app: AppHandle, worktree_id: String) -> Result<W
 pub async fn list_archived_worktrees(app: AppHandle) -> Result<Vec<Worktree>, String> {
     log::trace!("Listing all archived worktrees");
 
-    let data = load_projects_data(&app)?;
-    let archived = data
-        .worktrees
-        .iter()
-        .filter(|w| w.archived_at.is_some())
-        .cloned()
-        .collect();
-
-    Ok(archived)
+    crate::backend_runtime::project_service(&app)?
+        .list_archived_worktrees()
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .map(serde_json::from_value)
+        .collect::<Result<_, _>>()
+        .map_err(|error| error.to_string())
 }
 
 /// Import an existing git worktree directory into Jean
@@ -4286,116 +3269,11 @@ pub async fn import_worktree(
     path: String,
 ) -> Result<Worktree, String> {
     log::trace!("Importing worktree: path={path}, project_id={project_id}");
-
-    let worktree_path = Path::new(&path);
-
-    // Verify the path exists
-    if !worktree_path.exists() {
-        return Err(format!("Path does not exist: {path}"));
-    }
-
-    // Verify it's a directory
-    if !worktree_path.is_dir() {
-        return Err(format!("Path is not a directory: {path}"));
-    }
-
-    // Check if this is a git directory (has .git file or directory)
-    let git_indicator = worktree_path.join(".git");
-    if !git_indicator.exists() {
-        return Err(format!("Path is not a git worktree or repository: {path}"));
-    }
-
-    // Get the current branch name from git
-    let branch = git::get_current_branch(&path)?;
-
-    // Extract the worktree name from the path (last component)
-    let name = worktree_path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .ok_or_else(|| format!("Invalid path: {path}"))?
-        .to_string();
-
-    let mut data = load_projects_data(&app)?;
-
-    // Verify project exists
-    let _ = data
-        .find_project(&project_id)
-        .ok_or_else(|| format!("Project not found: {project_id}"))?;
-
-    // Check if a worktree with this path already exists
-    if data.worktrees.iter().any(|w| w.path == path) {
-        return Err(format!(
-            "A worktree with this path is already tracked: {path}"
-        ));
-    }
-
-    // Get max order for worktrees in this project
-    let max_order = data
-        .worktrees
-        .iter()
-        .filter(|w| w.project_id == project_id)
-        .map(|w| w.order)
-        .max()
-        .unwrap_or(0);
-
-    // Create the worktree record
-    let worktree = Worktree {
-        id: Uuid::new_v4().to_string(),
-        project_id: project_id.clone(),
-        name,
-        path: path.clone(),
-        branch,
-        base_branch: None,
-        created_at: now(),
-        setup_output: None,
-        setup_script: None,
-        setup_success: None,
-        session_type: SessionType::Worktree,
-        pr_number: None,
-        pr_url: None,
-        issue_number: None,
-        linear_issue_identifier: None,
-        security_alert_number: None,
-        security_alert_url: None,
-        advisory_ghsa_id: None,
-        advisory_url: None,
-        cached_pr_status: None,
-        cached_check_status: None,
-        cached_behind_count: None,
-        cached_ahead_count: None,
-        cached_status_at: None,
-        cached_uncommitted_added: None,
-        cached_uncommitted_removed: None,
-        cached_branch_diff_added: None,
-        cached_branch_diff_removed: None,
-        cached_base_branch_ahead_count: None,
-        cached_base_branch_behind_count: None,
-        cached_worktree_ahead_count: None,
-        cached_unpushed_count: None,
-        pr_push_remote: None,
-        pr_push_branch: None,
-        order: max_order + 1,
-        origin: None,
-        archived_at: None,
-        labels: Vec::new(),
-        label: None,
-        last_opened_at: None,
-    };
-
-    data.add_worktree(worktree.clone());
-    save_projects_data(&app, &data)?;
-
-    // Emit created event
-    let event = WorktreeCreatedEvent {
-        worktree: worktree.clone(),
-        auto_open_in_jean: true,
-    };
-    if let Err(e) = app.emit_all("worktree:created", &event) {
-        log::error!("Failed to emit worktree:created event: {e}");
-    }
-
-    log::trace!("Successfully imported worktree: {}", worktree.id);
-    Ok(worktree)
+    let context = crate::backend_runtime::context(&app)?;
+    let worktree = crate::backend_runtime::project_service(&app)?
+        .import_worktree(&project_id, &path, context.events.as_ref())
+        .map_err(|error| error.to_string())?;
+    serde_json::from_value(worktree).map_err(|error| error.to_string())
 }
 
 /// Permanently delete an archived worktree (removes git worktree/branch from disk)
@@ -4408,104 +3286,10 @@ pub async fn permanently_delete_worktree(
     worktree_id: String,
 ) -> Result<(), String> {
     log::trace!("Permanently deleting archived worktree: {worktree_id}");
-
-    let data = load_projects_data(&app)?;
-
-    let worktree = data
-        .find_worktree(&worktree_id)
-        .ok_or_else(|| format!("Worktree not found: {worktree_id}"))?
-        .clone();
-
-    // Verify it's archived
-    if worktree.archived_at.is_none() {
-        return Err(
-            "Only archived worktrees can be permanently deleted. Archive it first.".to_string(),
-        );
-    }
-
-    let project = data
-        .find_project(&worktree.project_id)
-        .ok_or_else(|| format!("Project not found: {}", worktree.project_id))?
-        .clone();
-
-    // Remove from storage SYNCHRONOUSLY to avoid race conditions with other operations
-    // (e.g., archive/unarchive could be overwritten if we save in background thread)
-    let mut data = load_projects_data(&app)?;
-    data.remove_worktree(&worktree_id);
-    save_projects_data(&app, &data)?;
-    log::trace!("Worktree removed from storage: {worktree_id}");
-
-    // Collect session IDs for cleanup before the index file is deleted
-    let session_ids: Vec<String> =
-        crate::chat::storage::load_sessions(&app, &worktree.path, &worktree.id)
-            .map(|ws| ws.sessions.iter().map(|s| s.id.clone()).collect())
-            .unwrap_or_default();
-
-    // Clone values for background thread
-    let app_clone = app.clone();
-    let worktree_id_clone = worktree_id.clone();
-    let project_id_clone = worktree.project_id.clone();
-    let project_path = project.path.clone();
-    let worktree_path = worktree.path.clone();
-    let worktree_branch = worktree.branch.clone();
-    let worktree_name = worktree.name.clone();
-    let is_base_session = worktree.session_type == SessionType::Base;
-
-    // Spawn background thread for git operations and cleanup only
-    // Storage is already updated, so git failures won't corrupt other data
-    thread::spawn(move || {
-        // Only remove git worktree/branch for non-base sessions
-        if !is_base_session {
-            log::trace!("Background: Removing git worktree at {worktree_path}");
-
-            // Remove the git worktree (ignore errors if already gone)
-            if let Err(e) = git::remove_worktree(&project_path, &worktree_path) {
-                log::warn!("Background: Failed to remove worktree (may already be deleted): {e}");
-            }
-
-            log::trace!("Background: Deleting branch {worktree_branch}");
-
-            // Delete the branch (ignore errors if already gone)
-            if let Err(e) = git::delete_branch(&project_path, &worktree_branch) {
-                log::warn!("Background: Failed to delete branch (may already be deleted): {e}");
-            }
-        }
-
-        // Delete the sessions file for this worktree
-        if let Ok(app_data_dir) = app_clone.path().app_data_dir() {
-            let sessions_file = app_data_dir
-                .join("sessions")
-                .join(format!("{worktree_id_clone}.json"));
-            if sessions_file.exists() {
-                if let Err(e) = std::fs::remove_file(&sessions_file) {
-                    log::warn!("Failed to delete sessions file: {e}");
-                } else {
-                    log::trace!("Deleted sessions file for worktree: {worktree_id_clone}");
-                }
-            }
-        }
-
-        // Clean up combined-context files for each session
-        for sid in &session_ids {
-            crate::chat::storage::cleanup_combined_context_files(&app_clone, sid);
-        }
-
-        // Emit success event
-        log::trace!("Background: Worktree permanently deleted: {worktree_name}");
-        let event = WorktreePermanentlyDeletedEvent {
-            id: worktree_id_clone,
-            project_id: project_id_clone,
-        };
-        if let Err(e) = app_clone.emit_all("worktree:permanently_deleted", &event) {
-            log::error!("Failed to emit worktree:permanently_deleted event: {e}");
-        }
-    });
-
-    log::trace!(
-        "Permanent deletion started in background for worktree: {}",
-        worktree.name
-    );
-    Ok(())
+    let context = crate::backend_runtime::context(&app)?;
+    crate::backend_runtime::project_service(&app)?
+        .permanently_delete_worktree(&worktree_id, context.events.as_ref())
+        .map_err(|error| error.to_string())
 }
 
 /// Open a project's worktrees folder in the system file explorer
@@ -4974,14 +3758,18 @@ pub async fn open_worktree_in_editor(
 #[tauri::command]
 pub async fn remove_git_remote(repo_path: String, remote_name: String) -> Result<(), String> {
     log::trace!("Removing git remote '{remote_name}' from: {repo_path}");
-    git::remove_git_remote(&repo_path, &remote_name)
+    crate::backend_runtime::git_service()
+        .remove_remote(&repo_path, &remote_name)
+        .map_err(|error| error.to_string())
 }
 
 /// Get all git remotes for a repository
 #[tauri::command]
-pub async fn get_git_remotes(repo_path: String) -> Result<Vec<git::GitRemote>, String> {
+pub async fn get_git_remotes(repo_path: String) -> Result<Vec<jean_core::git::GitRemote>, String> {
     log::trace!("Getting git remotes for: {repo_path}");
-    git::get_git_remotes(&repo_path)
+    crate::backend_runtime::git_service()
+        .remotes(&repo_path)
+        .map_err(|error| error.to_string())
 }
 
 /// Get all GitHub remotes for a repository
@@ -5094,47 +3882,10 @@ pub async fn rename_worktree(
     new_name: String,
 ) -> Result<Worktree, String> {
     log::trace!("Renaming worktree: {worktree_id} to {new_name}");
-
-    let mut data = load_projects_data(&app)?;
-
-    // Find the worktree first to check session type
-    let worktree = data
-        .find_worktree(&worktree_id)
-        .ok_or_else(|| format!("Worktree not found: {worktree_id}"))?;
-
-    let project_id = worktree.project_id.clone();
-
-    // Display name only - just trim whitespace, no branch sanitization needed
-    let new_name = new_name.trim().to_string();
-    if new_name.is_empty() {
-        return Err("Name cannot be empty".to_string());
-    }
-    log::trace!("Worktree display name: {new_name}");
-
-    // Check if name already exists for this project (excluding current worktree)
-    let name_exists = data
-        .worktrees
-        .iter()
-        .any(|w| w.project_id == project_id && w.name == new_name && w.id != worktree_id);
-
-    if name_exists {
-        return Err(format!(
-            "A worktree named '{new_name}' already exists in this project"
-        ));
-    }
-
-    // Update the worktree name
-    let worktree = data
-        .find_worktree_mut(&worktree_id)
-        .ok_or_else(|| format!("Worktree not found: {worktree_id}"))?;
-
-    worktree.name = new_name.clone();
-    let updated_worktree = worktree.clone();
-
-    save_projects_data(&app, &data)?;
-
-    log::trace!("Successfully renamed worktree to: {new_name}");
-    Ok(updated_worktree)
+    let worktree = crate::backend_runtime::project_service(&app)?
+        .rename_worktree(&worktree_id, &new_name)
+        .map_err(|error| error.to_string())?;
+    serde_json::from_value(worktree).map_err(|error| error.to_string())
 }
 
 /// Update the labels on a worktree.
@@ -5145,22 +3896,14 @@ pub async fn update_worktree_labels(
     mut labels: Vec<LabelData>,
 ) -> Result<(), String> {
     log::trace!("Updating worktree labels: {worktree_id}");
-
-    super::types::dedupe_labels_by_name(&mut labels);
-
-    let mut data = load_projects_data(&app)?;
-
-    let worktree = data
-        .find_worktree_mut(&worktree_id)
-        .ok_or_else(|| format!("Worktree not found: {worktree_id}"))?;
-
-    worktree.labels = labels;
-    worktree.label = None;
-
-    save_projects_data(&app, &data)?;
-
-    log::trace!("Successfully updated worktree labels for: {worktree_id}");
-    Ok(())
+    let labels = labels
+        .drain(..)
+        .map(serde_json::to_value)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
+    crate::backend_runtime::project_service(&app)?
+        .update_worktree_labels(&worktree_id, labels)
+        .map_err(|error| error.to_string())
 }
 
 /// Deprecated compatibility wrapper for old clients that only support one worktree label.
@@ -5177,22 +3920,9 @@ pub async fn update_worktree_label(
 #[tauri::command]
 pub async fn set_worktree_last_opened(app: AppHandle, worktree_id: String) -> Result<(), String> {
     log::trace!("Setting last_opened_at for worktree: {worktree_id}");
-
-    let mut data = load_projects_data(&app)?;
-
-    let worktree = data
-        .find_worktree_mut(&worktree_id)
-        .ok_or_else(|| format!("Worktree not found: {worktree_id}"))?;
-
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    worktree.last_opened_at = Some(now);
-
-    save_projects_data(&app, &data)?;
-
-    Ok(())
+    crate::backend_runtime::project_service(&app)?
+        .set_worktree_last_opened(&worktree_id)
+        .map_err(|error| error.to_string())
 }
 
 /// Commit changes in a worktree
@@ -5211,7 +3941,9 @@ pub async fn commit_changes(
         .find_worktree(&worktree_id)
         .ok_or_else(|| format!("Worktree not found: {worktree_id}"))?;
 
-    let result = git::commit_changes(&worktree.path, &message, stage_all.unwrap_or(false))?;
+    let result = crate::backend_runtime::git_service()
+        .commit(&worktree.path, &message, stage_all.unwrap_or(false))
+        .map_err(|error| error.to_string())?;
 
     log::trace!(
         "Successfully committed changes in worktree: {} ({})",
@@ -5255,105 +3987,17 @@ pub async fn open_pull_request(
     Ok(result)
 }
 
-/// Response structure for file listing
-#[derive(Debug, Clone, Serialize)]
-pub struct WorktreeFile {
-    /// Relative path from worktree root (e.g., "src/components/Button.tsx")
-    pub relative_path: String,
-    /// File extension (e.g., "tsx", "rs") or empty for no extension
-    pub extension: String,
-    /// Whether this entry is a directory
-    pub is_dir: bool,
-}
-
 /// List files in a worktree, respecting .gitignore
 /// Returns files sorted alphabetically, limited to prevent performance issues
 #[tauri::command]
 pub async fn list_worktree_files(
     worktree_path: String,
     max_files: Option<usize>,
-) -> Result<Vec<WorktreeFile>, String> {
+) -> Result<Vec<jean_core::git::WorktreeFile>, String> {
     log::trace!("Listing files in worktree: {worktree_path}");
-
-    let max = max_files.unwrap_or(5000);
-    let mut files = Vec::new();
-
-    // Use ignore crate's WalkBuilder which respects .gitignore by default
-    let walker = WalkBuilder::new(&worktree_path)
-        .hidden(false) // Include hidden files (user may want .env.example etc)
-        .git_ignore(true) // Respect .gitignore
-        .git_global(true) // Respect global gitignore
-        .git_exclude(true) // Respect .git/info/exclude
-        .require_git(false) // Work even if not a git repo
-        .build();
-
-    let worktree_path_ref = Path::new(&worktree_path);
-
-    for entry in walker {
-        if files.len() >= max {
-            break;
-        }
-
-        let entry = match entry {
-            Ok(e) => e,
-            Err(e) => {
-                log::warn!("Failed to read entry: {e}");
-                continue;
-            }
-        };
-
-        let path = entry.path();
-
-        // Skip the root directory itself
-        if path == worktree_path_ref {
-            continue;
-        }
-
-        // Skip .git directory and its contents
-        if path.components().any(|c| c.as_os_str() == ".git") {
-            continue;
-        }
-
-        let entry_is_dir = path.is_dir();
-
-        // Get relative path
-        let relative = match path.strip_prefix(worktree_path_ref) {
-            Ok(r) => r,
-            Err(_) => continue,
-        };
-
-        let relative_str = relative.to_string_lossy().to_string();
-
-        // Skip empty paths
-        if relative_str.is_empty() {
-            continue;
-        }
-
-        let extension = if entry_is_dir {
-            String::new()
-        } else {
-            path.extension()
-                .and_then(|e| e.to_str())
-                .unwrap_or("")
-                .to_string()
-        };
-
-        files.push(WorktreeFile {
-            relative_path: relative_str,
-            extension,
-            is_dir: entry_is_dir,
-        });
-    }
-
-    // Sort: directories first, then alphabetically within each group
-    files.sort_by(|a, b| {
-        b.is_dir
-            .cmp(&a.is_dir)
-            .then_with(|| a.relative_path.cmp(&b.relative_path))
-    });
-
-    log::trace!("Found {} files in worktree", files.len());
-    Ok(files)
+    crate::backend_runtime::git_service()
+        .list_files(&worktree_path, max_files.unwrap_or(5000))
+        .map_err(|error| error.to_string())
 }
 
 /// Get available branches for a project (prefers remote branches if available)
@@ -5366,41 +4010,9 @@ pub async fn get_project_branches(
     project_id: String,
 ) -> Result<Vec<String>, String> {
     log::trace!("Getting branches for project: {project_id}");
-
-    let data = load_projects_data(&app)?;
-    let project = data
-        .find_project(&project_id)
-        .ok_or_else(|| format!("Project not found: {project_id}"))?;
-
-    // Fetch from origin to get latest branches (best effort)
-    let _ = git::fetch_origin(&project.path);
-
-    // Try to get remote branches first
-    let remote_branches = git::get_remote_branches(&project.path)?;
-
-    if !remote_branches.is_empty() {
-        log::trace!(
-            "Found {} remote branches for project {}",
-            remote_branches.len(),
-            project.name
-        );
-        let mut branches = remote_branches;
-        branches.sort();
-        branches.dedup();
-        return Ok(branches);
-    }
-
-    // Fall back to local branches
-    let local_branches = git::get_branches(&project.path)?;
-    log::trace!(
-        "Found {} local branches for project {} (no remote)",
-        local_branches.len(),
-        project.name
-    );
-
-    let mut branches = local_branches;
-    branches.sort();
-    Ok(branches)
+    crate::backend_runtime::project_service(&app)?
+        .branches(&project_id)
+        .map_err(|error| error.to_string())
 }
 
 /// Update project settings
@@ -5423,140 +4035,35 @@ pub async fn update_project_settings(
     auto_fix_settings: Option<Option<ProjectAutoFixSettings>>,
 ) -> Result<Project, String> {
     log::trace!("Updating settings for project: {project_id}");
-
-    let mut data = load_projects_data(&app)?;
-
-    let project = data
-        .find_project_mut(&project_id)
-        .ok_or_else(|| format!("Project not found: {project_id}"))?;
-
-    if let Some(new_name) = name {
-        let new_name = new_name.trim().to_string();
-        if new_name.is_empty() {
-            return Err("Project name cannot be empty".to_string());
-        }
-        log::trace!("Renaming project from '{}' to '{new_name}'", project.name);
-        project.name = new_name;
-    }
-
-    if let Some(branch) = default_branch {
-        log::trace!(
-            "Updating default branch from '{}' to '{}'",
-            project.default_branch,
-            branch
-        );
-        project.default_branch = branch;
-    }
-
-    if let Some(servers) = enabled_mcp_servers {
-        log::trace!("Updating enabled MCP servers: {servers:?}");
-        project.enabled_mcp_servers = Some(servers);
-    }
-
-    if let Some(servers) = known_mcp_servers {
-        log::trace!("Updating known MCP servers: {servers:?}");
-        project.known_mcp_servers = servers;
-    }
-
-    if let Some(prompt) = custom_system_prompt {
-        let prompt = prompt.trim().to_string();
-        log::trace!("Updating custom system prompt ({} chars)", prompt.len());
-        project.custom_system_prompt = if prompt.is_empty() {
-            None
-        } else {
-            Some(prompt)
-        };
-    }
-
-    if let Some(provider) = default_provider {
-        log::trace!("Updating default provider: {provider:?}");
-        project.default_provider = provider.filter(|p| p != "__none__");
-    }
-
-    if let Some(backend) = default_backend {
-        log::trace!("Updating default backend: {backend:?}");
-        project.default_backend = backend.filter(|b| b != "__none__");
-    }
-
-    if let Some(dir) = worktrees_dir {
-        let dir = dir.trim().to_string();
-        log::trace!("Updating worktrees dir: {dir:?}");
-        project.worktrees_dir = if dir.is_empty() { None } else { Some(dir) };
-    }
-
-    if let Some(key) = linear_api_key {
-        let key = key.trim().to_string();
-        log::trace!("Updating Linear API key ({} chars)", key.len());
-        project.linear_api_key = if key.is_empty() { None } else { Some(key) };
-    }
-
-    if let Some(team_id) = linear_team_id {
-        let team_id = team_id.trim().to_string();
-        log::trace!("Updating Linear team ID: {team_id:?}");
-        project.linear_team_id = if team_id.is_empty() {
-            None
-        } else {
-            Some(team_id)
-        };
-    }
-
-    if let Some(settings) = auto_fix_settings {
-        log::trace!("Updating Mr. Robot settings: {settings:?}");
-        project.auto_fix_settings = settings;
-    }
-
-    // Handle linked_project_ids with bidirectional sync
-    if let Some(ids) = linked_project_ids {
-        // Filter out self-references and deduplicate
-        let clean_ids: Vec<String> = {
-            let mut seen = std::collections::HashSet::new();
-            ids.into_iter()
-                .filter(|id| id != &project_id && seen.insert(id.clone()))
-                .collect()
-        };
-
-        let old_ids = project.linked_project_ids.clone();
-        project.linked_project_ids = clean_ids.clone();
-
-        // Compute added and removed for reciprocal updates
-        let added: Vec<String> = clean_ids
-            .iter()
-            .filter(|id| !old_ids.contains(id))
-            .cloned()
-            .collect();
-        let removed: Vec<String> = old_ids
-            .iter()
-            .filter(|id| !clean_ids.contains(id))
-            .cloned()
-            .collect();
-
-        let pid = project_id.clone();
-
-        // Add reciprocal links for newly added projects
-        for add_id in &added {
-            if let Some(other) = data.find_project_mut(add_id) {
-                if !other.linked_project_ids.contains(&pid) {
-                    other.linked_project_ids.push(pid.clone());
-                }
+    let mut args = serde_json::Map::new();
+    macro_rules! insert_optional {
+        ($key:literal, $value:expr) => {
+            if let Some(value) = $value {
+                args.insert(
+                    $key.to_string(),
+                    serde_json::to_value(value).map_err(|error| error.to_string())?,
+                );
             }
-        }
-        // Remove reciprocal links for removed projects
-        for rem_id in &removed {
-            if let Some(other) = data.find_project_mut(rem_id) {
-                other.linked_project_ids.retain(|id| id != &pid);
-            }
-        }
+        };
     }
+    insert_optional!("name", name);
+    insert_optional!("defaultBranch", default_branch);
+    insert_optional!("enabledMcpServers", enabled_mcp_servers);
+    insert_optional!("knownMcpServers", known_mcp_servers);
+    insert_optional!("customSystemPrompt", custom_system_prompt);
+    insert_optional!("defaultProvider", default_provider);
+    insert_optional!("defaultBackend", default_backend);
+    insert_optional!("worktreesDir", worktrees_dir);
+    insert_optional!("linearApiKey", linear_api_key);
+    insert_optional!("linearTeamId", linear_team_id);
+    insert_optional!("linkedProjectIds", linked_project_ids);
+    insert_optional!("autoFixSettings", auto_fix_settings);
 
-    // Re-fetch the project after potential mutations from bidirectional sync
-    let updated_project = data
-        .find_project(&project_id)
-        .ok_or_else(|| format!("Project not found after update: {project_id}"))?
-        .clone();
-    save_projects_data(&app, &data)?;
-
+    let project = crate::backend_runtime::project_service(&app)?
+        .update(&project_id, &serde_json::Value::Object(args))
+        .map_err(|error| error.to_string())?;
     log::trace!("Successfully updated project settings");
-    Ok(updated_project)
+    serde_json::from_value(project).map_err(|error| error.to_string())
 }
 
 /// Rebase a worktree's branch onto the base branch
@@ -5605,7 +4112,9 @@ pub async fn has_uncommitted_changes(app: AppHandle, worktree_id: String) -> Res
         .find_worktree(&worktree_id)
         .ok_or_else(|| format!("Worktree not found: {worktree_id}"))?;
 
-    Ok(git::has_uncommitted_changes(&worktree.path))
+    crate::backend_runtime::git_service()
+        .has_uncommitted_changes(&worktree.path)
+        .map_err(|error| error.to_string())
 }
 
 /// Generate a PR prompt with dynamic context for the AI assistant
@@ -6324,69 +4833,26 @@ pub async fn update_worktree_cached_status(
     unpushed_count: Option<u32>,
 ) -> Result<(), String> {
     log::trace!("Updating cached status for worktree {worktree_id}");
-
-    let mut data = load_projects_data(&app)?;
-
-    let worktree = data
-        .worktrees
-        .iter_mut()
-        .find(|w| w.id == worktree_id)
-        .ok_or_else(|| format!("Worktree not found: {worktree_id}"))?;
-
-    // Only update fields that are provided, preserve existing values for None
-    if let Some(ref b) = branch {
-        worktree.branch = b.clone();
-        // For base sessions, also update the display name to match the branch
-        if worktree.session_type == crate::projects::types::SessionType::Base {
-            worktree.name = b.clone();
-        }
-    }
-    if pr_status.is_some() {
-        worktree.cached_pr_status = pr_status;
-    }
-    if check_status.is_some() {
-        worktree.cached_check_status = check_status;
-    }
-    if behind_count.is_some() {
-        worktree.cached_behind_count = behind_count;
-    }
-    if ahead_count.is_some() {
-        worktree.cached_ahead_count = ahead_count;
-    }
-    if uncommitted_added.is_some() {
-        worktree.cached_uncommitted_added = uncommitted_added;
-    }
-    if uncommitted_removed.is_some() {
-        worktree.cached_uncommitted_removed = uncommitted_removed;
-    }
-    if branch_diff_added.is_some() {
-        worktree.cached_branch_diff_added = branch_diff_added;
-    }
-    if branch_diff_removed.is_some() {
-        worktree.cached_branch_diff_removed = branch_diff_removed;
-    }
-    if base_branch_ahead_count.is_some() {
-        worktree.cached_base_branch_ahead_count = base_branch_ahead_count;
-    }
-    if base_branch_behind_count.is_some() {
-        worktree.cached_base_branch_behind_count = base_branch_behind_count;
-    }
-    if worktree_ahead_count.is_some() {
-        worktree.cached_worktree_ahead_count = worktree_ahead_count;
-    }
-    if unpushed_count.is_some() {
-        worktree.cached_unpushed_count = unpushed_count;
-    }
-    worktree.cached_status_at = Some(
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0),
-    );
-
-    save_projects_data(&app, &data)?;
-
-    Ok(())
+    crate::backend_runtime::project_service(&app)?
+        .update_worktree_cached_status(
+            &worktree_id,
+            &serde_json::json!({
+                "branch": branch,
+                "prStatus": pr_status,
+                "checkStatus": check_status,
+                "behindCount": behind_count,
+                "aheadCount": ahead_count,
+                "uncommittedAdded": uncommitted_added,
+                "uncommittedRemoved": uncommitted_removed,
+                "branchDiffAdded": branch_diff_added,
+                "branchDiffRemoved": branch_diff_removed,
+                "baseBranchAheadCount": base_branch_ahead_count,
+                "baseBranchBehindCount": base_branch_behind_count,
+                "worktreeAheadCount": worktree_ahead_count,
+                "unpushedCount": unpushed_count,
+            }),
+        )
+        .map_err(|error| error.to_string())
 }
 
 /// Get detailed git diff for a worktree
@@ -6399,10 +4865,12 @@ pub async fn get_git_diff(
     worktree_path: String,
     diff_type: String,
     base_branch: Option<String>,
-) -> Result<super::git_status::GitDiff, String> {
+) -> Result<jean_core::git::GitDiff, String> {
     log::trace!("Getting {diff_type} diff for {worktree_path}");
 
-    super::git_status::get_git_diff(&worktree_path, &diff_type, base_branch.as_deref())
+    crate::backend_runtime::git_service()
+        .diff(&worktree_path, &diff_type, base_branch.as_deref())
+        .map_err(|error| error.to_string())
 }
 
 /// Get paginated commit history for a branch
@@ -6412,11 +4880,13 @@ pub async fn get_commit_history(
     branch: Option<String>,
     limit: Option<u32>,
     skip: Option<u32>,
-) -> Result<super::git_log::CommitHistoryResult, String> {
+) -> Result<jean_core::git::CommitHistoryResult, String> {
     let limit = limit.unwrap_or(50);
     let skip = skip.unwrap_or(0);
     log::trace!("Getting commit history for {worktree_path} (branch={branch:?}, limit={limit}, skip={skip})");
-    super::git_log::get_commit_history(&worktree_path, branch.as_deref(), limit, skip)
+    crate::backend_runtime::git_service()
+        .commit_history(&worktree_path, branch.as_deref(), limit, skip)
+        .map_err(|error| error.to_string())
 }
 
 /// Get the unified diff for a single commit
@@ -6424,16 +4894,20 @@ pub async fn get_commit_history(
 pub async fn get_commit_diff(
     worktree_path: String,
     commit_sha: String,
-) -> Result<super::git_status::GitDiff, String> {
+) -> Result<jean_core::git::GitDiff, String> {
     log::trace!("Getting diff for commit {commit_sha} in {worktree_path}");
-    super::git_log::get_commit_diff(&worktree_path, &commit_sha)
+    crate::backend_runtime::git_service()
+        .commit_diff(&worktree_path, &commit_sha)
+        .map_err(|error| error.to_string())
 }
 
 /// Get local branches for a repository by path
 #[tauri::command]
 pub async fn get_repo_branches(repo_path: String) -> Result<Vec<String>, String> {
     log::trace!("Getting branches for repo at {repo_path}");
-    super::git::get_branches(&repo_path)
+    crate::backend_runtime::git_service()
+        .branches(&repo_path)
+        .map_err(|error| error.to_string())
 }
 
 /// Revert a single file to its HEAD state, discarding uncommitted changes
@@ -6443,82 +4917,19 @@ pub async fn revert_file(
     file_path: String,
     file_status: String,
 ) -> Result<(), String> {
-    use crate::platform::wsl_aware_command;
-
     log::trace!("Reverting file {file_path} (status: {file_status}) in {worktree_path}");
-
-    match file_status.as_str() {
-        "modified" | "deleted" => {
-            // Restore file to HEAD state (unstage + restore working tree)
-            let output = wsl_aware_command("git", Some(Path::new(&worktree_path)))
-                .args(["checkout", "HEAD", "--", &file_path])
-                .output()
-                .map_err(|e| format!("Failed to run git checkout: {e}"))?;
-
-            if !output.status.success() {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                return Err(format!("Failed to revert file: {stderr}"));
-            }
-        }
-        "added" => {
-            // Remove untracked/newly-added file; also unstage if staged
-            let _ = wsl_aware_command("git", Some(Path::new(&worktree_path)))
-                .args(["reset", "HEAD", "--", &file_path])
-                .output();
-
-            let target = std::path::Path::new(&worktree_path).join(&file_path);
-            if target.exists() {
-                std::fs::remove_file(&target).map_err(|e| format!("Failed to remove file: {e}"))?;
-            }
-        }
-        "renamed" => {
-            // For renamed files, restore the old path and remove the new one
-            // The file_path for renamed files is the new path
-            // First, try to restore via checkout which handles the rename
-            let output = wsl_aware_command("git", Some(Path::new(&worktree_path)))
-                .args(["checkout", "HEAD", "--", &file_path])
-                .output()
-                .map_err(|e| format!("Failed to run git checkout: {e}"))?;
-
-            if !output.status.success() {
-                // If checkout fails (new name doesn't exist at HEAD), reset index
-                let _ = wsl_aware_command("git", Some(Path::new(&worktree_path)))
-                    .args(["reset", "HEAD", "--", &file_path])
-                    .output();
-
-                let target = std::path::Path::new(&worktree_path).join(&file_path);
-                if target.exists() {
-                    std::fs::remove_file(&target)
-                        .map_err(|e| format!("Failed to remove renamed file: {e}"))?;
-                }
-            }
-        }
-        _ => {
-            return Err(format!("Unknown file status: {file_status}"));
-        }
-    }
-
-    Ok(())
+    crate::backend_runtime::git_service()
+        .revert_file(&worktree_path, &file_path, &file_status)
+        .map_err(|error| error.to_string())
 }
 
 /// Reorder projects in the sidebar
 #[tauri::command]
 pub async fn reorder_projects(app: AppHandle, project_ids: Vec<String>) -> Result<(), String> {
     log::trace!("Reordering projects: {:?}", project_ids);
-
-    let mut data = load_projects_data(&app)?;
-
-    // Update order based on position in the provided array
-    for (index, project_id) in project_ids.iter().enumerate() {
-        if let Some(project) = data.projects.iter_mut().find(|p| p.id == *project_id) {
-            project.order = index as u32;
-        }
-    }
-
-    // Sort projects by new order
-    data.projects.sort_by_key(|p| p.order);
-
-    save_projects_data(&app, &data)?;
+    crate::backend_runtime::project_service(&app)?
+        .reorder(&project_ids)
+        .map_err(|error| error.to_string())?;
     log::trace!("Projects reordered successfully");
     Ok(())
 }
@@ -6537,22 +4948,9 @@ pub async fn reorder_worktrees(
         worktree_ids
     );
 
-    let mut data = load_projects_data(&app)?;
-
-    // Update order based on position in the provided array.
-    // Base sessions always stay at order 0 and do not consume an order slot.
-    let mut next_order = 1_u32;
-    for worktree_id in worktree_ids.iter() {
-        if let Some(worktree) = data.worktrees.iter_mut().find(|w| w.id == *worktree_id) {
-            // Skip base sessions - they always stay at order 0
-            if worktree.session_type != SessionType::Base {
-                worktree.order = next_order;
-                next_order += 1;
-            }
-        }
-    }
-
-    save_projects_data(&app, &data)?;
+    crate::backend_runtime::project_service(&app)?
+        .reorder_worktrees(&project_id, &worktree_ids)
+        .map_err(|error| error.to_string())?;
     log::trace!(
         "Worktrees reordered successfully for project {}",
         project_id
@@ -9857,21 +8255,27 @@ pub async fn git_pull(
     remote: Option<String>,
 ) -> Result<String, String> {
     log::trace!("Pulling changes for worktree: {worktree_path}, base branch: {base_branch}, remote: {remote:?}");
-    git::git_pull(&worktree_path, &base_branch, remote.as_deref())
+    crate::backend_runtime::git_service()
+        .pull(&worktree_path, &base_branch, remote.as_deref())
+        .map_err(|error| error.to_string())
 }
 
 /// Stash all local changes including untracked files
 #[tauri::command]
 pub async fn git_stash(worktree_path: String) -> Result<String, String> {
     log::trace!("Stashing changes for worktree: {worktree_path}");
-    git::git_stash(&worktree_path)
+    crate::backend_runtime::git_service()
+        .stash(&worktree_path)
+        .map_err(|error| error.to_string())
 }
 
 /// Pop the most recent stash
 #[tauri::command]
 pub async fn git_stash_pop(worktree_path: String) -> Result<String, String> {
     log::trace!("Popping stash for worktree: {worktree_path}");
-    git::git_stash_pop(&worktree_path)
+    crate::backend_runtime::git_service()
+        .stash_pop(&worktree_path)
+        .map_err(|error| error.to_string())
 }
 
 /// Response from git push, includes whether the push fell back to a new branch
@@ -9930,11 +8334,13 @@ pub async fn git_push(
             })
         }
         None => {
-            let output = git::git_push(&worktree_path, remote.as_deref())?;
+            let result = crate::backend_runtime::git_service()
+                .push(&worktree_path, remote.as_deref())
+                .map_err(|error| error.to_string())?;
             Ok(GitPushResponse {
-                output,
-                fell_back: false,
-                permission_denied: false,
+                output: result.output,
+                fell_back: result.fell_back,
+                permission_denied: result.permission_denied,
             })
         }
     }
@@ -10510,7 +8916,10 @@ pub async fn merge_worktree_to_base(
     }
 
     // Auto-commit uncommitted changes in worktree using AI-generated message
-    if git::has_uncommitted_changes(&worktree.path) {
+    if crate::backend_runtime::git_service()
+        .has_uncommitted_changes(&worktree.path)
+        .map_err(|error| error.to_string())?
+    {
         log::trace!("Auto-committing uncommitted changes before merge with AI message");
 
         // Stage all changes
@@ -12402,52 +10811,13 @@ pub async fn save_jean_config(project_path: String, config: JeanConfig) -> Resul
     Ok(())
 }
 
-/// Response from reverting the last local commit
-#[derive(Debug, Clone, Serialize)]
-pub struct RevertCommitResponse {
-    pub commit_hash: String,
-    pub commit_message: String,
-}
-
 #[tauri::command]
 pub async fn revert_last_local_commit(
     worktree_path: String,
-) -> Result<RevertCommitResponse, String> {
-    // Get the current HEAD commit hash and message before reverting
-    let log_output = wsl_aware_command("git", Some(Path::new(&worktree_path)))
-        .args(["log", "-1", "--format=%H%n%s"])
-        .output()
-        .map_err(|e| format!("Failed to get current commit: {e}"))?;
-
-    if !log_output.status.success() {
-        let stderr = String::from_utf8_lossy(&log_output.stderr);
-        return Err(format!("No commits to revert: {stderr}"));
-    }
-
-    let log_text = String::from_utf8_lossy(&log_output.stdout);
-    let mut lines = log_text.trim().lines();
-    let commit_hash = lines.next().unwrap_or("").to_string();
-    let commit_message = lines.next().unwrap_or("").to_string();
-
-    if commit_hash.is_empty() {
-        return Err("No commits to revert".to_string());
-    }
-
-    // Reset soft: undo the commit but keep changes staged
-    let reset_output = wsl_aware_command("git", Some(Path::new(&worktree_path)))
-        .args(["reset", "--soft", "HEAD~1"])
-        .output()
-        .map_err(|e| format!("Failed to revert commit: {e}"))?;
-
-    if !reset_output.status.success() {
-        let stderr = String::from_utf8_lossy(&reset_output.stderr);
-        return Err(format!("Failed to revert commit: {stderr}"));
-    }
-
-    Ok(RevertCommitResponse {
-        commit_hash,
-        commit_message,
-    })
+) -> Result<jean_core::git::RevertCommitResponse, String> {
+    crate::backend_runtime::git_service()
+        .revert_last_commit(&worktree_path)
+        .map_err(|error| error.to_string())
 }
 
 #[cfg(test)]
@@ -13235,20 +11605,6 @@ Body
         assert_eq!(
             std::fs::read_to_string(fork.join("notes/untracked.md")).unwrap(),
             "scratch\n"
-        );
-    }
-
-    #[test]
-    fn parse_porcelain_files_handles_renames() {
-        let parsed = parse_porcelain_files(" M src/lib.rs\nR  old.rs -> new.rs\n?? scratch.txt\n");
-
-        assert_eq!(
-            parsed,
-            vec![
-                ("M".to_string(), "src/lib.rs".to_string()),
-                ("R".to_string(), "new.rs".to_string()),
-                ("??".to_string(), "scratch.txt".to_string()),
-            ]
         );
     }
 

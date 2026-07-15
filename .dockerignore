@@ -2,6 +2,7 @@
 .github
 node_modules
 src-tauri/target
+target
 dist
 .DS_Store
 *.log

@@ -1,0 +1,8 @@
+{
+  "active_project_id": "project-1",
+  "active_worktree_id": "worktree-1",
+  "answered_questions": {
+    "session-1": ["tool-1"]
+  },
+  "future_ui_field": [1, 2, 3]
+}

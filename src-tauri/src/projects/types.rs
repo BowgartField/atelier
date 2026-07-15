@@ -68,52 +68,7 @@ pub enum MergeType {
     Rebase,
 }
 
-/// A port entry in jean.json
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PortEntry {
-    pub port: u16,
-    pub label: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub host: Option<String>,
-}
-
-/// Jean configuration from jean.json
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct JeanConfig {
-    #[serde(default)]
-    pub scripts: JeanScripts,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ports: Option<Vec<PortEntry>>,
-}
-
-/// Run script(s) — supports both a single string and an array of strings
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(untagged)]
-pub enum RunScript {
-    Single(String),
-    Multiple(Vec<String>),
-}
-
-impl RunScript {
-    /// Normalize into a Vec<String>, regardless of variant
-    pub fn into_vec(self) -> Vec<String> {
-        match self {
-            RunScript::Single(s) => vec![s],
-            RunScript::Multiple(v) => v,
-        }
-    }
-}
-
-/// Scripts section of jean.json
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct JeanScripts {
-    /// Script to run after worktree creation
-    pub setup: Option<String>,
-    /// Script to run before worktree deletion
-    pub teardown: Option<String>,
-    /// Script(s) to run the dev environment — string or array of strings
-    pub run: Option<RunScript>,
-}
+pub use jean_core::{JeanConfig, PortEntry};
 
 /// A git project that has been added to Jean, or a folder for organizing projects
 #[derive(Debug, Clone, Serialize, Deserialize)]

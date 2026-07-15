@@ -10,6 +10,8 @@ use super::github_issues::{
 };
 use super::storage::load_projects_data;
 
+pub use jean_core::{LinearComment, LinearIssueContext, LinearUser};
+
 // =============================================================================
 // Types
 // =============================================================================
@@ -32,13 +34,6 @@ pub struct LinearLabel {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct LinearUser {
-    pub name: String,
-    pub display_name: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct LinearIssue {
     pub id: String,
     pub identifier: String,
@@ -52,14 +47,6 @@ pub struct LinearIssue {
     pub url: String,
     pub priority: u32,
     pub priority_label: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct LinearComment {
-    pub body: String,
-    pub user: Option<LinearUser>,
-    pub created_at: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -84,17 +71,6 @@ pub struct LinearIssueDetail {
 #[serde(rename_all = "camelCase")]
 pub struct LinearIssueListResult {
     pub issues: Vec<LinearIssue>,
-}
-
-/// Context for creating a worktree from a Linear issue (passed from frontend)
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct LinearIssueContext {
-    pub id: String,
-    pub identifier: String,
-    pub title: String,
-    pub description: Option<String>,
-    pub comments: Vec<LinearComment>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

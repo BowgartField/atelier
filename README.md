@@ -80,14 +80,17 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for full development setup and guidelines
 
 ## Headless Web Access
 
-Run Jean without the desktop window and expose the web UI over HTTP:
+Run the standalone GUI-free server and expose the web UI over HTTP:
 
 ```bash
-jean --headless --host 127.0.0.1 --port 3456
+jean-server --host 127.0.0.1 --port 3456
 ```
 
 `--host` accepts `localhost` or an IP address. Passing a specific address such
 as your Tailscale IP binds Jean only to that interface.
+
+`jean --headless` remains available as a compatibility runtime and still needs
+the Tauri graphical runtime on Linux.
 
 ## Roadmap
 

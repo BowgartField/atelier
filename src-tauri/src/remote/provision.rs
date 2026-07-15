@@ -6,6 +6,7 @@ use base64::Engine;
 use flate2::read::GzDecoder;
 use minisign_verify::{PublicKey, Signature};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tauri::{AppHandle, Manager};
 
 use super::ssh;
@@ -17,7 +18,8 @@ const JEAN_UPDATER_PUBLIC_KEY: &str =
 const JEAN_REPO: &str = "coollabsio/jean";
 const SERVICE_NAME: &str = "jean-remote.service";
 const REMOTE_INSTALL_DIR: &str = "/opt/jean-remote";
-const REMOTE_BINARY_PATH: &str = "/opt/jean-remote/jean.AppImage";
+const REMOTE_BINARY_PATH: &str = "/opt/jean-remote/jean-server";
+const REMOTE_COMPAT_BINARY_PATH: &str = "/opt/jean-remote/jean.AppImage";
 const PROVISION_PROGRESS_EVENT: &str = "remote-server:provision-progress";
 const PROVISION_LOG_EVENT: &str = "remote-server:provision-log";
 
@@ -88,8 +90,12 @@ pub async fn list_available_versions() -> Result<Vec<RemoteJeanVersionInfo>, Str
 }
 
 pub fn jean_launch_command(remote_port: u16, token: &str) -> String {
+    format!("{REMOTE_BINARY_PATH} --host 127.0.0.1 --port {remote_port} --token {token}")
+}
+
+fn compatibility_launch_command(remote_port: u16, token: &str) -> String {
     format!(
-        "/usr/bin/xvfb-run -a {REMOTE_BINARY_PATH} --headless --host 127.0.0.1 --port {remote_port} --token {token}"
+        "/usr/bin/xvfb-run -a {REMOTE_COMPAT_BINARY_PATH} --headless --host 127.0.0.1 --port {remote_port} --token {token}"
     )
 }
 
@@ -149,17 +155,13 @@ else
 fi
 if command -v apt-get >/dev/null 2>&1; then
   $SUDO apt-get update -qq
-  WEBKIT_PACKAGE="libwebkit2gtk-4.1-0"
-  if ! apt-cache show "$WEBKIT_PACKAGE" >/dev/null 2>&1; then
-    WEBKIT_PACKAGE="libwebkit2gtk-4.0-37"
-  fi
-  $SUDO env DEBIAN_FRONTEND=noninteractive apt-get install -y curl xvfb libgtk-3-0 "$WEBKIT_PACKAGE"
+  $SUDO env DEBIAN_FRONTEND=noninteractive apt-get install -y curl ca-certificates
 elif command -v dnf >/dev/null 2>&1; then
-  $SUDO dnf install -y curl xorg-x11-server-Xvfb gtk3 webkit2gtk4.1
+  $SUDO dnf install -y curl ca-certificates
 elif command -v yum >/dev/null 2>&1; then
-  $SUDO yum install -y curl xorg-x11-server-Xvfb gtk3 webkit2gtk4.1
+  $SUDO yum install -y curl ca-certificates
 elif command -v pacman >/dev/null 2>&1; then
-  $SUDO pacman -Sy --noconfirm curl xorg-server-xvfb gtk3 webkit2gtk-4.1
+  $SUDO pacman -Sy --noconfirm curl ca-certificates
 else
   echo "Unsupported Linux package manager" >&2
   exit 65
@@ -168,6 +170,23 @@ command -v systemctl >/dev/null 2>&1 || {
   echo "systemd is required for Jean remote provisioning" >&2
   exit 66
 }
+"#
+}
+
+fn compatibility_dependency_install_command() -> &'static str {
+    r#"set -eu
+if [ "$(id -u)" -eq 0 ]; then SUDO=""; else SUDO="sudo -n"; fi
+if command -v apt-get >/dev/null 2>&1; then
+  WEBKIT_PACKAGE="libwebkit2gtk-4.1-0"
+  if ! apt-cache show "$WEBKIT_PACKAGE" >/dev/null 2>&1; then WEBKIT_PACKAGE="libwebkit2gtk-4.0-37"; fi
+  $SUDO env DEBIAN_FRONTEND=noninteractive apt-get install -y xvfb libgtk-3-0 "$WEBKIT_PACKAGE"
+elif command -v dnf >/dev/null 2>&1; then
+  $SUDO dnf install -y xorg-x11-server-Xvfb gtk3 webkit2gtk4.1
+elif command -v yum >/dev/null 2>&1; then
+  $SUDO yum install -y xorg-x11-server-Xvfb gtk3 webkit2gtk4.1
+elif command -v pacman >/dev/null 2>&1; then
+  $SUDO pacman -Sy --noconfirm xorg-server-xvfb gtk3 webkit2gtk-4.1
+fi
 "#
 }
 
@@ -224,6 +243,98 @@ fn extract_appimage(archive_bytes: &[u8], destination: &Path) -> Result<(), Stri
     }
 
     Err("Jean updater archive did not contain an AppImage".to_string())
+}
+
+fn extract_server_binary(archive_bytes: &[u8], destination: &Path) -> Result<(), String> {
+    let decoder = GzDecoder::new(archive_bytes);
+    let mut archive = tar::Archive::new(decoder);
+    for entry in archive
+        .entries()
+        .map_err(|e| format!("Failed to read jean-server archive: {e}"))?
+    {
+        let mut entry = entry.map_err(|e| format!("Failed to read archive entry: {e}"))?;
+        if !entry.header().entry_type().is_file() {
+            continue;
+        }
+        let filename = entry
+            .path()
+            .ok()
+            .and_then(|path| path.file_name().map(|name| name.to_owned()));
+        if !filename
+            .as_deref()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("jean-server-linux-"))
+        {
+            continue;
+        }
+        let mut output = std::fs::File::create(destination)
+            .map_err(|e| format!("Failed to create temporary jean-server: {e}"))?;
+        std::io::copy(&mut entry, &mut output)
+            .map_err(|e| format!("Failed to extract jean-server: {e}"))?;
+        return Ok(());
+    }
+    Err("Server archive did not contain a jean-server binary".to_string())
+}
+
+async fn download_server_release(
+    app: &AppHandle,
+    server_id: &str,
+    architecture: &str,
+    requested_version: &str,
+) -> Result<Option<Vec<u8>>, String> {
+    let arch = match architecture.trim() {
+        "x86_64" | "amd64" => "amd64",
+        "aarch64" | "arm64" => "arm64",
+        other => return Err(format!("Unsupported remote architecture: {other}")),
+    };
+    let filename = format!("jean-server-linux-{arch}-{requested_version}.tar.gz");
+    let base =
+        format!("https://github.com/{JEAN_REPO}/releases/download/v{requested_version}/{filename}");
+    let client = reqwest::Client::builder()
+        .read_timeout(Duration::from_secs(60))
+        .user_agent(format!("Jean/{}", env!("CARGO_PKG_VERSION")))
+        .build()
+        .map_err(|e| format!("Failed to create server download client: {e}"))?;
+    let response = client
+        .get(&base)
+        .send()
+        .await
+        .map_err(|e| format!("Failed to download jean-server: {e}"))?;
+    if response.status() == reqwest::StatusCode::NOT_FOUND {
+        emit_log(
+            app,
+            server_id,
+            "system",
+            "True-headless artifact unavailable; using one-release AppImage rollback path",
+        );
+        return Ok(None);
+    }
+    let bytes = response
+        .error_for_status()
+        .map_err(|e| format!("jean-server artifact request failed: {e}"))?
+        .bytes()
+        .await
+        .map_err(|e| format!("Failed to read jean-server artifact: {e}"))?
+        .to_vec();
+    let checksum_text = client
+        .get(format!("{base}.sha256"))
+        .send()
+        .await
+        .map_err(|e| format!("Failed to download jean-server checksum: {e}"))?
+        .error_for_status()
+        .map_err(|e| format!("jean-server checksum request failed: {e}"))?
+        .text()
+        .await
+        .map_err(|e| format!("Failed to read jean-server checksum: {e}"))?;
+    let expected = checksum_text
+        .split_whitespace()
+        .next()
+        .ok_or_else(|| "Empty jean-server checksum".to_string())?;
+    let actual = format!("{:x}", Sha256::digest(&bytes));
+    if !actual.eq_ignore_ascii_case(expected) {
+        return Err("Jean server checksum verification failed".to_string());
+    }
+    Ok(Some(bytes))
 }
 
 fn artifact_dir(app: &AppHandle, server_id: &str) -> Result<PathBuf, String> {
@@ -308,7 +419,10 @@ async fn download_release(
                     app,
                     server_id,
                     "downloading_release",
-                    &format!("Downloading Jean release ({downloaded_mb}/{} MB)", total / 1_048_576),
+                    &format!(
+                        "Downloading Jean release ({downloaded_mb}/{} MB)",
+                        total / 1_048_576
+                    ),
                     percent,
                 );
             }
@@ -328,7 +442,17 @@ async fn download_release(
     Ok((manifest.version, bytes))
 }
 
-fn build_systemd_unit(server: &RemoteServerConfig, token: &str) -> String {
+fn build_systemd_unit(server: &RemoteServerConfig, token: &str, compatibility: bool) -> String {
+    let launch_command = if compatibility {
+        compatibility_launch_command(server.remote_port, token)
+    } else {
+        jean_launch_command(server.remote_port, token)
+    };
+    let compatibility_environment = if compatibility {
+        "Environment=APPIMAGE_EXTRACT_AND_RUN=1\n"
+    } else {
+        ""
+    };
     format!(
         r#"[Unit]
 Description=Jean remote headless server
@@ -338,7 +462,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 User={username}
-Environment=APPIMAGE_EXTRACT_AND_RUN=1
+{compatibility_environment}
 # The desktop webview (origin tauri://localhost / https://tauri.localhost)
 # reaches this backend cross-origin through the loopback SSH tunnel. Allow any
 # origin so its fetch/WebSocket handshake is not blocked by CORS — the server
@@ -347,12 +471,18 @@ Environment=JEAN_ALLOWED_ORIGINS=*
 ExecStart={launch_command}
 Restart=on-failure
 RestartSec=3
+TimeoutStopSec=20
+KillMode=mixed
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
 
 [Install]
 WantedBy=multi-user.target
 "#,
         username = server.username,
-        launch_command = jean_launch_command(server.remote_port, token),
+        launch_command = launch_command,
+        compatibility_environment = compatibility_environment,
     )
 }
 
@@ -379,20 +509,30 @@ exit 1"#
 fn install_artifact_and_service(
     app: &AppHandle,
     server: &RemoteServerConfig,
-    local_appimage: &Path,
+    local_binary: &Path,
     version: &str,
     token: &str,
+    compatibility: bool,
 ) -> Result<(), String> {
-    let remote_temp = format!("/tmp/jean-remote-{}.AppImage", uuid::Uuid::new_v4());
+    let remote_temp = if compatibility {
+        format!("/tmp/jean-remote-{}.AppImage", uuid::Uuid::new_v4())
+    } else {
+        format!("/tmp/jean-server-{}", uuid::Uuid::new_v4())
+    };
     emit_log(
         app,
         &server.id,
         "system",
         &format!("Uploading Jean {} to {}", version, server.host),
     );
-    ssh::scp_to(app, server, local_appimage, &remote_temp)?;
+    ssh::scp_to(app, server, local_binary, &remote_temp)?;
 
-    let unit = build_systemd_unit(server, token);
+    let unit = build_systemd_unit(server, token, compatibility);
+    let binary_path = if compatibility {
+        REMOTE_COMPAT_BINARY_PATH
+    } else {
+        REMOTE_BINARY_PATH
+    };
     let unit_base64 = base64::engine::general_purpose::STANDARD.encode(unit.as_bytes());
     let install_command = format!(
         r#"set -eu
@@ -408,7 +548,7 @@ rm -f {remote_temp}
 "#,
         install_dir = REMOTE_INSTALL_DIR,
         remote_temp = shell_quote(&remote_temp),
-        binary_path = REMOTE_BINARY_PATH,
+        binary_path = binary_path,
         version = shell_quote(version),
         unit_base64 = shell_quote(&unit_base64),
         service_name = SERVICE_NAME,
@@ -519,8 +659,29 @@ pub async fn provision(
         "system",
         &format!("Selecting release artifact for {architecture}"),
     );
-    let (version, archive_bytes) =
-        download_release(app, &server.id, &architecture, requested_version).await?;
+    let server_archive =
+        download_server_release(app, &server.id, &architecture, requested_version).await?;
+    let (version, archive_bytes, compatibility) = if let Some(bytes) = server_archive {
+        (requested_version.to_string(), bytes, false)
+    } else {
+        let app_for_compat = app.clone();
+        let server_for_compat = server.clone();
+        let compatibility_output = tokio::task::spawn_blocking(move || {
+            ssh::exec(
+                &app_for_compat,
+                &server_for_compat,
+                compatibility_dependency_install_command(),
+            )
+        })
+        .await
+        .map_err(|e| format!("Compatibility dependency task failed: {e}"))??;
+        if !compatibility_output.status.success() {
+            return Err("Failed to install compatibility runtime dependencies".to_string());
+        }
+        let (version, bytes) =
+            download_release(app, &server.id, &architecture, requested_version).await?;
+        (version, bytes, true)
+    };
     emit_log(
         app,
         &server.id,
@@ -528,7 +689,11 @@ pub async fn provision(
         &format!("Downloaded and verified Jean {}", version),
     );
     let temp_dir = artifact_dir(app, &server.id)?;
-    let local_appimage = temp_dir.join("jean.AppImage");
+    let local_binary = temp_dir.join(if compatibility {
+        "jean.AppImage"
+    } else {
+        "jean-server"
+    });
     let app_for_install = app.clone();
     let server_for_install = server.clone();
     let version_for_install = version;
@@ -542,13 +707,18 @@ pub async fn provision(
     );
     tokio::task::spawn_blocking(move || {
         let operation = (|| {
-            extract_appimage(&archive_bytes, &local_appimage)?;
+            if compatibility {
+                extract_appimage(&archive_bytes, &local_binary)?;
+            } else {
+                extract_server_binary(&archive_bytes, &local_binary)?;
+            }
             install_artifact_and_service(
                 &app_for_install,
                 &server_for_install,
-                &local_appimage,
+                &local_binary,
                 &version_for_install,
                 &token_for_install,
+                compatibility,
             )?;
             emit_progress(
                 &app_for_install,
@@ -604,7 +774,8 @@ pub async fn provision(
                 service_name: SERVICE_NAME.to_string(),
             })
         })();
-        let _ = std::fs::remove_dir_all(&temp_dir);
+        let _ = std::fs::remove_file(&local_binary);
+        let _ = std::fs::remove_dir(&temp_dir);
         operation
     })
     .await
@@ -617,11 +788,12 @@ mod tests {
     use crate::remote::types::{RemoteServerAuth, RemoteServerStatus};
 
     #[test]
-    fn launch_command_wraps_appimage_with_virtual_display() {
+    fn launch_command_uses_true_headless_binary_without_virtual_display() {
         assert_eq!(
             jean_launch_command(5599, "test-token"),
-            "/usr/bin/xvfb-run -a /opt/jean-remote/jean.AppImage --headless --host 127.0.0.1 --port 5599 --token test-token"
+            "/opt/jean-remote/jean-server --host 127.0.0.1 --port 5599 --token test-token"
         );
+        assert!(!jean_launch_command(5599, "test-token").contains("xvfb"));
     }
 
     #[test]
@@ -658,11 +830,35 @@ mod tests {
             http_token: None,
             installed_version: None,
         };
-        let unit = build_systemd_unit(&server, "secret");
+        let unit = build_systemd_unit(&server, "secret", false);
         assert!(unit.contains("User=jean"));
         assert!(unit.contains("--host 127.0.0.1 --port 3456 --token secret"));
-        assert!(unit.contains("APPIMAGE_EXTRACT_AND_RUN=1"));
+        assert!(!unit.contains("APPIMAGE_EXTRACT_AND_RUN=1"));
+        assert!(unit.contains("NoNewPrivileges=true"));
         // Cross-origin CORS must be allowed for the desktop webview tunnel.
         assert!(unit.contains("Environment=JEAN_ALLOWED_ORIGINS=*"));
+    }
+
+    #[test]
+    fn compatibility_unit_remains_available_for_one_release_cycle() {
+        let server = RemoteServerConfig {
+            id: "server-id".to_string(),
+            name: "Cloud".to_string(),
+            host: "example.com".to_string(),
+            port: 22,
+            username: "jean".to_string(),
+            auth: RemoteServerAuth::SshKeyPath {
+                path: "/tmp/key".to_string(),
+                passphrase: None,
+            },
+            default: false,
+            remote_port: 3456,
+            status: RemoteServerStatus::Disconnected,
+            http_token: None,
+            installed_version: None,
+        };
+        let unit = build_systemd_unit(&server, "secret", true);
+        assert!(unit.contains("xvfb-run"));
+        assert!(unit.contains("APPIMAGE_EXTRACT_AND_RUN=1"));
     }
 }

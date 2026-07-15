@@ -864,6 +864,8 @@ mod tests {
             default_provider: None,
             default_backend: None,
             worktrees_dir: None,
+            server_id: None,
+            remote_clones: Vec::new(),
             linear_api_key: None,
             linear_team_id: None,
             linked_project_ids: Vec::new(),

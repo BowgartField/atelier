@@ -51,10 +51,12 @@ Provisioning currently requires:
 - systemd;
 - x86_64 or aarch64.
 
-The flow installs Xvfb and WebKitGTK/GTK runtime packages, downloads the Linux
-artifact from the release manifest for the selected Jean version, verifies its
-updater minisign signature with the same public key as the desktop updater,
-uploads the extracted AppImage with `scp`, and installs `jean-remote.service`.
+The flow installs only `curl` and CA certificates, downloads the architecture-
+specific `jean-server` archive, verifies its published SHA-256 checksum,
+uploads the extracted binary with `scp`, and installs `jean-remote.service`.
+If a release predating the server artifact is selected, provisioning retains a
+one-release rollback path through the signed AppImage and installs its graphical
+runtime only for that fallback.
 The Preferences UI uses a dedicated provisioning modal with a version picker,
 a vertical step timeline on the left, and live logs on the right. The active
 step uses a spinning marker; completed and active steps share the same accent
@@ -74,13 +76,13 @@ The backend emits `remote-server:provision-progress` and
 the current step and command output without waiting for the final mutation
 result.
 
-The current Tauri runtime still initializes GTK before the headless window
-configuration is applied, so the AppImage runs behind an Xvfb compatibility
-boundary:
+The normal service starts the standalone runtime directly:
 
 ```text
-xvfb-run -a jean.AppImage --headless --host 127.0.0.1 --port P --token T
+/opt/jean-remote/jean-server --host 127.0.0.1 --port P --token T
 ```
+
+The legacy AppImage plus Xvfb command exists only as the rollback path.
 
 Provisioning waits for the authenticated `/api/auth` endpoint before reporting
 success. A transient `systemctl is-active` result is not sufficient because a
@@ -162,15 +164,21 @@ Run `bun run test:remote-tunnel` for a real SSH transport test using Docker. It
 starts an ephemeral `sshd` and sequenced WebSocket backend, kills the local
 forward, creates a replacement tunnel on another port, and verifies replay of
 the missed event. This covers tunnel and transport recovery without requiring a
-cloud server. It does not validate systemd, AppImage provisioning, or Xvfb.
+cloud server. It does not validate systemd or artifact provisioning.
+
+The standalone server exposes `get_server_capabilities`. Its generated
+available/unavailable inventory is derived from the desktop WebSocket
+dispatcher and checked in `test:server-ci`; unsupported adapter or desktop
+operations therefore fail with the typed `unsupported` code instead of an
+unclassified `Unknown command` response.
 
 Run `bun run test:remote-provision` on macOS for the full provisioning path
 using a Lima Linux VM. The test invokes Jean's real `add_remote_server`,
 `test_remote_server`, `provision_remote_server`, and `connect_remote_server`
-commands from an isolated local profile. It verifies the signed release
-download, AppImage installation, Xvfb and WebKitGTK packages, the enabled and
-running systemd service, authenticated tunnel health, and remote WebSocket
-dispatch. Install Lima with `brew install lima` first and build the local debug
+commands from an isolated local profile. It verifies the checksummed server
+download, GUI-free installation, the enabled and running systemd service,
+authenticated tunnel health, and remote WebSocket dispatch. Install Lima with
+`brew install lima` first and build the local debug
 Jean binary. The test reuses an existing `jean-remote-provision-test` VM when
 present; otherwise it creates an ephemeral VM and deletes it afterward.
 
@@ -251,8 +259,8 @@ Mutating WebSocket dispatch arms emit cache invalidations for
 ## Remaining constraints
 
 - Linux provisioning requires systemd and a supported package manager.
-- Xvfb is required until the server runtime is decoupled from Tauri's GTK
-  initialization.
+- The AppImage plus Xvfb rollback path is retained for releases that do not
+  publish `jean-server`; current releases use the GUI-free binary.
 - SSH passwords remain in local preferences; SSH key authentication is
   recommended.
 - Reverse port-forwarding UI is not implemented.

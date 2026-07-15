@@ -23,7 +23,7 @@ pub mod wakeup;
 
 pub use commands::*;
 pub use native_history::*;
-pub use storage::{preserve_base_sessions, restore_base_sessions, with_sessions_mut};
+pub use storage::{restore_base_sessions, with_sessions_mut};
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -58,18 +58,6 @@ pub(crate) fn should_add_recap_instruction(app: &tauri::AppHandle) -> bool {
         .unwrap_or(true)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::RECAP_INSTRUCTION;
-
-    #[test]
-    fn recap_how_to_test_rule_requests_manual_smoke_test_when_useful() {
-        assert!(RECAP_INSTRUCTION.contains("smoke test"));
-        assert!(RECAP_INSTRUCTION.contains("manual"));
-        assert!(RECAP_INSTRUCTION.contains("if it makes sense"));
-    }
-}
-
 /// Global counter for active file tailers (sessions being streamed)
 static ACTIVE_TAILER_COUNT: once_cell::sync::Lazy<AtomicUsize> =
     once_cell::sync::Lazy::new(|| AtomicUsize::new(0));
@@ -80,4 +68,16 @@ pub fn increment_tailer_count() {
 
 pub fn decrement_tailer_count() {
     ACTIVE_TAILER_COUNT.fetch_sub(1, Ordering::Relaxed);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::RECAP_INSTRUCTION;
+
+    #[test]
+    fn recap_how_to_test_rule_requests_manual_smoke_test_when_useful() {
+        assert!(RECAP_INSTRUCTION.contains("smoke test"));
+        assert!(RECAP_INSTRUCTION.contains("manual"));
+        assert!(RECAP_INSTRUCTION.contains("if it makes sense"));
+    }
 }

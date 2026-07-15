@@ -4,23 +4,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     git \
     openssh-client \
-    libwebkit2gtk-4.1-0 \
-    libayatana-appindicator3-1 \
-    librsvg2-2 \
-    xdg-utils \
-    xvfb \
-    xauth \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --create-home --shell /bin/bash jean \
-    && mkdir -p /home/jean/.cache /home/jean/.config /home/jean/.local/share/com.jean.desktop /tmp/.X11-unix \
-    && chown -R jean:jean /home/jean \
-    && chmod 1777 /tmp/.X11-unix
+    && mkdir -p /home/jean/.cache /home/jean/.config /home/jean/.local/share/com.jean.desktop \
+    && chown -R jean:jean /home/jean
 COPY jean-server /usr/local/bin/jean-server
-COPY docker-entrypoint.sh /usr/local/bin/jean-server-entrypoint
-RUN chmod +x /usr/local/bin/jean-server /usr/local/bin/jean-server-entrypoint
+RUN chmod +x /usr/local/bin/jean-server
 USER jean
 ENV JEAN_HOST=0.0.0.0 \
     JEAN_PORT=3456
 EXPOSE 3456
 VOLUME ["/home/jean/.local/share/com.jean.desktop"]
-ENTRYPOINT ["/usr/local/bin/jean-server-entrypoint"]
+ENTRYPOINT ["/usr/local/bin/jean-server"]

@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use once_cell::sync::Lazy;
-use tauri::{AppHandle, Manager};
+use tauri::AppHandle;
 
 use super::types::{
     SavedContextsMetadata, Session, SessionIndexEntry, SessionMetadata, WorktreeIndex,
@@ -71,9 +71,7 @@ pub fn sanitize_filename(name: &str) -> String {
 /// Get the sessions base directory in app data (creates if not exists)
 /// Structure: sessions/
 pub fn get_sessions_dir(app: &AppHandle) -> Result<PathBuf, String> {
-    let app_data_dir = app
-        .path()
-        .app_data_dir()
+    let app_data_dir = crate::backend_runtime::data_dir(app)
         .map_err(|e| format!("Failed to get app data directory: {e}"))?;
 
     let sessions_dir = app_data_dir.join("sessions");
@@ -497,7 +495,7 @@ fn cleanup_orphaned_session_indexes_in_dir(
 /// Delete combined-context files for a specific session.
 /// Best-effort: logs warnings on failure, never returns an error.
 pub fn cleanup_combined_context_files(app: &AppHandle, session_id: &str) {
-    let app_data_dir = match app.path().app_data_dir() {
+    let app_data_dir = match crate::backend_runtime::data_dir(app) {
         Ok(dir) => dir,
         Err(e) => {
             log::warn!("Failed to get app data dir for combined-context cleanup: {e}");
@@ -548,9 +546,7 @@ pub fn cleanup_orphaned_combined_contexts(app: &AppHandle) -> Result<u32, String
     }
 
     // Scan combined-contexts directory
-    let app_data_dir = app
-        .path()
-        .app_data_dir()
+    let app_data_dir = crate::backend_runtime::data_dir(app)
         .map_err(|e| format!("Failed to get app data dir: {e}"))?;
     let combined_dir = app_data_dir.join("combined-contexts");
 
@@ -638,9 +634,7 @@ pub fn cleanup_orphaned_pasted_files(app: &AppHandle) -> Result<u32, String> {
         }
     }
 
-    let app_data_dir = app
-        .path()
-        .app_data_dir()
+    let app_data_dir = crate::backend_runtime::data_dir(app)
         .map_err(|e| format!("Failed to get app data dir: {e}"))?;
 
     let mut deleted = 0u32;
@@ -1039,9 +1033,7 @@ pub fn restore_base_sessions(
 /// Get the images directory path in app data directory (creates if not exists)
 /// Used for storing pasted images: ~/Library/Application Support/<app>/pasted-images/
 pub fn get_images_dir(app: &AppHandle) -> Result<PathBuf, String> {
-    let app_data_dir = app
-        .path()
-        .app_data_dir()
+    let app_data_dir = crate::backend_runtime::data_dir(app)
         .map_err(|e| format!("Failed to get app data directory: {e}"))?;
 
     let path = app_data_dir.join("pasted-images");
@@ -1054,9 +1046,7 @@ pub fn get_images_dir(app: &AppHandle) -> Result<PathBuf, String> {
 /// Get the pastes directory path in app data directory (creates if not exists)
 /// Used for storing pasted text files: ~/Library/Application Support/<app>/pasted-texts/
 pub fn get_pastes_dir(app: &AppHandle) -> Result<PathBuf, String> {
-    let app_data_dir = app
-        .path()
-        .app_data_dir()
+    let app_data_dir = crate::backend_runtime::data_dir(app)
         .map_err(|e| format!("Failed to get app data directory: {e}"))?;
 
     let path = app_data_dir.join("pasted-texts");
@@ -1069,9 +1059,7 @@ pub fn get_pastes_dir(app: &AppHandle) -> Result<PathBuf, String> {
 /// Get the saved contexts directory path in app data directory (creates if not exists)
 /// Used for storing conversation context summaries: ~/Library/Application Support/<app>/session-context/
 pub fn get_saved_contexts_dir(app: &AppHandle) -> Result<PathBuf, String> {
-    let app_data_dir = app
-        .path()
-        .app_data_dir()
+    let app_data_dir = crate::backend_runtime::data_dir(app)
         .map_err(|e| format!("Failed to get app data directory: {e}"))?;
 
     let path = app_data_dir.join("session-context");

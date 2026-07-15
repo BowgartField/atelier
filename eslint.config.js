@@ -101,6 +101,7 @@ export default tseslint.config(
       'src-tauri/dist/**',
       'node_modules/**',
       'src-tauri/target/**',
+      'target/**',
       'src-tauri/gen/**',
       'e2e/**',
       '*.config.js',

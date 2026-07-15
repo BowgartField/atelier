@@ -7,6 +7,11 @@ use tauri::{AppHandle, Manager};
 use super::git::get_repo_identifier;
 use crate::gh_cli::config::resolve_gh_binary;
 
+pub use jean_core::{
+    AdvisoryContext, AdvisoryVulnerability, GitHubAuthor, GitHubComment, GitHubReview,
+    IssueContext, PullRequestContext, SecurityAlertContext,
+};
+
 fn gh_command(gh: &Path, project_path: &str) -> Command {
     crate::platform::resolved_cli_command(gh, Some(Path::new(project_path)))
 }
@@ -26,12 +31,6 @@ pub fn parse_github_labels_response(stdout: &str) -> Result<Vec<GitHubLabel>, St
     serde_json::from_str(stdout).map_err(|e| format!("Failed to parse gh labels response: {e}"))
 }
 
-/// GitHub user/author
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct GitHubAuthor {
-    pub login: String,
-}
-
 /// GitHub issue from list response
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -43,15 +42,6 @@ pub struct GitHubIssue {
     pub labels: Vec<GitHubLabel>,
     pub created_at: String,
     pub author: GitHubAuthor,
-}
-
-/// GitHub comment
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct GitHubComment {
-    pub body: String,
-    pub author: GitHubAuthor,
-    pub created_at: String,
 }
 
 /// GitHub issue detail with comments (from gh issue view)
@@ -110,15 +100,6 @@ pub async fn list_github_labels(
     let mut labels = parse_github_labels_response(&stdout)?;
     labels.sort_by_key(|label| label.name.to_lowercase());
     Ok(labels)
-}
-
-/// Issue context to pass when creating a worktree
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct IssueContext {
-    pub number: u32,
-    pub title: String,
-    pub body: Option<String>,
-    pub comments: Vec<GitHubComment>,
 }
 
 /// Detect gh errors caused by a directory that cannot be resolved to a GitHub
@@ -414,43 +395,7 @@ pub fn generate_branch_name_from_issue(issue_number: u32, title: &str) -> String
 
 /// Format issue context as markdown for the context file
 pub fn format_issue_context_markdown(ctx: &IssueContext) -> String {
-    let mut content = String::new();
-
-    content.push_str(&format!(
-        "# GitHub Issue #{}: {}\n\n",
-        ctx.number, ctx.title
-    ));
-
-    content.push_str("---\n\n");
-
-    content.push_str("## Description\n\n");
-    if let Some(body) = &ctx.body {
-        if !body.is_empty() {
-            content.push_str(body);
-        } else {
-            content.push_str("*No description provided.*");
-        }
-    } else {
-        content.push_str("*No description provided.*");
-    }
-    content.push_str("\n\n");
-
-    if !ctx.comments.is_empty() {
-        content.push_str("## Comments\n\n");
-        for comment in &ctx.comments {
-            content.push_str(&format!(
-                "### @{} ({})\n\n",
-                comment.author.login, comment.created_at
-            ));
-            content.push_str(&comment.body);
-            content.push_str("\n\n---\n\n");
-        }
-    }
-
-    content.push_str("---\n\n");
-    content.push_str("*Investigate this issue and propose a solution.*\n");
-
-    content
+    jean_core::format_issue_context_markdown(ctx)
 }
 
 /// Loaded issue context info returned to frontend
@@ -1352,16 +1297,6 @@ pub struct GitHubPullRequest {
     pub labels: Vec<GitHubLabel>,
 }
 
-/// GitHub review
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct GitHubReview {
-    pub body: String,
-    pub state: String,
-    pub author: GitHubAuthor,
-    pub submitted_at: Option<String>,
-}
-
 /// GitHub inline review comment (on specific diff lines), normalized to camelCase for frontend
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -1490,20 +1425,6 @@ pub struct GitHubPullRequestDetail {
     pub comments: Vec<GitHubComment>,
     #[serde(default)]
     pub reviews: Vec<GitHubReview>,
-}
-
-/// PR context to pass when creating a worktree
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct PullRequestContext {
-    pub number: u32,
-    pub title: String,
-    pub body: Option<String>,
-    pub head_ref_name: String,
-    pub base_ref_name: String,
-    pub comments: Vec<GitHubComment>,
-    pub reviews: Vec<GitHubReview>,
-    pub diff: Option<String>,
 }
 
 /// Loaded PR context info returned to frontend
@@ -1808,77 +1729,7 @@ pub fn generate_branch_name_from_pr(pr_number: u32, title: &str) -> String {
 
 /// Format PR context as markdown for the context file
 pub fn format_pr_context_markdown(ctx: &PullRequestContext) -> String {
-    let mut content = String::new();
-
-    content.push_str(&format!(
-        "# GitHub Pull Request #{}: {}\n\n",
-        ctx.number, ctx.title
-    ));
-
-    content.push_str(&format!(
-        "**Branch:** `{}` → `{}`\n\n",
-        ctx.head_ref_name, ctx.base_ref_name
-    ));
-
-    content.push_str("---\n\n");
-
-    content.push_str("## Description\n\n");
-    if let Some(body) = &ctx.body {
-        if !body.is_empty() {
-            content.push_str(body);
-        } else {
-            content.push_str("*No description provided.*");
-        }
-    } else {
-        content.push_str("*No description provided.*");
-    }
-    content.push_str("\n\n");
-
-    if !ctx.reviews.is_empty() {
-        content.push_str("## Reviews\n\n");
-        for review in &ctx.reviews {
-            let submitted = review.submitted_at.as_deref().unwrap_or("Unknown date");
-            content.push_str(&format!(
-                "### @{} - {} ({})\n\n",
-                review.author.login, review.state, submitted
-            ));
-            if !review.body.is_empty() {
-                content.push_str(&review.body);
-                content.push_str("\n\n");
-            }
-            content.push_str("---\n\n");
-        }
-    }
-
-    if !ctx.comments.is_empty() {
-        content.push_str("## Comments\n\n");
-        for comment in &ctx.comments {
-            content.push_str(&format!(
-                "### @{} ({})\n\n",
-                comment.author.login, comment.created_at
-            ));
-            content.push_str(&comment.body);
-            content.push_str("\n\n---\n\n");
-        }
-    }
-
-    // Add diff section if available
-    if let Some(diff) = &ctx.diff {
-        if !diff.is_empty() {
-            content.push_str("## Changes (Diff)\n\n");
-            content.push_str("```diff\n");
-            content.push_str(diff);
-            if !diff.ends_with('\n') {
-                content.push('\n');
-            }
-            content.push_str("```\n\n");
-        }
-    }
-
-    content.push_str("---\n\n");
-    content.push_str("*Review this pull request and provide feedback or make changes.*\n");
-
-    content
+    jean_core::format_pr_context_markdown(ctx)
 }
 
 /// Get the diff for a PR using `gh pr diff`
@@ -2239,22 +2090,6 @@ pub struct DependabotAlert {
     pub html_url: String,
 }
 
-/// Security alert context to pass when creating a worktree
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SecurityAlertContext {
-    pub number: u32,
-    pub package_name: String,
-    pub package_ecosystem: String,
-    pub severity: String,
-    pub summary: String,
-    pub description: String,
-    pub ghsa_id: String,
-    pub cve_id: Option<String>,
-    pub manifest_path: String,
-    pub html_url: Option<String>,
-}
-
 /// Loaded security alert context info returned to frontend
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -2329,16 +2164,6 @@ pub struct RepositoryAdvisoryRaw {
     pub vulnerabilities: Vec<AdvisoryVulnerabilityRaw>,
 }
 
-/// Vulnerability info for frontend
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct AdvisoryVulnerability {
-    pub package_name: String,
-    pub package_ecosystem: String,
-    pub vulnerable_version_range: Option<String>,
-    pub patched_versions: Option<String>,
-}
-
 /// Repository security advisory for frontend
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -2354,19 +2179,6 @@ pub struct RepositoryAdvisory {
     pub published_at: Option<String>,
     pub html_url: String,
     pub vulnerabilities: Vec<AdvisoryVulnerability>,
-}
-
-/// Advisory context to pass when creating a worktree
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct AdvisoryContext {
-    pub ghsa_id: String,
-    pub severity: String,
-    pub summary: String,
-    pub description: String,
-    pub cve_id: Option<String>,
-    pub vulnerabilities: Vec<AdvisoryVulnerability>,
-    pub html_url: Option<String>,
 }
 
 /// Loaded advisory context info returned from backend
@@ -2432,30 +2244,7 @@ pub fn generate_branch_name_from_security_alert(
 
 /// Format security alert context as markdown
 pub fn format_security_context_markdown(ctx: &SecurityAlertContext) -> String {
-    let mut content = String::new();
-
-    content.push_str(&format!(
-        "# Dependabot Alert #{}: {}\n\n",
-        ctx.number, ctx.summary
-    ));
-
-    content.push_str(&format!(
-        "**Severity:** {} | **Package:** {} ({}) | **Manifest:** {}\n\n",
-        ctx.severity, ctx.package_name, ctx.package_ecosystem, ctx.manifest_path
-    ));
-
-    content.push_str(&format!("**GHSA:** {}", ctx.ghsa_id));
-    if let Some(ref cve) = ctx.cve_id {
-        content.push_str(&format!(" | **CVE:** {cve}"));
-    }
-    content.push_str("\n\n---\n\n");
-
-    content.push_str("## Description\n\n");
-    content.push_str(&ctx.description);
-    content.push_str("\n\n---\n\n");
-    content.push_str("*Fix this security vulnerability.*\n");
-
-    content
+    jean_core::format_security_context_markdown(ctx)
 }
 
 /// Generate branch name from advisory
@@ -2478,43 +2267,7 @@ pub fn generate_branch_name_from_advisory(ghsa_id: &str, summary: &str) -> Strin
 
 /// Format advisory context as markdown
 pub fn format_advisory_context_markdown(ctx: &AdvisoryContext) -> String {
-    let mut content = String::new();
-
-    content.push_str(&format!(
-        "# Security Advisory {}: {}\n\n",
-        ctx.ghsa_id, ctx.summary
-    ));
-
-    content.push_str(&format!("**Severity:** {}", ctx.severity));
-    if let Some(ref cve) = ctx.cve_id {
-        content.push_str(&format!(" | **CVE:** {cve}"));
-    }
-    content.push_str("\n\n");
-
-    if !ctx.vulnerabilities.is_empty() {
-        content.push_str("## Affected Packages\n\n");
-        for vuln in &ctx.vulnerabilities {
-            content.push_str(&format!(
-                "- **{}** ({})",
-                vuln.package_name, vuln.package_ecosystem
-            ));
-            if let Some(ref range) = vuln.vulnerable_version_range {
-                content.push_str(&format!(" — vulnerable: {range}"));
-            }
-            if let Some(ref patched) = vuln.patched_versions {
-                content.push_str(&format!(", patched: {patched}"));
-            }
-            content.push('\n');
-        }
-        content.push('\n');
-    }
-
-    content.push_str("---\n\n## Description\n\n");
-    content.push_str(&ctx.description);
-    content.push_str("\n\n---\n\n");
-    content.push_str("*Fix this security advisory.*\n");
-
-    content
+    jean_core::format_advisory_context_markdown(ctx)
 }
 
 /// List Dependabot alerts for a repository

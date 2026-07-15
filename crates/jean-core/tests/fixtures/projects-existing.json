@@ -1,0 +1,28 @@
+{
+  "projects": [
+    {
+      "id": "project-1",
+      "name": "Example",
+      "path": "/tmp/example",
+      "default_branch": "main",
+      "added_at": 1700000000,
+      "remote_clones": [],
+      "linked_project_ids": [],
+      "future_project_field": "preserved"
+    }
+  ],
+  "worktrees": [
+    {
+      "id": "worktree-1",
+      "project_id": "project-1",
+      "name": "example-worktree",
+      "path": "/tmp/example-worktree",
+      "branch": "example-worktree",
+      "created_at": 1700000001,
+      "session_type": "worktree",
+      "labels": [],
+      "future_worktree_field": 42
+    }
+  ],
+  "future_top_level_field": "preserved"
+}
